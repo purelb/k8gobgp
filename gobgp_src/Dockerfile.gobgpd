@@ -1,0 +1,17 @@
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+COPY . .
+
+RUN go build -o gobgpd ./cmd/gobgpd
+
+FROM alpine/git
+
+WORKDIR /
+
+COPY --from=builder /app/gobgpd /usr/local/bin/gobgpd
+
+EXPOSE 50051
+
+ENTRYPOINT ["gobgpd"]

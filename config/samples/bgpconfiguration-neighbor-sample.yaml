@@ -1,0 +1,12 @@
+apiVersion: bgp.example.com/v1alpha1
+kind: BGPConfiguration
+metadata:
+  name: global-bgp-config
+spec:
+  global:
+    asn: 64512
+    routerID: 192.168.0.1
+  neighbors:
+    - config:
+        neighborAddress: 192.168.151.161
+        peerAs: 65413

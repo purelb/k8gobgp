@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8gobgp-manager-role
+rules:
+- apiGroups:
+  - bgp.example.com
+  resources:
+  - bgpconfigurations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - bgp.example.com
+  resources:
+  - bgpconfigurations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - bgp.example.com
+  resources:
+  - bgpconfigurations/status
+  verbs:
+  - get
+  - patch
+  - update

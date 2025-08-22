@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  labels:
+    app: gobgp
+  name: gobgp
+  namespace: gobgp-system
+spec:
+  selector:
+    matchLabels:
+      app: gobgp
+  template:
+    metadata:
+      labels:
+        app: gobgp
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: gobgp
+        image: ghcr.io/adamdunstan/registry/k8gobgp:latest
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        env:
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: NODE_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: spec.nodeName
+        ports:
+        - containerPort: 50051
+          hostPort: 50051
+          name: gobgp-grpc
+      tolerations:
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      - key: CriticalAddonsOnly
+        operator: Exists
+      serviceAccountName: gobgp-controller-manager

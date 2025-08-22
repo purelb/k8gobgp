@@ -1,0 +1,21 @@
+{
+	"mcpServers": {
+		"purelb": {
+			"command": "npx",
+			"args": [
+				"-y",
+				"mcp-code-graph@latest",
+				"purelb/purelb"
+			]
+		},
+        "gobgp": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-code-graph@latest",
+                "osrg/gobgp"
+            ]
+        }
+
+	}
+}
