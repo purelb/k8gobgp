@@ -37,6 +37,37 @@ spec:
             type: object
           spec:
             properties:
+              definedSets:
+                items:
+                  properties:
+                    list:
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      type: string
+                    prefixes:
+                      items:
+                        properties:
+                          ipPrefix:
+                            type: string
+                          maskLengthMax:
+                            format: int32
+                            type: integer
+                          maskLengthMin:
+                            format: int32
+                            type: integer
+                        required:
+                        - ipPrefix
+                        type: object
+                      type: array
+                    type:
+                      type: string
+                  required:
+                  - name
+                  - type
+                  type: object
+                type: array
               dynamicNeighbors:
                 items:
                   properties:
@@ -57,8 +88,6 @@ spec:
                         properties:
                           defaultAction:
                             type: string
-                          direction:
-                            type: string
                           name:
                             type: string
                           policies:
@@ -70,8 +99,6 @@ spec:
                         properties:
                           defaultAction:
                             type: string
-                          direction:
-                            type: string
                           name:
                             type: string
                           policies:
@@ -82,8 +109,6 @@ spec:
                       inPolicy:
                         properties:
                           defaultAction:
-                            type: string
-                          direction:
                             type: string
                           name:
                             type: string
@@ -122,20 +147,14 @@ spec:
                     type: object
                   families:
                     items:
-                      format: int32
-                      type: integer
+                      type: string
                     type: array
                   gracefulRestart:
                     properties:
-                      deferralTime:
-                        format: int32
-                        type: integer
                       enabled:
                         type: boolean
                       helperOnly:
                         type: boolean
-                      mode:
-                        type: string
                       restartTime:
                         format: int32
                         type: integer
@@ -153,14 +172,6 @@ spec:
                         type: boolean
                       alwaysCompareMed:
                         type: boolean
-                      enableAigp:
-                        type: boolean
-                      externalCompareRouterId:
-                        type: boolean
-                      ignoreAsPathLength:
-                        type: boolean
-                      ignoreNextHopIgpMetric:
-                        type: boolean
                     type: object
                   routerID:
                     type: string
@@ -173,13 +184,77 @@ spec:
               neighbors:
                 items:
                   properties:
+                    afiSafis:
+                      items:
+                        properties:
+                          addPaths:
+                            properties:
+                              receive:
+                                type: boolean
+                              sendMax:
+                                format: int32
+                                type: integer
+                            type: object
+                          enabled:
+                            type: boolean
+                          family:
+                            type: string
+                          prefixLimit:
+                            properties:
+                              maxPrefixes:
+                                format: int32
+                                type: integer
+                              shutdownThresholdPct:
+                                format: int32
+                                type: integer
+                            required:
+                            - maxPrefixes
+                            type: object
+                        required:
+                        - enabled
+                        - family
+                        type: object
+                      type: array
+                    applyPolicy:
+                      properties:
+                        exportPolicy:
+                          properties:
+                            defaultAction:
+                              type: string
+                            name:
+                              type: string
+                            policies:
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                        importPolicy:
+                          properties:
+                            defaultAction:
+                              type: string
+                            name:
+                              type: string
+                            policies:
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                        inPolicy:
+                          properties:
+                            defaultAction:
+                              type: string
+                            name:
+                              type: string
+                            policies:
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                      type: object
                     config:
                       properties:
                         adminDown:
                           type: boolean
-                        allowOwnAsn:
-                          format: int32
-                          type: integer
                         authPassword:
                           type: string
                         description:
@@ -196,22 +271,70 @@ spec:
                           type: integer
                         peerGroup:
                           type: string
-                        peerType:
-                          type: string
-                        removePrivate:
-                          type: string
-                        replacePeerAsn:
-                          type: boolean
-                        routeFlapDamping:
-                          type: boolean
-                        sendCommunity:
-                          format: int32
-                          type: integer
                         vrf:
                           type: string
                       required:
                       - neighborAddress
                       - peerAsn
+                      type: object
+                    ebgpMultihop:
+                      properties:
+                        enabled:
+                          type: boolean
+                        multihopTtl:
+                          format: int32
+                          type: integer
+                      required:
+                      - enabled
+                      type: object
+                    gracefulRestart:
+                      properties:
+                        enabled:
+                          type: boolean
+                        helperOnly:
+                          type: boolean
+                        restartTime:
+                          format: int32
+                          type: integer
+                      type: object
+                    routeReflector:
+                      properties:
+                        routeReflectorClient:
+                          type: boolean
+                        routeReflectorClusterId:
+                          type: string
+                      required:
+                      - routeReflectorClient
+                      - routeReflectorClusterId
+                      type: object
+                    timers:
+                      properties:
+                        config:
+                          properties:
+                            connectRetry:
+                              format: int64
+                              type: integer
+                            holdTime:
+                              format: int64
+                              type: integer
+                            keepaliveInterval:
+                              format: int64
+                              type: integer
+                            minimumAdvertisementInterval:
+                              format: int64
+                              type: integer
+                          type: object
+                      required:
+                      - config
+                      type: object
+                    transport:
+                      properties:
+                        bindInterface:
+                          type: string
+                        localAddress:
+                          type: string
+                        passiveMode:
+                          type: boolean
                       type: object
                   required:
                   - config
@@ -220,6 +343,73 @@ spec:
               peerGroups:
                 items:
                   properties:
+                    afiSafis:
+                      items:
+                        properties:
+                          addPaths:
+                            properties:
+                              receive:
+                                type: boolean
+                              sendMax:
+                                format: int32
+                                type: integer
+                            type: object
+                          enabled:
+                            type: boolean
+                          family:
+                            type: string
+                          prefixLimit:
+                            properties:
+                              maxPrefixes:
+                                format: int32
+                                type: integer
+                              shutdownThresholdPct:
+                                format: int32
+                                type: integer
+                            required:
+                            - maxPrefixes
+                            type: object
+                        required:
+                        - enabled
+                        - family
+                        type: object
+                      type: array
+                    applyPolicy:
+                      properties:
+                        exportPolicy:
+                          properties:
+                            defaultAction:
+                              type: string
+                            name:
+                              type: string
+                            policies:
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                        importPolicy:
+                          properties:
+                            defaultAction:
+                              type: string
+                            name:
+                              type: string
+                            policies:
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                        inPolicy:
+                          properties:
+                            defaultAction:
+                              type: string
+                            name:
+                              type: string
+                            policies:
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                      type: object
                     config:
                       properties:
                         authPassword:
@@ -234,20 +424,146 @@ spec:
                           type: integer
                         peerGroupName:
                           type: string
-                        peerType:
-                          type: string
-                        removePrivate:
-                          type: string
-                        routeFlapDamping:
-                          type: boolean
-                        sendCommunity:
-                          format: int32
-                          type: integer
                       required:
                       - peerGroupName
                       type: object
+                    timers:
+                      properties:
+                        config:
+                          properties:
+                            connectRetry:
+                              format: int64
+                              type: integer
+                            holdTime:
+                              format: int64
+                              type: integer
+                            keepaliveInterval:
+                              format: int64
+                              type: integer
+                            minimumAdvertisementInterval:
+                              format: int64
+                              type: integer
+                          type: object
+                      required:
+                      - config
+                      type: object
+                    transport:
+                      properties:
+                        bindInterface:
+                          type: string
+                        localAddress:
+                          type: string
+                        passiveMode:
+                          type: boolean
+                      type: object
                   required:
                   - config
+                  type: object
+                type: array
+              policyDefinitions:
+                items:
+                  properties:
+                    name:
+                      type: string
+                    statements:
+                      items:
+                        properties:
+                          actions:
+                            properties:
+                              asPrepend:
+                                properties:
+                                  asn:
+                                    format: int32
+                                    type: integer
+                                  repeat:
+                                    format: int32
+                                    type: integer
+                                required:
+                                - asn
+                                type: object
+                              community:
+                                properties:
+                                  communities:
+                                    items:
+                                      type: string
+                                    type: array
+                                  type:
+                                    type: string
+                                required:
+                                - communities
+                                - type
+                                type: object
+                              localPref:
+                                format: int32
+                                type: integer
+                              med:
+                                properties:
+                                  type:
+                                    type: string
+                                  value:
+                                    format: int64
+                                    type: integer
+                                required:
+                                - type
+                                - value
+                                type: object
+                              routeAction:
+                                type: string
+                            required:
+                            - routeAction
+                            type: object
+                          conditions:
+                            properties:
+                              asPathSet:
+                                properties:
+                                  match:
+                                    type: string
+                                  name:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              communitySet:
+                                properties:
+                                  match:
+                                    type: string
+                                  name:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              neighborSet:
+                                properties:
+                                  match:
+                                    type: string
+                                  name:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              prefixSet:
+                                properties:
+                                  match:
+                                    type: string
+                                  name:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              rpkiResult:
+                                type: string
+                            type: object
+                          name:
+                            type: string
+                        required:
+                        - actions
+                        - conditions
+                        - name
+                        type: object
+                      type: array
+                  required:
+                  - name
+                  - statements
                   type: object
                 type: array
               vrfs:
@@ -257,9 +573,6 @@ spec:
                       items:
                         type: string
                       type: array
-                    id:
-                      format: int32
-                      type: integer
                     importRt:
                       items:
                         type: string

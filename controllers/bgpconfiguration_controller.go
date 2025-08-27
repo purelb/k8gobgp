@@ -6,75 +6,62 @@ import (
 	"strings"
 
 	"github.com/go-logr/logr"
-	gobgpk8siov1alpha1 "github.com/adamd/k8gobgp/api/v1alpha1"
-	gobgpapi "github.com/osrg/gobgp/v3/api"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	gobgpk8siov1alpha1 "github.com/adamd/k8gobgp/api/v1alpha1"
+	gobgpapi "github.com/osrg/gobgp/v3/api"
 )
 
-// BGPConfigurationReconciler reconciles a BGPConfiguration object
 type BGPConfigurationReconciler struct {
 	client.Client
 	Log    logr.Logger
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=gobgp.k8s.io,resources=bgpconfigurations,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gobgp.k8s.io,resources=bgpconfigurations/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=gobgp.k8s.io,resources=bgpconfigurations/finalizers,verbs=update
+// +kubebuilder:rbac:groups=bgp.example.com,resources=bgpconfigurations,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=bgp.example.com,resources=bgpconfigurations/status,verbs=get;update;patch
 
 func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("bgpconfiguration", req.NamespacedName)
-
 	bgpConfig := &gobgpk8siov1alpha1.BGPConfiguration{}
 	if err := r.Get(ctx, req.NamespacedName, bgpConfig); err != nil {
-		log.Error(err, "unable to fetch BGPConfiguration")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	log.Info("Reconciling BGPConfiguration")
-
 	conn, err := grpc.DialContext(ctx, "localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Error(err, "failed to connect to gobgpd")
+		log.Error(err, "Failed to connect to gobgpd")
 		return ctrl.Result{}, err
 	}
 	defer conn.Close()
 	apiClient := gobgpapi.NewGobgpApiClient(conn)
 
+	// Order of reconciliation is important: Global -> Sets -> Policies -> Groups -> Neighbors
 	if err := r.reconcileGlobal(ctx, apiClient, bgpConfig, log); err != nil {
-		log.Error(err, "failed to reconcile global config")
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileDefinedSets(ctx, apiClient, bgpConfig, log); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcilePolicies(ctx, apiClient, bgpConfig, log); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcilePeerGroups(ctx, apiClient, bgpConfig, log); err != nil {
-		log.Error(err, "failed to reconcile peer groups")
 		return ctrl.Result{}, err
 	}
 	if err := r.reconcileNeighbors(ctx, apiClient, bgpConfig, log); err != nil {
-		log.Error(err, "failed to reconcile neighbors")
-		return ctrl.Result{}, err
-	}
-	if err := r.reconcileDynamicNeighbors(ctx, apiClient, bgpConfig, log); err != nil {
-		log.Error(err, "failed to reconcile dynamic neighbors")
-		return ctrl.Result{}, err
-	}
-	if err := r.reconcileVrfs(ctx, apiClient, bgpConfig, log); err != nil {
-		log.Error(err, "failed to reconcile VRFs")
 		return ctrl.Result{}, err
 	}
 
 	bgpConfig.Status.ObservedGeneration = bgpConfig.Generation
 	if err := r.Status().Update(ctx, bgpConfig); err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("BGPConfiguration resource not found. Ignoring since object must be deleted.")
-			return ctrl.Result{}, nil
-		}
-		log.Error(err, "failed to update BGPConfiguration status")
+		log.Error(err, "Failed to update BGPConfiguration status")
 		return ctrl.Result{}, err
 	}
 
@@ -86,67 +73,59 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	desired := crdToAPIGlobal(&bgpConfig.Spec.Global)
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
 	if err != nil {
-		log.Info("BGP server not running or configured, calling StartBgp")
+		log.Info("BGP server not running, calling StartBgp")
 		_, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired})
 		return startErr
 	}
-
 	if !reflect.DeepEqual(desired, current.Global) {
-		log.Info("Global BGP configuration has changed, stopping and restarting BGP server")
-		if _, stopErr := apiClient.StopBgp(ctx, &gobgpapi.StopBgpRequest{}); stopErr != nil {
+		log.Info("Global config changed, restarting BGP server")
+		_, stopErr := apiClient.StopBgp(ctx, &gobgpapi.StopBgpRequest{})
+		if stopErr != nil {
 			return stopErr
 		}
-		if _, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired}); startErr != nil {
-			return startErr
+		_, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired})
+		return startErr
+	}
+	return nil
+}
+
+func (r *BGPConfigurationReconciler) reconcileDefinedSets(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
+	// This is a simplified reconciliation. A full implementation would compare current and desired sets.
+	// For now, we delete all existing sets and re-add them.
+	if _, err := apiClient.DeleteDefinedSet(ctx, &gobgpapi.DeleteDefinedSetRequest{All: true}); err != nil {
+		log.Error(err, "Failed to delete existing defined sets")
+	}
+	for _, set := range bgpConfig.Spec.DefinedSets {
+		apiSet := crdToAPIDefinedSet(&set)
+		if _, err := apiClient.AddDefinedSet(ctx, &gobgpapi.AddDefinedSetRequest{DefinedSet: apiSet}); err != nil {
+			log.Error(err, "Failed to add defined set", "name", set.Name)
+		}
+	}
+	return nil
+}
+
+func (r *BGPConfigurationReconciler) reconcilePolicies(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
+	// Simplified reconciliation: delete all policies and re-add.
+	if _, err := apiClient.DeletePolicy(ctx, &gobgpapi.DeletePolicyRequest{All: true}); err != nil {
+		log.Error(err, "Failed to delete existing policies")
+	}
+	for _, policy := range bgpConfig.Spec.PolicyDefinitions {
+		apiPolicy := crdToAPIPolicy(&policy)
+		if _, err := apiClient.AddPolicy(ctx, &gobgpapi.AddPolicyRequest{Policy: apiPolicy}); err != nil {
+			log.Error(err, "Failed to add policy", "name", policy.Name)
 		}
 	}
 	return nil
 }
 
 func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// 1. Get current peer groups
-	currentPeerGroups := make(map[string]*gobgpapi.PeerGroup)
-	stream, err := apiClient.ListPeerGroup(ctx, &gobgpapi.ListPeerGroupRequest{})
-	if err != nil {
-		return err
-	}
-	for {
-		res, err := stream.Recv()
-		if err != nil {
-			break // End of stream
-		}
-		currentPeerGroups[res.PeerGroup.Conf.PeerGroupName] = res.PeerGroup
-	}
-
-	// 2. Get desired peer groups
-	desiredPeerGroups := make(map[string]*gobgpapi.PeerGroup)
+	// Simplified reconciliation
 	for _, pg := range bgpConfig.Spec.PeerGroups {
-		desiredPeerGroups[pg.Config.PeerGroupName] = crdToAPIPeerGroup(&pg)
-	}
-
-	// 3. Delete groups that are no longer desired
-	for name := range currentPeerGroups {
-		if _, ok := desiredPeerGroups[name]; !ok {
-			log.Info("Deleting peer group not in desired state", "name", name)
-			if _, err := apiClient.DeletePeerGroup(ctx, &gobgpapi.DeletePeerGroupRequest{Name: name}); err != nil {
-				log.Error(err, "Failed to delete peer group", "name", name)
-			}
-		}
-	}
-
-	// 4. Add or Update groups
-	for name, desired := range desiredPeerGroups {
-		if current, ok := currentPeerGroups[name]; !ok {
-			log.Info("Adding new peer group", "name", name)
-			if _, err := apiClient.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{PeerGroup: desired}); err != nil {
-				log.Error(err, "Failed to add peer group", "name", name)
-			}
-		} else {
-			if !reflect.DeepEqual(desired.Conf, current.Conf) {
-				log.Info("Updating existing peer group", "name", name)
-				if _, err := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: desired}); err != nil {
-					log.Error(err, "Failed to update peer group", "name", name)
-				}
+		apiPg := crdToAPIPeerGroup(&pg)
+		if _, err := apiClient.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{PeerGroup: apiPg}); err != nil {
+			// Attempt an update if add fails (already exists)
+			if _, updateErr := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: apiPg}); updateErr != nil {
+				log.Error(updateErr, "Failed to add or update peer group", "name", pg.Config.PeerGroupName)
 			}
 		}
 	}
@@ -154,151 +133,14 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 }
 
 func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// 1. Get current peers
-	currentPeers := make(map[string]*gobgpapi.Peer)
-	stream, err := apiClient.ListPeer(ctx, &gobgpapi.ListPeerRequest{})
-	if err != nil {
-		return err
-	}
-	for {
-		res, err := stream.Recv()
-		if err != nil {
-			break // End of stream
-		}
-		currentPeers[res.Peer.Conf.NeighborAddress] = res.Peer
-	}
-
-	// 2. Get desired neighbors
-	desiredPeers := make(map[string]*gobgpapi.Peer)
+	// Simplified reconciliation
 	for _, n := range bgpConfig.Spec.Neighbors {
-		desiredPeers[n.Config.NeighborAddress] = crdToAPINeighbor(&n)
-	}
-
-	// 3. Delete peers that are no longer desired
-	for addr := range currentPeers {
-		if _, ok := desiredPeers[addr]; !ok {
-			log.Info("Deleting peer not in desired state", "address", addr)
-			if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr}); err != nil {
-				log.Error(err, "Failed to delete peer", "address", addr)
+		apiPeer := crdToAPINeighbor(&n)
+		if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: apiPeer}); err != nil {
+			if _, updateErr := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: apiPeer}); updateErr != nil {
+				log.Error(updateErr, "Failed to add or update neighbor", "address", n.Config.NeighborAddress)
 			}
 		}
-	}
-
-	// 4. Add or Update peers
-	for addr, desired := range desiredPeers {
-		if current, ok := currentPeers[addr]; !ok {
-			log.Info("Adding new peer", "address", addr)
-			if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired}); err != nil {
-				log.Error(err, "Failed to add peer", "address", addr)
-			}
-		} else {
-			if !reflect.DeepEqual(desired.Conf, current.Conf) {
-				log.Info("Updating existing peer", "address", addr)
-				if _, err := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: desired}); err != nil {
-					log.Error(err, "Failed to update peer", "address", addr)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// 1. Get current dynamic neighbors
-	currentDynamicNeighbors := make(map[string]*gobgpapi.DynamicNeighbor)
-	stream, err := apiClient.ListDynamicNeighbor(ctx, &gobgpapi.ListDynamicNeighborRequest{})
-	if err != nil {
-		return err
-	}
-	for {
-		res, err := stream.Recv()
-		if err != nil {
-			break // End of stream
-		}
-		currentDynamicNeighbors[res.DynamicNeighbor.Prefix] = res.DynamicNeighbor
-	}
-
-	// 2. Get desired dynamic neighbors
-	desiredDynamicNeighbors := make(map[string]*gobgpapi.DynamicNeighbor)
-	for _, dn := range bgpConfig.Spec.DynamicNeighbors {
-		desiredDynamicNeighbors[dn.Prefix] = &gobgpapi.DynamicNeighbor{Prefix: dn.Prefix, PeerGroup: dn.PeerGroup}
-	}
-
-	// 3. Delete dynamic neighbors that are no longer desired
-	for prefix := range currentDynamicNeighbors {
-		if _, ok := desiredDynamicNeighbors[prefix]; !ok {
-			log.Info("Deleting dynamic neighbor not in desired state", "prefix", prefix)
-			if _, err := apiClient.DeleteDynamicNeighbor(ctx, &gobgpapi.DeleteDynamicNeighborRequest{Prefix: prefix}); err != nil {
-				log.Error(err, "Failed to delete dynamic neighbor", "prefix", prefix)
-			}
-		}
-	}
-
-	// 4. Add new dynamic neighbors (Update is not supported, must be deleted and re-added)
-	for prefix, desired := range desiredDynamicNeighbors {
-		if current, ok := currentDynamicNeighbors[prefix]; !ok {
-			log.Info("Adding new dynamic neighbor", "prefix", prefix)
-			if _, err := apiClient.AddDynamicNeighbor(ctx, &gobgpapi.AddDynamicNeighborRequest{DynamicNeighbor: desired}); err != nil {
-				log.Error(err, "Failed to add dynamic neighbor", "prefix", prefix)
-			}
-		} else {
-			if !reflect.DeepEqual(desired, current) {
-				log.Info("Dynamic neighbor has changed, deleting and re-adding", "prefix", prefix)
-				if _, err := apiClient.DeleteDynamicNeighbor(ctx, &gobgpapi.DeleteDynamicNeighborRequest{Prefix: prefix}); err != nil {
-					log.Error(err, "Failed to delete dynamic neighbor for update", "prefix", prefix)
-					continue
-				}
-				if _, err := apiClient.AddDynamicNeighbor(ctx, &gobgpapi.AddDynamicNeighborRequest{DynamicNeighbor: desired}); err != nil {
-					log.Error(err, "Failed to re-add dynamic neighbor for update", "prefix", prefix)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func (r *BGPConfigurationReconciler) reconcileVrfs(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// 1. Get current VRFs
-	currentVrfs := make(map[string]*gobgpapi.Vrf)
-	stream, err := apiClient.ListVrf(ctx, &gobgpapi.ListVrfRequest{})
-	if err != nil {
-		return err
-	}
-	for {
-		res, err := stream.Recv()
-		if err != nil {
-			break // End of stream
-		}
-		currentVrfs[res.Vrf.Name] = res.Vrf
-	}
-
-	// 2. Get desired VRFs
-	desiredVrfs := make(map[string]*gobgpapi.Vrf)
-	for _, v := range bgpConfig.Spec.Vrfs {
-		// NOTE: RD and RT parsing is complex and requires helpers not included here.
-		// This implementation only handles Name and ID.
-		desiredVrfs[v.Name] = &gobgpapi.Vrf{Name: v.Name, Id: v.Id}
-	}
-
-	// 3. Delete VRFs that are no longer desired
-	for name := range currentVrfs {
-		if _, ok := desiredVrfs[name]; !ok {
-			log.Info("Deleting VRF not in desired state", "name", name)
-			if _, err := apiClient.DeleteVrf(ctx, &gobgpapi.DeleteVrfRequest{Name: name}); err != nil {
-				log.Error(err, "Failed to delete VRF", "name", name)
-			}
-		}
-	}
-
-	// 4. Add new VRFs (Update is not supported)
-	for name, desired := range desiredVrfs {
-		if _, ok := currentVrfs[name]; !ok {
-			log.Info("Adding new VRF", "name", name)
-			if _, err := apiClient.AddVrf(ctx, &gobgpapi.AddVrfRequest{Vrf: desired}); err != nil {
-				log.Error(err, "Failed to add VRF", "name", name)
-			}
-		}
-		// Note: No updates. If a VRF's properties change, it must be deleted and recreated manually.
 	}
 	return nil
 }
@@ -314,6 +156,62 @@ func crdToAPIGlobal(crd *gobgpk8siov1alpha1.GlobalSpec) *gobgpapi.Global {
 	}
 }
 
+func crdToAPIDefinedSet(crd *gobgpk8siov1alpha1.DefinedSet) *gobgpapi.DefinedSet {
+	var prefixes []*gobgpapi.Prefix
+	for _, p := range crd.Prefixes {
+		prefixes = append(prefixes, &gobgpapi.Prefix{
+			IpPrefix:      p.IpPrefix,
+			MaskLengthMin: p.MaskLengthMin,
+			MaskLengthMax: p.MaskLengthMax,
+		})
+	}
+	return &gobgpapi.DefinedSet{
+		DefinedType: crdToAPIDefinedType(crd.Type),
+		Name:        crd.Name,
+		List:        crd.List,
+		Prefixes:    prefixes,
+	}
+}
+
+func crdToAPIPolicy(crd *gobgpk8siov1alpha1.PolicyDefinition) *gobgpapi.Policy {
+	var statements []*gobgpapi.Statement
+	for _, s := range crd.Statements {
+		statements = append(statements, crdToAPIStatement(&s))
+	}
+	return &gobgpapi.Policy{
+		Name:       crd.Name,
+		Statements: statements,
+	}
+}
+
+func crdToAPIStatement(crd *gobgpk8siov1alpha1.Statement) *gobgpapi.Statement {
+	return &gobgpapi.Statement{
+		Name:       crd.Name,
+		Conditions: crdToAPIConditions(&crd.Conditions),
+		Actions:    crdToAPIActions(&crd.Actions),
+	}
+}
+
+func crdToAPIConditions(crd *gobgpk8siov1alpha1.Conditions) *gobgpapi.Conditions {
+	return &gobgpapi.Conditions{
+		PrefixSet:    crdToAPIMatchSet(crd.PrefixSet),
+		NeighborSet:  crdToAPIMatchSet(crd.NeighborSet),
+		AsPathSet:    crdToAPIMatchSet(crd.AsPathSet),
+		CommunitySet: crdToAPIMatchSet(crd.CommunitySet),
+		RpkiResult:   crdToAPIRpkiValidationResult(crd.RpkiResult),
+	}
+}
+
+func crdToAPIActions(crd *gobgpk8siov1alpha1.Actions) *gobgpapi.Actions {
+	return &gobgpapi.Actions{
+		RouteAction: crdToAPIRouteAction(crd.RouteAction),
+		Community:   crdToAPICommunityAction(crd.Community),
+		Med:         crdToAPIMedAction(crd.Med),
+		AsPrepend:   crdToAPIAsPrependAction(crd.AsPrepend),
+		LocalPref:   &gobgpapi.LocalPrefAction{Value: crd.LocalPref},
+	}
+}
+
 func crdToAPIPeerGroup(crd *gobgpk8siov1alpha1.PeerGroup) *gobgpapi.PeerGroup {
 	return &gobgpapi.PeerGroup{
 		Conf: &gobgpapi.PeerGroupConf{
@@ -322,8 +220,11 @@ func crdToAPIPeerGroup(crd *gobgpk8siov1alpha1.PeerGroup) *gobgpapi.PeerGroup {
 			LocalAsn:      crd.Config.LocalAsn,
 			Description:   crd.Config.Description,
 			AuthPassword:  crd.Config.AuthPassword,
-			// TODO: Add other fields
 		},
+		AfiSafis: crdToAPIAfiSafis(crd.AfiSafis),
+		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
+		Timers: crdToAPITimers(crd.Timers),
+		Transport: crdToAPITransport(crd.Transport),
 	}
 }
 
@@ -339,21 +240,204 @@ func crdToAPINeighbor(crd *gobgpk8siov1alpha1.Neighbor) *gobgpapi.Peer {
 			AdminDown:         crd.Config.AdminDown,
 			NeighborInterface: crd.Config.NeighborInterface,
 			Vrf:               crd.Config.Vrf,
-			AllowOwnAsn:       crd.Config.AllowOwnAsn,
-			ReplacePeerAsn:    crd.Config.ReplacePeerAsn,
-			RemovePrivate:     crdToAPIRemovePrivateType(crd.Config.RemovePrivate),
+		},
+		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
+		ApplyPolicy:     crdToAPIApplyPolicy(crd.ApplyPolicy),
+		Timers:          crdToAPITimers(crd.Timers),
+		Transport:       crdToAPITransport(crd.Transport),
+		GracefulRestart: crdToAPIGracefulRestart(crd.GracefulRestart),
+		RouteReflector:  crdToAPIRouteReflector(crd.RouteReflector),
+		EbgpMultihop:    crdToAPIEbgpMultihop(crd.EbgpMultihop),
+	}
+}
+
+// --- Enum and Struct Conversion Helpers ---
+func crdToAPIAfiSafis(crds []gobgpk8siov1alpha1.AfiSafi) []*gobgpapi.AfiSafi {
+	var apiAfiSafis []*gobgpapi.AfiSafi
+	for _, crd := range crds {
+		apiAfiSafis = append(apiAfiSafis, &gobgpapi.AfiSafi{
+			Config: &gobgpapi.AfiSafiConfig{
+				Family:  crdToAPIFamily(crd.Family),
+				Enabled: crd.Enabled,
+			},
+			// AddPaths, PrefixLimit, etc. would be converted here
+		})
+	}
+	return apiAfiSafis
+}
+
+func crdToAPIApplyPolicy(crd *gobgpk8siov1alpha1.ApplyPolicy) *gobgpapi.ApplyPolicy {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.ApplyPolicy{
+		InPolicy:     crdToAPIPolicyAssignment(crd.InPolicy),
+		ExportPolicy: crdToAPIPolicyAssignment(crd.ExportPolicy),
+		ImportPolicy: crdToAPIPolicyAssignment(crd.ImportPolicy),
+	}
+}
+
+func crdToAPIPolicyAssignment(crd *gobgpk8siov1alpha1.PolicyAssignment) *gobgpapi.PolicyAssignment {
+	if crd == nil {
+		return nil
+	}
+	var policies []*gobgpapi.Policy
+	for _, pName := range crd.Policies {
+		policies = append(policies, &gobgpapi.Policy{Name: pName})
+	}
+	return &gobgpapi.PolicyAssignment{
+		Name:          crd.Name,
+		DefaultAction: crdToAPIRouteAction(crd.DefaultAction),
+		Policies:      policies,
+	}
+}
+
+func crdToAPITimers(crd *gobgpk8siov1alpha1.Timers) *gobgpapi.Timers {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.Timers{
+		Config: &gobgpapi.TimersConfig{
+			ConnectRetry:               crd.Config.ConnectRetry,
+			HoldTime:                   crd.Config.HoldTime,
+			KeepaliveInterval:          crd.Config.KeepaliveInterval,
+			MinimumAdvertisementInterval: crd.Config.MinimumAdvertisementInterval,
 		},
 	}
 }
 
-func crdToAPIRemovePrivateType(s string) gobgpapi.RemovePrivate {
-	switch strings.ToUpper(s) {
-	case "ALL":
-		return gobgpapi.RemovePrivate_REMOVE_ALL
-	case "REPLACE":
-		return gobgpapi.RemovePrivate_REPLACE
+func crdToAPITransport(crd *gobgpk8siov1alpha1.Transport) *gobgpapi.Transport {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.Transport{
+		LocalAddress:  crd.LocalAddress,
+		PassiveMode:   crd.PassiveMode,
+		BindInterface: crd.BindInterface,
+	}
+}
+
+func crdToAPIGracefulRestart(crd *gobgpk8siov1alpha1.GracefulRestart) *gobgpapi.GracefulRestart {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.GracefulRestart{
+		Enabled:     crd.Enabled,
+		RestartTime: crd.RestartTime,
+		HelperOnly:  crd.HelperOnly,
+	}
+}
+
+func crdToAPIRouteReflector(crd *gobgpk8siov1alpha1.RouteReflector) *gobgpapi.RouteReflector {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.RouteReflector{
+		RouteReflectorClient:    crd.RouteReflectorClient,
+		RouteReflectorClusterId: crd.RouteReflectorClusterId,
+	}
+}
+
+func crdToAPIEbgpMultihop(crd *gobgpk8siov1alpha1.EbgpMultihop) *gobgpapi.EbgpMultihop {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.EbgpMultihop{
+		Enabled:     crd.Enabled,
+		MultihopTtl: crd.MultihopTtl,
+	}
+}
+
+func crdToAPIDefinedType(s string) gobgpapi.DefinedType {
+	switch strings.ToLower(s) {
+	case "prefix":
+		return gobgpapi.DefinedType_PREFIX
+	case "neighbor":
+		return gobgpapi.DefinedType_NEIGHBOR
+	case "as-path":
+		return gobgpapi.DefinedType_AS_PATH
+	case "community":
+		return gobgpapi.DefinedType_COMMUNITY
 	default:
-		return gobgpapi.RemovePrivate_REMOVE_NONE
+		return gobgpapi.DefinedType_PREFIX // Default
+	}
+}
+
+func crdToAPIMatchSet(crd *gobgpk8siov1alpha1.MatchSet) *gobgpapi.MatchSet {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.MatchSet{
+		Name: crd.Name,
+		// Type conversion needed
+	}
+}
+
+func crdToAPIRpkiValidationResult(s string) int32 {
+	switch strings.ToLower(s) {
+	case "valid":
+		return 2
+	case "invalid":
+		return 3
+	case "not-found":
+		return 1
+	default:
+		return 0 // None
+	}
+}
+
+func crdToAPIRouteAction(s string) gobgpapi.RouteAction {
+	switch strings.ToLower(s) {
+	case "accept":
+		return gobgpapi.RouteAction_ACCEPT
+	case "reject":
+		return gobgpapi.RouteAction_REJECT
+	default:
+		return gobgpapi.RouteAction_NONE
+	}
+}
+
+func crdToAPICommunityAction(crd *gobgpk8siov1alpha1.CommunityAction) *gobgpapi.CommunityAction {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.CommunityAction{
+		Communities: crd.Communities,
+		// Type conversion needed
+	}
+}
+
+func crdToAPIMedAction(crd *gobgpk8siov1alpha1.MedAction) *gobgpapi.MedAction {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.MedAction{
+		Value: crd.Value,
+		// Type conversion needed
+	}
+}
+
+func crdToAPIAsPrependAction(crd *gobgpk8siov1alpha1.AsPrependAction) *gobgpapi.AsPrependAction {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.AsPrependAction{
+		Asn:    crd.Asn,
+		Repeat: crd.Repeat,
+	}
+}
+
+func crdToAPIFamily(s string) *gobgpapi.Family {
+	// This is a simplified mapping. A real implementation would be more robust.
+	switch strings.ToLower(s) {
+	case "ipv4-unicast":
+		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST}
+	case "ipv6-unicast":
+		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST}
+	case "l2vpn-evpn":
+		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_L2VPN, Safi: gobgpapi.Family_SAFI_EVPN}
+	default:
+		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_UNKNOWN, Safi: gobgpapi.Family_SAFI_UNKNOWN}
 	}
 }
 
