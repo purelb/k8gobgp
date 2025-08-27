@@ -14,7 +14,7 @@ WORKDIR /k8gobgp_app
 
 COPY . .
 
-RUN go build -mod=vendor -o manager main.go
+RUN go build -mod=vendor -o manager ./cmd/manager
 
 FROM alpine/git
 
