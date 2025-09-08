@@ -42,7 +42,6 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	defer conn.Close()
 	apiClient := gobgpapi.NewGobgpApiClient(conn)
 
-	// Order of reconciliation is important: Global -> Sets -> Policies -> Groups -> Neighbors
 	if err := r.reconcileGlobal(ctx, apiClient, bgpConfig, log); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -90,42 +89,141 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 }
 
 func (r *BGPConfigurationReconciler) reconcileDefinedSets(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// This is a simplified reconciliation. A full implementation would compare current and desired sets.
-	// For now, we delete all existing sets and re-add them.
-	if _, err := apiClient.DeleteDefinedSet(ctx, &gobgpapi.DeleteDefinedSetRequest{All: true}); err != nil {
-		log.Error(err, "Failed to delete existing defined sets")
+	// 1. Get current defined sets
+	currentSets := make(map[string]*gobgpapi.DefinedSet)
+	stream, err := apiClient.ListDefinedSet(ctx, &gobgpapi.ListDefinedSetRequest{})
+	if err != nil {
+		return err
 	}
+	for {
+		res, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		currentSets[res.DefinedSet.Name] = res.DefinedSet
+	}
+
+	// 2. Get desired defined sets
+	desiredSets := make(map[string]*gobgpapi.DefinedSet)
 	for _, set := range bgpConfig.Spec.DefinedSets {
-		apiSet := crdToAPIDefinedSet(&set)
-		if _, err := apiClient.AddDefinedSet(ctx, &gobgpapi.AddDefinedSetRequest{DefinedSet: apiSet}); err != nil {
-			log.Error(err, "Failed to add defined set", "name", set.Name)
+		desiredSets[set.Name] = crdToAPIDefinedSet(&set)
+	}
+
+	// 3. Delete unwanted sets
+	for name := range currentSets {
+		if _, ok := desiredSets[name]; !ok {
+			log.Info("Deleting defined set", "name", name)
+			if _, err := apiClient.DeleteDefinedSet(ctx, &gobgpapi.DeleteDefinedSetRequest{DefinedSet: &gobgpapi.DefinedSet{Name: name}}); err != nil {
+				log.Error(err, "Failed to delete defined set", "name", name)
+			}
+		}
+	}
+
+	// 4. Add or update sets
+	for name, desired := range desiredSets {
+		if current, ok := currentSets[name]; !ok {
+			log.Info("Adding defined set", "name", name)
+			if _, err := apiClient.AddDefinedSet(ctx, &gobgpapi.AddDefinedSetRequest{DefinedSet: desired}); err != nil {
+				log.Error(err, "Failed to add defined set", "name", name)
+			}
+		} else {
+			if !reflect.DeepEqual(desired, current) {
+				log.Info("Updating defined set", "name", name)
+				if _, err := apiClient.AddDefinedSet(ctx, &gobgpapi.AddDefinedSetRequest{DefinedSet: desired, Replace: true}); err != nil {
+					log.Error(err, "Failed to update defined set", "name", name)
+				}
+			}
 		}
 	}
 	return nil
 }
 
 func (r *BGPConfigurationReconciler) reconcilePolicies(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// Simplified reconciliation: delete all policies and re-add.
-	if _, err := apiClient.DeletePolicy(ctx, &gobgpapi.DeletePolicyRequest{All: true}); err != nil {
-		log.Error(err, "Failed to delete existing policies")
+	// 1. Get current policies
+	currentPolicies := make(map[string]*gobgpapi.Policy)
+	stream, err := apiClient.ListPolicy(ctx, &gobgpapi.ListPolicyRequest{})
+	if err != nil {
+		return err
 	}
+	for {
+		res, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		currentPolicies[res.Policy.Name] = res.Policy
+	}
+
+	// 2. Get desired policies
+	desiredPolicies := make(map[string]*gobgpapi.Policy)
 	for _, policy := range bgpConfig.Spec.PolicyDefinitions {
-		apiPolicy := crdToAPIPolicy(&policy)
-		if _, err := apiClient.AddPolicy(ctx, &gobgpapi.AddPolicyRequest{Policy: apiPolicy}); err != nil {
-			log.Error(err, "Failed to add policy", "name", policy.Name)
+		desiredPolicies[policy.Name] = crdToAPIPolicy(&policy)
+	}
+
+	// 3. Delete unwanted policies
+	for name := range currentPolicies {
+		if _, ok := desiredPolicies[name]; !ok {
+			log.Info("Deleting policy", "name", name)
+			if _, err := apiClient.DeletePolicy(ctx, &gobgpapi.DeletePolicyRequest{Policy: &gobgpapi.Policy{Name: name}}); err != nil {
+				log.Error(err, "Failed to delete policy", "name", name)
+			}
+		}
+	}
+
+	// 4. Add or update policies
+	for name, desired := range desiredPolicies {
+		// AddPolicy with the same name will update the existing policy
+		log.Info("Adding/Updating policy", "name", name)
+		if _, err := apiClient.AddPolicy(ctx, &gobgpapi.AddPolicyRequest{Policy: desired}); err != nil {
+			log.Error(err, "Failed to add/update policy", "name", name)
 		}
 	}
 	return nil
 }
 
 func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// Simplified reconciliation
+	// 1. Get current peer groups
+	currentPeerGroups := make(map[string]*gobgpapi.PeerGroup)
+	stream, err := apiClient.ListPeerGroup(ctx, &gobgpapi.ListPeerGroupRequest{})
+	if err != nil {
+		return err
+	}
+	for {
+		res, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		currentPeerGroups[res.PeerGroup.Conf.PeerGroupName] = res.PeerGroup
+	}
+
+	// 2. Get desired peer groups
+	desiredPeerGroups := make(map[string]*gobgpapi.PeerGroup)
 	for _, pg := range bgpConfig.Spec.PeerGroups {
-		apiPg := crdToAPIPeerGroup(&pg)
-		if _, err := apiClient.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{PeerGroup: apiPg}); err != nil {
-			// Attempt an update if add fails (already exists)
-			if _, updateErr := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: apiPg}); updateErr != nil {
-				log.Error(updateErr, "Failed to add or update peer group", "name", pg.Config.PeerGroupName)
+		desiredPeerGroups[pg.Config.PeerGroupName] = crdToAPIPeerGroup(&pg)
+	}
+
+	// 3. Delete unwanted peer groups
+	for name := range currentPeerGroups {
+		if _, ok := desiredPeerGroups[name]; !ok {
+			log.Info("Deleting peer group", "name", name)
+			if _, err := apiClient.DeletePeerGroup(ctx, &gobgpapi.DeletePeerGroupRequest{Name: name}); err != nil {
+				log.Error(err, "Failed to delete peer group", "name", name)
+			}
+		}
+	}
+
+	// 4. Add or update peer groups
+	for name, desired := range desiredPeerGroups {
+		if current, ok := currentPeerGroups[name]; !ok {
+			log.Info("Adding peer group", "name", name)
+			if _, err := apiClient.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{PeerGroup: desired}); err != nil {
+				log.Error(err, "Failed to add peer group", "name", name)
+			}
+		} else {
+			if !reflect.DeepEqual(desired, current) {
+				log.Info("Updating peer group", "name", name)
+				if _, err := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: desired}); err != nil {
+					log.Error(err, "Failed to update peer group", "name", name)
+				}
 			}
 		}
 	}
@@ -133,12 +231,49 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 }
 
 func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, apiClient gobgpapi.GobgpApiClient, bgpConfig *gobgpk8siov1alpha1.BGPConfiguration, log logr.Logger) error {
-	// Simplified reconciliation
+	// 1. Get current neighbors
+	currentNeighbors := make(map[string]*gobgpapi.Peer)
+	stream, err := apiClient.ListPeer(ctx, &gobgpapi.ListPeerRequest{})
+	if err != nil {
+		return err
+	}
+	for {
+		res, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		currentNeighbors[res.Peer.Conf.NeighborAddress] = res.Peer
+	}
+
+	// 2. Get desired neighbors
+	desiredNeighbors := make(map[string]*gobgpapi.Peer)
 	for _, n := range bgpConfig.Spec.Neighbors {
-		apiPeer := crdToAPINeighbor(&n)
-		if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: apiPeer}); err != nil {
-			if _, updateErr := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: apiPeer}); updateErr != nil {
-				log.Error(updateErr, "Failed to add or update neighbor", "address", n.Config.NeighborAddress)
+		desiredNeighbors[n.Config.NeighborAddress] = crdToAPINeighbor(&n)
+	}
+
+	// 3. Delete unwanted neighbors
+	for addr := range currentNeighbors {
+		if _, ok := desiredNeighbors[addr]; !ok {
+			log.Info("Deleting neighbor", "address", addr)
+			if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr}); err != nil {
+				log.Error(err, "Failed to delete neighbor", "address", addr)
+			}
+		}
+	}
+
+	// 4. Add or update neighbors
+	for addr, desired := range desiredNeighbors {
+		if current, ok := currentNeighbors[addr]; !ok {
+			log.Info("Adding neighbor", "address", addr)
+			if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired}); err != nil {
+				log.Error(err, "Failed to add neighbor", "address", addr)
+			}
+		} else {
+			if !reflect.DeepEqual(desired, current) {
+				log.Info("Updating neighbor", "address", addr)
+				if _, err := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: desired}); err != nil {
+					log.Error(err, "Failed to update neighbor", "address", addr)
+				}
 			}
 		}
 	}
