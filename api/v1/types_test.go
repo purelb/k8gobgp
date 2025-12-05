@@ -58,13 +58,13 @@ func TestBGPConfigurationStatus(t *testing.T) {
 
 func TestGlobalSpec(t *testing.T) {
 	global := GlobalSpec{
-		ASN:             64512,
-		RouterID:        "10.0.0.1",
-		ListenPort:      179,
-		ListenAddresses: []string{"0.0.0.0", "::"},
-		Families:        []string{"ipv4-unicast", "ipv6-unicast"},
+		ASN:              64512,
+		RouterID:         "10.0.0.1",
+		ListenPort:       179,
+		ListenAddresses:  []string{"0.0.0.0", "::"},
+		Families:         []string{"ipv4-unicast", "ipv6-unicast"},
 		UseMultiplePaths: true,
-		BindToDevice:    "eth0",
+		BindToDevice:     "eth0",
 	}
 
 	assert.Equal(t, uint32(64512), global.ASN)
@@ -137,10 +137,10 @@ func TestAfiSafi(t *testing.T) {
 
 func TestTimersConfig(t *testing.T) {
 	config := TimersConfig{
-		ConnectRetry:                  120,
-		HoldTime:                      90,
-		KeepaliveInterval:             30,
-		MinimumAdvertisementInterval:  30,
+		ConnectRetry:                 120,
+		HoldTime:                     90,
+		KeepaliveInterval:            30,
+		MinimumAdvertisementInterval: 30,
 	}
 
 	assert.Equal(t, uint64(120), config.ConnectRetry)

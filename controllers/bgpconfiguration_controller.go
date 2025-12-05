@@ -3,7 +3,6 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"reflect"
 	"strings"
@@ -92,7 +91,11 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		r.updateStatusCondition(ctx, bgpConfig, "Ready", metav1.ConditionFalse, "ConnectionFailed", err.Error())
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Error(err, "Failed to close gRPC connection")
+		}
+	}()
 	RecordGoBGPConnection(r.getEndpoint(), true)
 	apiClient := gobgpapi.NewGoBgpServiceClient(conn)
 
@@ -156,7 +159,7 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 }
 
 // dialGoBGP establishes a gRPC connection to the GoBGP daemon
-func (r *BGPConfigurationReconciler) dialGoBGP(ctx context.Context) (*grpc.ClientConn, error) {
+func (r *BGPConfigurationReconciler) dialGoBGP(_ context.Context) (*grpc.ClientConn, error) {
 	endpoint := r.GoBGPEndpoint
 	if endpoint == "" {
 		endpoint = os.Getenv(envGoBGPEndpoint)
@@ -168,16 +171,13 @@ func (r *BGPConfigurationReconciler) dialGoBGP(ctx context.Context) (*grpc.Clien
 	// Support Unix socket connections (unix:///path/to/socket)
 	if strings.HasPrefix(endpoint, "unix://") {
 		socketPath := strings.TrimPrefix(endpoint, "unix://")
-		return grpc.DialContext(ctx, "unix:"+socketPath,
+		return grpc.NewClient("unix:"+socketPath,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-				return net.Dial("unix", strings.TrimPrefix(addr, "unix:"))
-			}),
 		)
 	}
 
 	// Default TCP connection
-	return grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	return grpc.NewClient(endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()))
 }
 
 // getEndpoint returns the configured GoBGP endpoint for metrics
@@ -207,7 +207,11 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			// Retry after delay if connection fails - don't remove finalizer yet
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				log.Error(err, "Failed to close gRPC connection during cleanup")
+			}
+		}()
 		apiClient := gobgpapi.NewGoBgpServiceClient(conn)
 
 		// Track cleanup errors
@@ -691,8 +695,12 @@ func parseRouteDistinguisher(rd string) *gobgpapi.RouteDistinguisher {
 	}
 	var admin uint32
 	var assigned uint32
-	fmt.Sscanf(parts[0], "%d", &admin)
-	fmt.Sscanf(parts[1], "%d", &assigned)
+	if _, err := fmt.Sscanf(parts[0], "%d", &admin); err != nil {
+		return nil
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &assigned); err != nil {
+		return nil
+	}
 	return &gobgpapi.RouteDistinguisher{
 		Rd: &gobgpapi.RouteDistinguisher_TwoOctetAsn{
 			TwoOctetAsn: &gobgpapi.RouteDistinguisherTwoOctetASN{
@@ -715,8 +723,12 @@ func parseRouteTarget(rt string) *gobgpapi.RouteTarget {
 	}
 	var asn uint32
 	var localAdmin uint32
-	fmt.Sscanf(parts[0], "%d", &asn)
-	fmt.Sscanf(parts[1], "%d", &localAdmin)
+	if _, err := fmt.Sscanf(parts[0], "%d", &asn); err != nil {
+		return nil
+	}
+	if _, err := fmt.Sscanf(parts[1], "%d", &localAdmin); err != nil {
+		return nil
+	}
 	return &gobgpapi.RouteTarget{
 		Rt: &gobgpapi.RouteTarget_TwoOctetAsSpecific{
 			TwoOctetAsSpecific: &gobgpapi.TwoOctetAsSpecificExtended{
@@ -880,9 +892,9 @@ func crdToAPITimers(crd *bgpv1.Timers) *gobgpapi.Timers {
 	}
 	return &gobgpapi.Timers{
 		Config: &gobgpapi.TimersConfig{
-			ConnectRetry:               crd.Config.ConnectRetry,
-			HoldTime:                   crd.Config.HoldTime,
-			KeepaliveInterval:          crd.Config.KeepaliveInterval,
+			ConnectRetry:                 crd.Config.ConnectRetry,
+			HoldTime:                     crd.Config.HoldTime,
+			KeepaliveInterval:            crd.Config.KeepaliveInterval,
 			MinimumAdvertisementInterval: crd.Config.MinimumAdvertisementInterval,
 		},
 	}

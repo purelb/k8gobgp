@@ -1,8 +1,6 @@
 run:
   timeout: 5m
   tests: true
-  skip-dirs:
-    - vendor
 
 linters:
   enable:
@@ -19,14 +17,15 @@ linters:
     - bodyclose
     - noctx
     - gosec
-    - exportloopref
+    - copyloopvar
 
 linters-settings:
   errcheck:
     check-type-assertions: true
     check-blank: false
   govet:
-    check-shadowing: true
+    enable:
+      - shadow
   gofmt:
     simplify: true
   gosec:
@@ -38,6 +37,8 @@ linters-settings:
     locale: US
 
 issues:
+  exclude-dirs:
+    - vendor
   exclude-use-default: false
   max-issues-per-linter: 0
   max-same-issues: 0

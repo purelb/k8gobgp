@@ -36,9 +36,9 @@ func TestCrdToAPIGlobal(t *testing.T) {
 		{
 			name: "global config with listen port",
 			input: &bgpv1.GlobalSpec{
-				ASN:        64512,
-				RouterID:   "10.0.0.1",
-				ListenPort: 179,
+				ASN:             64512,
+				RouterID:        "10.0.0.1",
+				ListenPort:      179,
 				ListenAddresses: []string{"0.0.0.0", "::"},
 			},
 			expected: &gobgpapi.Global{
@@ -197,17 +197,17 @@ func TestCrdToAPIDefinedType(t *testing.T) {
 
 func TestParseRouteDistinguisher(t *testing.T) {
 	tests := []struct {
-		name          string
-		input         string
-		expectNil     bool
-		expectedAdmin uint32
+		name             string
+		input            string
+		expectNil        bool
+		expectedAdmin    uint32
 		expectedAssigned uint32
 	}{
 		{
-			name:          "valid RD",
-			input:         "65000:100",
-			expectNil:     false,
-			expectedAdmin: 65000,
+			name:             "valid RD",
+			input:            "65000:100",
+			expectNil:        false,
+			expectedAdmin:    65000,
 			expectedAssigned: 100,
 		},
 		{
@@ -244,17 +244,17 @@ func TestParseRouteDistinguisher(t *testing.T) {
 
 func TestParseRouteTarget(t *testing.T) {
 	tests := []struct {
-		name              string
-		input             string
-		expectNil         bool
-		expectedAsn       uint32
+		name               string
+		input              string
+		expectNil          bool
+		expectedAsn        uint32
 		expectedLocalAdmin uint32
 	}{
 		{
-			name:              "valid RT",
-			input:             "65000:100",
-			expectNil:         false,
-			expectedAsn:       65000,
+			name:               "valid RT",
+			input:              "65000:100",
+			expectNil:          false,
+			expectedAsn:        65000,
 			expectedLocalAdmin: 100,
 		},
 		{
@@ -371,9 +371,9 @@ func TestResolveAuthPassword(t *testing.T) {
 
 func TestCrdToAPITimers(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    *bgpv1.Timers
-		isNil    bool
+		name  string
+		input *bgpv1.Timers
+		isNil bool
 	}{
 		{
 			name:  "nil input",

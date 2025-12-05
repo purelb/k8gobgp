@@ -459,9 +459,9 @@ func TestIsValidName(t *testing.T) {
 		{"valid-name", true},
 		{"valid_name", true},
 		{"ValidName123", true},
-		{"invalid name", false},  // Space
-		{"invalid.name", false},  // Dot
-		{"invalid@name", false},  // Special char
+		{"invalid name", false}, // Space
+		{"invalid.name", false}, // Dot
+		{"invalid@name", false}, // Special char
 		{"", false},
 	}
 

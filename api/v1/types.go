@@ -172,9 +172,9 @@ type Timers struct {
 
 // +kubebuilder:object:generate=true
 type TimersConfig struct {
-	ConnectRetry               uint64 `json:"connectRetry,omitempty"`
-	HoldTime                   uint64 `json:"holdTime,omitempty"`
-	KeepaliveInterval          uint64 `json:"keepaliveInterval,omitempty"`
+	ConnectRetry                 uint64 `json:"connectRetry,omitempty"`
+	HoldTime                     uint64 `json:"holdTime,omitempty"`
+	KeepaliveInterval            uint64 `json:"keepaliveInterval,omitempty"`
 	MinimumAdvertisementInterval uint64 `json:"minimumAdvertisementInterval,omitempty"`
 }
 
@@ -306,17 +306,17 @@ type Conditions struct {
 
 // +kubebuilder:object:generate=true
 type MatchSet struct {
-	Name    string `json:"name"`
-	Match   string `json:"match,omitempty"` // "any", "all", "invert"
+	Name  string `json:"name"`
+	Match string `json:"match,omitempty"` // "any", "all", "invert"
 }
 
 // +kubebuilder:object:generate=true
 type Actions struct {
-	RouteAction   string             `json:"routeAction"` // "accept" or "reject"
-	Community     *CommunityAction   `json:"community,omitempty"`
-	Med           *MedAction         `json:"med,omitempty"`
-	AsPrepend     *AsPrependAction   `json:"asPrepend,omitempty"`
-	LocalPref     uint32             `json:"localPref,omitempty"`
+	RouteAction string           `json:"routeAction"` // "accept" or "reject"
+	Community   *CommunityAction `json:"community,omitempty"`
+	Med         *MedAction       `json:"med,omitempty"`
+	AsPrepend   *AsPrependAction `json:"asPrepend,omitempty"`
+	LocalPref   uint32           `json:"localPref,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
