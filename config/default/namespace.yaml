@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+    app.kubernetes.io/component: namespace

@@ -1,0 +1,28 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: k8gobgp-validating-webhook-configuration
+  annotations:
+    cert-manager.io/inject-ca-from: k8gobgp-system/k8gobgp-serving-cert
+webhooks:
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: k8gobgp-webhook-service
+        namespace: k8gobgp-system
+        path: /validate-bgp-purelb-io-v1-bgpconfiguration
+    failurePolicy: Fail
+    name: vbgpconfiguration.kb.io
+    rules:
+      - apiGroups:
+          - bgp.purelb.io
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - bgpconfigurations
+    sideEffects: None

@@ -5,7 +5,15 @@ metadata:
   name: k8gobgp-manager-role
 rules:
 - apiGroups:
-  - bgp.example.com
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - bgp.purelb.io
   resources:
   - bgpconfigurations
   verbs:
@@ -17,13 +25,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - bgp.example.com
+  - bgp.purelb.io
   resources:
   - bgpconfigurations/finalizers
   verbs:
   - update
 - apiGroups:
-  - bgp.example.com
+  - bgp.purelb.io
   resources:
   - bgpconfigurations/status
   verbs:

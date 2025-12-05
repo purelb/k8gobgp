@@ -1,0 +1,46 @@
+# This Certificate is used by cert-manager to generate the webhook TLS certificates
+# and inject the CA bundle into the ValidatingWebhookConfiguration
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: k8gobgp-serving-cert
+  namespace: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+    app.kubernetes.io/component: certificate
+spec:
+  # Certificate will be valid for 1 year
+  duration: 8760h # 365 days
+  # Renew 30 days before expiry
+  renewBefore: 720h # 30 days
+  subject:
+    organizations:
+      - k8gobgp
+  isCA: false
+  privateKey:
+    algorithm: RSA
+    encoding: PKCS1
+    size: 2048
+  usages:
+    - server auth
+    - digital signature
+    - key encipherment
+  dnsNames:
+    - k8gobgp-webhook-service
+    - k8gobgp-webhook-service.k8gobgp-system
+    - k8gobgp-webhook-service.k8gobgp-system.svc
+    - k8gobgp-webhook-service.k8gobgp-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: k8gobgp-selfsigned-issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: k8gobgp-selfsigned-issuer
+  namespace: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+    app.kubernetes.io/component: certificate
+spec:
+  selfSigned: {}

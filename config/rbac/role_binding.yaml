@@ -1,11 +1,14 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: gobgp-manager-rolebinding
+  name: k8gobgp-manager-rolebinding
+  labels:
+    app.kubernetes.io/name: k8gobgp
+    app.kubernetes.io/component: rbac
 subjects:
 - kind: ServiceAccount
-  name: gobgp-controller-manager
-  namespace: gobgp-system # Must match the namespace of the ServiceAccount
+  name: k8gobgp-controller-manager
+  namespace: k8gobgp-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

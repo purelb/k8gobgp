@@ -1,0 +1,43 @@
+apiVersion: bgp.purelb.io/v1
+kind: BGPConfiguration
+metadata:
+  name: bgp-config-with-netlink
+  namespace: k8gobgp-system
+spec:
+  global:
+    asn: 64512
+    routerID: "192.168.1.1"
+    listenPort: 179
+    families:
+      - "ipv4-unicast"
+
+  # Import connected routes from Linux kernel into BGP
+  netlinkImport:
+    enabled: true
+    # Import routes from specific interfaces (supports glob patterns)
+    interfaceList:
+      - "eth*"
+      - "ens*"
+
+  # Export BGP routes to Linux kernel routing table
+  netlinkExport:
+    enabled: true
+    dampeningInterval: 100  # milliseconds
+    routeProtocol: 186      # RTPROT_BGP
+    rules:
+      - name: "default-export"
+        # Filter by BGP communities (optional)
+        # communityList:
+        #   - "64512:100"
+        tableId: 0          # Main routing table
+        metric: 20
+        validateNexthop: true
+
+  neighbors:
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerAsn: 64513
+        description: "Upstream router with netlink"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true

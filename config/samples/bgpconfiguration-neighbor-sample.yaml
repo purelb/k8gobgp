@@ -1,12 +1,16 @@
-apiVersion: bgp.example.com/v1alpha1
+apiVersion: bgp.purelb.io/v1
 kind: BGPConfiguration
 metadata:
   name: global-bgp-config
+  namespace: k8gobgp-system
 spec:
   global:
     asn: 64512
-    routerID: 192.168.0.1
+    routerID: "192.168.0.1"
   neighbors:
     - config:
-        neighborAddress: 192.168.151.161
-        peerAs: 65413
+        neighborAddress: "192.168.151.161"
+        peerAsn: 65413
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true

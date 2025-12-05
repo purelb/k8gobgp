@@ -1,0 +1,26 @@
+apiVersion: bgp.purelb.io/v1
+kind: BGPConfiguration
+metadata:
+  name: basic-bgp-config
+  namespace: k8gobgp-system
+spec:
+  global:
+    asn: 64512
+    routerID: "192.168.1.1"
+    listenPort: 179
+    families:
+      - "ipv4-unicast"
+      - "ipv6-unicast"
+
+  neighbors:
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerAsn: 64513
+        description: "Upstream router"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+      timers:
+        config:
+          holdTime: 90
+          keepaliveInterval: 30
