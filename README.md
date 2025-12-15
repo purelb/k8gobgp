@@ -24,14 +24,13 @@ A Kubernetes controller for managing GoBGP configurations using Custom Resource 
   - Prometheus metrics for reconciliation, connections, and BGP state
   - Structured logging
   - Health and readiness probes
-- **Validation Webhook**: Comprehensive admission validation for configuration errors
+- **CRD Schema Validation**: OpenAPI v3 schema validation for configuration errors
 
 ## Installation
 
 ### Prerequisites
 
 - Kubernetes 1.25+
-- [cert-manager](https://cert-manager.io/) (for webhook TLS certificates)
 
 ### Quick Start
 
@@ -59,6 +58,7 @@ make deploy IMG=<your-registry>/k8gobgp:latest
 ```
 
 ## Usage
+
 
 ### Basic BGP Configuration
 
@@ -133,9 +133,12 @@ spec:
           enabled: true
 ```
 
-### Authentication Secret
+### Authentication with Secrets
+
+BGP MD5 authentication passwords should be stored in Kubernetes Secrets rather than in the BGPConfiguration directly. This prevents sensitive credentials from being exposed in the CR.
 
 ```yaml
+# First, create the Secret with your BGP passwords
 apiVersion: v1
 kind: Secret
 metadata:
@@ -143,7 +146,86 @@ metadata:
   namespace: k8gobgp-system
 type: Opaque
 stringData:
+  # Use meaningful key names for different peers
   upstream-password: "your-md5-password"
+  peer-router-1: "another-password"
+```
+
+Then reference it in your BGPConfiguration:
+
+```yaml
+apiVersion: bgp.purelb.io/v1
+kind: BGPConfiguration
+metadata:
+  name: bgp-with-auth
+  namespace: k8gobgp-system
+spec:
+  global:
+    asn: 64512
+    routerID: "192.168.1.1"
+
+  neighbors:
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerAsn: 64513
+        description: "Authenticated upstream peer"
+        # Reference the Secret and key containing the password
+        authPasswordSecretRef:
+          name: bgp-secrets
+          key: upstream-password
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+      timers:
+        config:
+          holdTime: 90
+          keepaliveInterval: 30
+```
+
+### Using Peer Groups
+
+Peer groups allow you to define common settings that are inherited by multiple neighbors:
+
+```yaml
+apiVersion: bgp.purelb.io/v1
+kind: BGPConfiguration
+metadata:
+  name: bgp-with-peer-groups
+  namespace: k8gobgp-system
+spec:
+  global:
+    asn: 64512
+    routerID: "192.168.1.1"
+    families:
+      - "ipv4-unicast"
+
+  # Define reusable peer group templates
+  peerGroups:
+    - config:
+        peerGroupName: "upstream-peers"
+        peerAsn: 64513
+        # Peer groups can also use Secret-based authentication
+        authPasswordSecretRef:
+          name: bgp-secrets
+          key: upstream-password
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+      timers:
+        config:
+          holdTime: 90
+          keepaliveInterval: 30
+
+  neighbors:
+    # These neighbors inherit settings from the peer group
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerGroup: "upstream-peers"
+        description: "Primary upstream"
+    - config:
+        neighborAddress: "192.168.1.253"
+        peerGroup: "upstream-peers"
+        description: "Secondary upstream"
 ```
 
 ## Configuration Reference
@@ -155,6 +237,11 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
 - Route policies and defined sets
 - Peer groups and dynamic neighbors
 - Authentication with Secrets
+
+### Important Notes
+
+- **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod restart to take effect. These are immutable at runtime in GoBGP.
+- **Neighbor/Peer Group Changes**: Neighbors, peer groups, policies, and other settings can be updated dynamically without pod restart.
 
 ## Architecture
 
@@ -230,6 +317,49 @@ make install
 # Run controller locally
 make run
 ```
+
+## Troubleshooting
+
+### Check BGPConfiguration Status
+
+```bash
+kubectl -n k8gobgp-system get configs.bgp.purelb.io -o wide
+kubectl -n k8gobgp-system describe config.bgp.purelb.io <name>
+# Or use the short name:
+kubectl -n k8gobgp-system get bgpconfig -o wide
+```
+
+### View Controller Logs
+
+```bash
+kubectl -n k8gobgp-system logs -l app.kubernetes.io/name=k8gobgp -f
+```
+
+### Check GoBGP State
+
+Use the `gobgp` CLI inside the pod to inspect BGP state:
+
+```bash
+# Get pod name
+POD=$(kubectl -n k8gobgp-system get pod -l app.kubernetes.io/name=k8gobgp -o jsonpath='{.items[0].metadata.name}')
+
+# Check global config
+kubectl -n k8gobgp-system exec $POD -- gobgp --target passthrough:///unix:///var/run/gobgp/gobgp.sock global
+
+# List neighbors
+kubectl -n k8gobgp-system exec $POD -- gobgp --target passthrough:///unix:///var/run/gobgp/gobgp.sock neighbor
+
+# Show neighbor details
+kubectl -n k8gobgp-system exec $POD -- gobgp --target passthrough:///unix:///var/run/gobgp/gobgp.sock neighbor <peer-ip>
+```
+
+### Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| BGPConfiguration stuck in not-ready | Global config change | Delete and recreate pod to apply ASN/RouterID changes |
+| Neighbor not establishing | Authentication mismatch | Verify Secret exists and key matches |
+| No routes imported | Netlink config missing | Check `netlinkImport.enabled` and interface patterns |
 
 ## Contributing
 

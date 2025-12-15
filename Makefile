@@ -16,7 +16,7 @@ help: ## Display this help.
 .PHONY: manifests
 manifests: ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	@echo "Generating CRDs and RBAC..."
-	@$(CONTROLLER_GEN) rbac:roleName=manager-role crd paths="./api/..." output:crd:dir=./config/crd/bases output:rbac:dir=./config/rbac
+	@$(CONTROLLER_GEN) rbac:roleName=k8gobgp-manager-role crd paths="./api/...;./controllers/..." output:crd:dir=./config/crd/bases output:rbac:dir=./config/rbac
 
 .PHONY: generate
 generate: ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.

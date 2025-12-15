@@ -47,9 +47,9 @@ type BGPConfigurationReconciler struct {
 	GoBGPEndpoint string
 }
 
-// +kubebuilder:rbac:groups=bgp.purelb.io,resources=bgpconfigurations,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=bgp.purelb.io,resources=bgpconfigurations/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=bgp.purelb.io,resources=bgpconfigurations/finalizers,verbs=update
+// +kubebuilder:rbac:groups=bgp.purelb.io,resources=configs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=bgp.purelb.io,resources=configs/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=bgp.purelb.io,resources=configs/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -265,11 +265,10 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			}
 		}
 
-		// Stop BGP server
-		if _, err := apiClient.StopBgp(ctx, &gobgpapi.StopBgpRequest{}); err != nil {
-			log.Error(err, "Failed to stop BGP server during cleanup")
-			// Don't add to errors - stopping BGP is best-effort
-		}
+		// Note: We don't call StopBgp here because:
+		// 1. StopBgp can block indefinitely waiting for peer FSMs to complete
+		// 2. The BGP server will stop when the pod terminates
+		// 3. We've already cleaned up neighbors, peer groups, VRFs, and other resources
 
 		// If there were cleanup errors, retry
 		if len(cleanupErrors) > 0 {
@@ -327,18 +326,31 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	desired := crdToAPIGlobal(&bgpConfig.Spec.Global)
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
 	if err != nil {
+		// gRPC error - server may not be accessible
 		log.Info("BGP server not running, calling StartBgp")
 		_, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired})
 		return startErr
 	}
-	if !reflect.DeepEqual(desired, current.Global) {
-		log.Info("Global config changed, restarting BGP server")
-		_, stopErr := apiClient.StopBgp(ctx, &gobgpapi.StopBgpRequest{})
-		if stopErr != nil {
-			return stopErr
-		}
+
+	// GetBgp returns empty config (ASN=0) when gobgpd started but StartBgp never called
+	if current.Global.Asn == 0 {
+		log.Info("BGP server not initialized, calling StartBgp")
 		_, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired})
 		return startErr
+	}
+
+	// BGP server already running with config - check if immutable fields (ASN, RouterID) match
+	// We only compare ASN and RouterID because other fields (ListenPort, ListenAddresses)
+	// are set by gobgp with defaults and would cause false positives with reflect.DeepEqual
+	if current.Global.Asn != desired.Asn || current.Global.RouterId != desired.RouterId {
+		// Global config (ASN, RouterID) cannot be changed dynamically in gobgp.
+		// A pod restart is required to apply changes to global configuration.
+		log.Info("Global config changed - pod restart required to apply changes",
+			"currentASN", current.Global.Asn,
+			"desiredASN", desired.Asn,
+			"currentRouterID", current.Global.RouterId,
+			"desiredRouterID", desired.RouterId)
+		return fmt.Errorf("global configuration change detected (ASN or RouterID); pod restart required to apply")
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:object:generate=true
+// +kubebuilder:resource:shortName=bgpconfig,scope=Namespaced,path=configs,singular=config
 type BGPConfiguration struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

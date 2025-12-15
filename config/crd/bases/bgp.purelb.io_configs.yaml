@@ -4,14 +4,16 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.19.0
-  name: bgpconfigurations.bgp.purelb.io
+  name: configs.bgp.purelb.io
 spec:
   group: bgp.purelb.io
   names:
     kind: BGPConfiguration
     listKind: BGPConfigurationList
-    plural: bgpconfigurations
-    singular: bgpconfiguration
+    plural: configs
+    shortNames:
+    - bgpconfig
+    singular: config
   scope: Namespaced
   versions:
   - name: v1

@@ -15,7 +15,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	bgpv1 "github.com/adamd/k8gobgp/api/v1"
 	"github.com/adamd/k8gobgp/controllers"
@@ -58,9 +57,6 @@ func main() {
 		Metrics: server.Options{
 			BindAddress: metricsAddr,
 		},
-		WebhookServer: webhook.NewServer(webhook.Options{
-			Port: 9443,
-		}),
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -79,12 +75,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err = (&bgpv1.BGPConfiguration{}).SetupWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "BGPConfiguration")
-			os.Exit(1)
-		}
-	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

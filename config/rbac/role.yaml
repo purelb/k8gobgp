@@ -15,7 +15,7 @@ rules:
 - apiGroups:
   - bgp.purelb.io
   resources:
-  - bgpconfigurations
+  - configs
   verbs:
   - create
   - delete
@@ -27,13 +27,13 @@ rules:
 - apiGroups:
   - bgp.purelb.io
   resources:
-  - bgpconfigurations/finalizers
+  - configs/finalizers
   verbs:
   - update
 - apiGroups:
   - bgp.purelb.io
   resources:
-  - bgpconfigurations/status
+  - configs/status
   verbs:
   - get
   - patch
