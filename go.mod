@@ -1,4 +1,4 @@
-module github.com/adamd/k8gobgp
+module github.com/purelb/k8gobgp
 
 go 1.24.5
 

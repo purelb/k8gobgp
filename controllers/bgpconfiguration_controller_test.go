@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	bgpv1 "github.com/adamd/k8gobgp/api/v1"
+	bgpv1 "github.com/purelb/k8gobgp/api/v1"
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 )
 

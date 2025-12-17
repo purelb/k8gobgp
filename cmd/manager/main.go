@@ -16,8 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	bgpv1 "github.com/adamd/k8gobgp/api/v1"
-	"github.com/adamd/k8gobgp/controllers"
+	bgpv1 "github.com/purelb/k8gobgp/api/v1"
+	"github.com/purelb/k8gobgp/controllers"
 	// +kubebuilder:scaffold:imports
 )
 
