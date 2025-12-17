@@ -23,8 +23,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	bgpv1 "github.com/purelb/k8gobgp/api/v1"
 	gobgpapi "github.com/osrg/gobgp/v4/api"
+	bgpv1 "github.com/purelb/k8gobgp/api/v1"
 )
 
 const (
