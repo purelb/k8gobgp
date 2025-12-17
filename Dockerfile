@@ -22,7 +22,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o manager ./cmd/manager
 
 # Final runtime image
-FROM alpine:3.20
+FROM alpine:3.23
 
 # Install ca-certificates for TLS and bash for entrypoint
 RUN apk add --no-cache ca-certificates bash
