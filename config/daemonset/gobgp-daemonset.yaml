@@ -62,6 +62,13 @@ spec:
           value: "true"
         - name: GOBGP_SOCKET
           value: "/var/run/gobgp/gobgp.sock"
+        # GOBGP_TARGET enables the gobgp CLI to connect without flags
+        # Usage: kubectl exec -it <pod> -- gobgp neighbor
+        - name: GOBGP_TARGET
+          value: "unix:///var/run/gobgp/gobgp.sock"
+        # Add gobgp binaries to PATH for easier CLI access
+        - name: PATH
+          value: "/usr/local/bin:/usr/bin:/bin"
 
         ports:
         - containerPort: 179

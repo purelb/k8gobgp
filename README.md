@@ -337,20 +337,26 @@ kubectl -n k8gobgp-system logs -l app.kubernetes.io/name=k8gobgp -f
 
 ### Check GoBGP State
 
-Use the `gobgp` CLI inside the pod to inspect BGP state:
+Use the `gobgp` CLI inside the pod to inspect BGP state. The `GOBGP_TARGET` environment variable is pre-configured, so no flags are needed:
 
 ```bash
 # Get pod name
 POD=$(kubectl -n k8gobgp-system get pod -l app.kubernetes.io/name=k8gobgp -o jsonpath='{.items[0].metadata.name}')
 
 # Check global config
-kubectl -n k8gobgp-system exec $POD -- gobgp --target passthrough:///unix:///var/run/gobgp/gobgp.sock global
+kubectl -n k8gobgp-system exec $POD -- gobgp global
 
 # List neighbors
-kubectl -n k8gobgp-system exec $POD -- gobgp --target passthrough:///unix:///var/run/gobgp/gobgp.sock neighbor
+kubectl -n k8gobgp-system exec $POD -- gobgp neighbor
 
 # Show neighbor details
-kubectl -n k8gobgp-system exec $POD -- gobgp --target passthrough:///unix:///var/run/gobgp/gobgp.sock neighbor <peer-ip>
+kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip>
+
+# Show received routes from a neighbor
+kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip> adj-in
+
+# Show advertised routes to a neighbor
+kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip> adj-out
 ```
 
 ### Common Issues
