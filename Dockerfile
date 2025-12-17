@@ -1,5 +1,5 @@
 # Build GoBGP daemon and CLI from purelb/gobgp-netlink fork
-FROM golang:1.24-alpine AS gobgpd_builder
+FROM golang:1.25-alpine AS gobgpd_builder
 
 RUN apk add --no-cache git
 
@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gobgpd ./cmd/gobgpd
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gobgp ./cmd/gobgp
 
 # Build the k8gobgp reconciler/controller
-FROM golang:1.24-alpine AS reconciler_builder
+FROM golang:1.25-alpine AS reconciler_builder
 
 WORKDIR /k8gobgp_app
 
