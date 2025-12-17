@@ -5,7 +5,7 @@ go 1.24.5
 toolchain go1.24.11
 
 require (
-	github.com/go-logr/logr v1.4.2
+	github.com/go-logr/logr v1.4.3
 	github.com/osrg/gobgp/v4 v4.0.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/stretchr/testify v1.11.1
