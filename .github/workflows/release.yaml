@@ -102,20 +102,27 @@ jobs:
           mkdir -p dist
           VERSION=${GITHUB_REF_NAME}
 
-          # Generate CRDs
+          # Generate CRDs (already has --- at start)
           cat config/crd/bases/*.yaml > dist/crds.yaml
 
-          # Generate RBAC
-          cat config/rbac/*.yaml > dist/rbac.yaml
+          # Generate RBAC with proper document separators
+          # Order: ServiceAccount, ClusterRole, ClusterRoleBinding
+          echo "---" > dist/rbac.yaml
+          cat config/rbac/service_account.yaml >> dist/rbac.yaml
+          echo "---" >> dist/rbac.yaml
+          cat config/rbac/role.yaml >> dist/rbac.yaml
+          echo "---" >> dist/rbac.yaml
+          cat config/rbac/role_binding.yaml >> dist/rbac.yaml
 
           # Generate production daemonset with versioned image tag
           sed "s|ghcr.io/purelb/k8gobgp:latest|ghcr.io/purelb/k8gobgp:${VERSION}|g" \
             config/daemonset/gobgp-daemonset-prod.yaml > dist/daemonset.yaml
 
           # Generate all-in-one install manifest
+          # Order: Namespace, CRDs, RBAC, DaemonSet
           echo "---" > dist/install.yaml
+          cat config/default/namespace.yaml >> dist/install.yaml
           cat dist/crds.yaml >> dist/install.yaml
-          echo "---" >> dist/install.yaml
           cat dist/rbac.yaml >> dist/install.yaml
           echo "---" >> dist/install.yaml
           cat dist/daemonset.yaml >> dist/install.yaml
