@@ -115,3 +115,22 @@ jobs:
         uses: securego/gosec@master
         with:
           args: -exclude-dir=vendor ./...
+
+  # Combined status check for branch protection rules
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    needs: [lint, test, build, docker-build, security]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]] || \
+             [[ "${{ needs.docker-build.result }}" != "success" ]] || \
+             [[ "${{ needs.security.result }}" != "success" ]]; then
+            echo "One or more jobs failed"
+            exit 1
+          fi
+          echo "All jobs passed"
