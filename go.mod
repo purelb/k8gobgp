@@ -16,8 +16,8 @@ require (
 	sigs.k8s.io/controller-runtime v0.21.0
 )
 
-// Use purelb/gobgp-netlink fork for netlink integration
-replace github.com/osrg/gobgp/v4 => github.com/purelb/gobgp-netlink/v4 v4.0.0
+// Use purelb/gobgp-netlink fork for netlink integration (netlink-grpc-complete branch)
+replace github.com/osrg/gobgp/v4 => github.com/purelb/gobgp-netlink/v4 v4.0.1-0.20251222165807-108e09f79f16
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

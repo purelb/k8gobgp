@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/purelb/k8gobgp)](https://goreportcard.com/report/github.com/purelb/k8gobgp)
 
-A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork for enhanced Linux kernel integration.
+A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.1.1) for enhanced Linux kernel integration.
 
 ## Features
 
@@ -15,7 +15,7 @@ A Kubernetes controller for managing GoBGP configurations using Custom Resource 
 - **Dynamic Neighbors**: Support for dynamic BGP peering with prefix-based matching
 - **VRF Support**: Configure Virtual Routing and Forwarding instances
 - **Route Policies**: Define import/export policies with prefix lists, community matching, and AS path manipulation
-- **Netlink Integration**: Import connected routes from Linux kernel and export BGP routes to routing tables
+- **Netlink Integration**: Import connected routes from Linux kernel and export BGP routes to routing tables, with dynamic enable/disable support (no pod restart required)
 - **Security**:
   - Secret-based authentication (no plaintext passwords in CRDs)
   - Non-root container execution with minimal capabilities
@@ -35,13 +35,12 @@ A Kubernetes controller for managing GoBGP configurations using Custom Resource 
 ### Quick Start
 
 ```bash
-# Install CRDs
+# Option 1: All-in-one install
+kubectl apply -f https://github.com/purelb/k8gobgp/releases/latest/download/install.yaml
+
+# Option 2: Individual manifests
 kubectl apply -f https://github.com/purelb/k8gobgp/releases/latest/download/crds.yaml
-
-# Install RBAC
 kubectl apply -f https://github.com/purelb/k8gobgp/releases/latest/download/rbac.yaml
-
-# Install DaemonSet
 kubectl apply -f https://github.com/purelb/k8gobgp/releases/latest/download/daemonset.yaml
 ```
 
@@ -242,6 +241,7 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
 
 - **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod restart to take effect. These are immutable at runtime in GoBGP.
 - **Neighbor/Peer Group Changes**: Neighbors, peer groups, policies, and other settings can be updated dynamically without pod restart.
+- **Netlink Import/Export**: Can be enabled or disabled dynamically without pod restart. When disabled, imported routes are withdrawn from the RIB.
 
 ## Architecture
 
@@ -270,24 +270,80 @@ k8gobgp runs as a DaemonSet, with one instance per node. Each instance:
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Command-Line Flags
+
+The manager supports the following command-line flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--metrics-bind-address` | `:8080` | Address for the metrics endpoint |
+| `--health-probe-bind-address` | `:8081` | Address for health probes |
+| `--gobgp-endpoint` | (env: `GOBGP_ENDPOINT`) | GoBGP gRPC endpoint (e.g., `localhost:50051` or `unix:///var/run/gobgp/gobgp.sock`) |
+| `--metrics-poll-interval` | `15s` | Interval for polling BGP stats from gobgpd (minimum 15s) |
+| `--enable-per-neighbor-metrics` | `false` | Enable high-cardinality per-neighbor route metrics |
+| `--max-neighbors-metrics` | `200` | Maximum neighbors for per-neighbor metrics (0=unlimited) |
+
 ## Metrics
 
 The controller exposes Prometheus metrics on `:8080/metrics`:
+
+### Controller Metrics
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `k8gobgp_reconcile_total` | Counter | Total reconciliations by result |
 | `k8gobgp_reconcile_duration_seconds` | Histogram | Reconciliation duration |
-| `k8gobgp_neighbors_configured` | Gauge | Number of configured neighbors |
-| `k8gobgp_neighbors_established` | Gauge | Number of established sessions |
-| `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status |
-| `k8gobgp_configuration_ready` | Gauge | Configuration ready status |
+| `k8gobgp_neighbors_configured` | Gauge | Number of configured neighbors (from CRD) |
+| `k8gobgp_neighbors_established` | Gauge | Number of established sessions (from CRD reconcile) |
+| `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected) |
+| `k8gobgp_configuration_ready` | Gauge | Configuration ready status (1=ready) |
+| `k8gobgp_peer_groups_configured` | Gauge | Number of peer groups configured |
+| `k8gobgp_dynamic_neighbors_configured` | Gauge | Number of dynamic neighbors configured |
+| `k8gobgp_vrfs_configured` | Gauge | Number of VRFs configured |
+| `k8gobgp_policies_configured` | Gauge | Number of policies configured |
+| `k8gobgp_defined_sets_configured` | Gauge | Number of defined sets configured |
+| `k8gobgp_cleanup_retries_total` | Counter | Cleanup retries during deletion |
+| `k8gobgp_cleanup_duration_seconds` | Histogram | Cleanup operation duration |
+
+### BGP Stats Metrics (from periodic polling)
+
+These metrics are collected every `--metrics-poll-interval` (default 15s) directly from gobgpd:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `k8gobgp_neighbors_total` | Gauge | Total BGP neighbors from gobgpd |
+| `k8gobgp_neighbors_established_total` | Gauge | Neighbors in ESTABLISHED state |
+| `k8gobgp_neighbors_active` | Gauge | Neighbors in ACTIVE state (attempting connection) |
+| `k8gobgp_neighbors_idle` | Gauge | Neighbors in IDLE state |
+| `k8gobgp_rib_route_count` | Gauge | Routes in RIB by address family (labels: `family`) |
+| `k8gobgp_routes_received_total` | Gauge | Total routes received from all neighbors |
+| `k8gobgp_routes_accepted_total` | Gauge | Total routes accepted from all neighbors |
+| `k8gobgp_routes_advertised_total` | Gauge | Total routes advertised to all neighbors |
+
+### Per-Neighbor Metrics (opt-in, high cardinality)
+
+Enable with `--enable-per-neighbor-metrics`. Limited to `--max-neighbors-metrics` neighbors (default 200):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `k8gobgp_neighbor_routes_received` | Gauge | Routes received by neighbor and family |
+| `k8gobgp_neighbor_routes_accepted` | Gauge | Routes accepted by neighbor and family |
+| `k8gobgp_neighbor_routes_advertised` | Gauge | Routes advertised by neighbor and family |
+
+### Metrics Collection Health
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `k8gobgp_metrics_collection_duration_seconds` | Histogram | Time to collect BGP stats |
+| `k8gobgp_metrics_collection_errors_total` | Counter | Collection errors |
+| `k8gobgp_metrics_collection_skipped_total` | Counter | Collections skipped (previous still running) |
+| `k8gobgp_metrics_cardinality_limit_hit_total` | Counter | Times per-neighbor limit was hit |
 
 ## Development
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.24+
 - Docker
 - kubectl
 - [kubebuilder](https://kubebuilder.io/)
@@ -366,6 +422,8 @@ kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip> adj-out
 | BGPConfiguration stuck in not-ready | Global config change | Delete and recreate pod to apply ASN/RouterID changes |
 | Neighbor not establishing | Authentication mismatch | Verify Secret exists and key matches |
 | No routes imported | Netlink config missing | Check `netlinkImport.enabled` and interface patterns |
+| ConfigurationInvalid status | Invalid community format | Communities must be `AS:VALUE` (0-65535:0-65535) |
+| CRD validation error | Invalid community pattern | Check community format matches `^\d{1,5}:\d{1,5}$` |
 
 ## Contributing
 
@@ -390,5 +448,5 @@ limitations under the License.
 ## Acknowledgments
 
 - [GoBGP](https://github.com/osrg/gobgp) - The BGP implementation
-- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) - Enhanced GoBGP fork with netlink integration
+- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.1.1 - Enhanced GoBGP fork with netlink integration
 - [PureLB](https://purelb.io) - Kubernetes load balancer project

@@ -1,4 +1,5 @@
 // Copyright (C) 2015-2017 Nippon Telegraph and Telephone Corporation.
+// Copyright (C) 2025 Acnodal Inc.
 //
 // Permission is hereby granted, free of charge, to any person
 // obtaining a copy of this software and associated documentation files
@@ -40,61 +41,75 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	GoBgpService_StartBgp_FullMethodName               = "/api.GoBgpService/StartBgp"
-	GoBgpService_StopBgp_FullMethodName                = "/api.GoBgpService/StopBgp"
-	GoBgpService_GetBgp_FullMethodName                 = "/api.GoBgpService/GetBgp"
-	GoBgpService_WatchEvent_FullMethodName             = "/api.GoBgpService/WatchEvent"
-	GoBgpService_AddPeer_FullMethodName                = "/api.GoBgpService/AddPeer"
-	GoBgpService_DeletePeer_FullMethodName             = "/api.GoBgpService/DeletePeer"
-	GoBgpService_ListPeer_FullMethodName               = "/api.GoBgpService/ListPeer"
-	GoBgpService_UpdatePeer_FullMethodName             = "/api.GoBgpService/UpdatePeer"
-	GoBgpService_ResetPeer_FullMethodName              = "/api.GoBgpService/ResetPeer"
-	GoBgpService_ShutdownPeer_FullMethodName           = "/api.GoBgpService/ShutdownPeer"
-	GoBgpService_EnablePeer_FullMethodName             = "/api.GoBgpService/EnablePeer"
-	GoBgpService_DisablePeer_FullMethodName            = "/api.GoBgpService/DisablePeer"
-	GoBgpService_AddPeerGroup_FullMethodName           = "/api.GoBgpService/AddPeerGroup"
-	GoBgpService_DeletePeerGroup_FullMethodName        = "/api.GoBgpService/DeletePeerGroup"
-	GoBgpService_ListPeerGroup_FullMethodName          = "/api.GoBgpService/ListPeerGroup"
-	GoBgpService_UpdatePeerGroup_FullMethodName        = "/api.GoBgpService/UpdatePeerGroup"
-	GoBgpService_AddDynamicNeighbor_FullMethodName     = "/api.GoBgpService/AddDynamicNeighbor"
-	GoBgpService_ListDynamicNeighbor_FullMethodName    = "/api.GoBgpService/ListDynamicNeighbor"
-	GoBgpService_DeleteDynamicNeighbor_FullMethodName  = "/api.GoBgpService/DeleteDynamicNeighbor"
-	GoBgpService_AddPath_FullMethodName                = "/api.GoBgpService/AddPath"
-	GoBgpService_DeletePath_FullMethodName             = "/api.GoBgpService/DeletePath"
-	GoBgpService_ListPath_FullMethodName               = "/api.GoBgpService/ListPath"
-	GoBgpService_AddPathStream_FullMethodName          = "/api.GoBgpService/AddPathStream"
-	GoBgpService_GetTable_FullMethodName               = "/api.GoBgpService/GetTable"
-	GoBgpService_AddVrf_FullMethodName                 = "/api.GoBgpService/AddVrf"
-	GoBgpService_DeleteVrf_FullMethodName              = "/api.GoBgpService/DeleteVrf"
-	GoBgpService_ListVrf_FullMethodName                = "/api.GoBgpService/ListVrf"
-	GoBgpService_AddPolicy_FullMethodName              = "/api.GoBgpService/AddPolicy"
-	GoBgpService_DeletePolicy_FullMethodName           = "/api.GoBgpService/DeletePolicy"
-	GoBgpService_ListPolicy_FullMethodName             = "/api.GoBgpService/ListPolicy"
-	GoBgpService_SetPolicies_FullMethodName            = "/api.GoBgpService/SetPolicies"
-	GoBgpService_AddDefinedSet_FullMethodName          = "/api.GoBgpService/AddDefinedSet"
-	GoBgpService_DeleteDefinedSet_FullMethodName       = "/api.GoBgpService/DeleteDefinedSet"
-	GoBgpService_ListDefinedSet_FullMethodName         = "/api.GoBgpService/ListDefinedSet"
-	GoBgpService_AddStatement_FullMethodName           = "/api.GoBgpService/AddStatement"
-	GoBgpService_DeleteStatement_FullMethodName        = "/api.GoBgpService/DeleteStatement"
-	GoBgpService_ListStatement_FullMethodName          = "/api.GoBgpService/ListStatement"
-	GoBgpService_AddPolicyAssignment_FullMethodName    = "/api.GoBgpService/AddPolicyAssignment"
-	GoBgpService_DeletePolicyAssignment_FullMethodName = "/api.GoBgpService/DeletePolicyAssignment"
-	GoBgpService_ListPolicyAssignment_FullMethodName   = "/api.GoBgpService/ListPolicyAssignment"
-	GoBgpService_SetPolicyAssignment_FullMethodName    = "/api.GoBgpService/SetPolicyAssignment"
-	GoBgpService_AddRpki_FullMethodName                = "/api.GoBgpService/AddRpki"
-	GoBgpService_DeleteRpki_FullMethodName             = "/api.GoBgpService/DeleteRpki"
-	GoBgpService_ListRpki_FullMethodName               = "/api.GoBgpService/ListRpki"
-	GoBgpService_EnableRpki_FullMethodName             = "/api.GoBgpService/EnableRpki"
-	GoBgpService_DisableRpki_FullMethodName            = "/api.GoBgpService/DisableRpki"
-	GoBgpService_ResetRpki_FullMethodName              = "/api.GoBgpService/ResetRpki"
-	GoBgpService_ListRpkiTable_FullMethodName          = "/api.GoBgpService/ListRpkiTable"
-	GoBgpService_EnableZebra_FullMethodName            = "/api.GoBgpService/EnableZebra"
-	GoBgpService_EnableMrt_FullMethodName              = "/api.GoBgpService/EnableMrt"
-	GoBgpService_DisableMrt_FullMethodName             = "/api.GoBgpService/DisableMrt"
-	GoBgpService_AddBmp_FullMethodName                 = "/api.GoBgpService/AddBmp"
-	GoBgpService_DeleteBmp_FullMethodName              = "/api.GoBgpService/DeleteBmp"
-	GoBgpService_ListBmp_FullMethodName                = "/api.GoBgpService/ListBmp"
-	GoBgpService_SetLogLevel_FullMethodName            = "/api.GoBgpService/SetLogLevel"
+	GoBgpService_StartBgp_FullMethodName                = "/api.GoBgpService/StartBgp"
+	GoBgpService_StopBgp_FullMethodName                 = "/api.GoBgpService/StopBgp"
+	GoBgpService_GetBgp_FullMethodName                  = "/api.GoBgpService/GetBgp"
+	GoBgpService_WatchEvent_FullMethodName              = "/api.GoBgpService/WatchEvent"
+	GoBgpService_AddPeer_FullMethodName                 = "/api.GoBgpService/AddPeer"
+	GoBgpService_DeletePeer_FullMethodName              = "/api.GoBgpService/DeletePeer"
+	GoBgpService_ListPeer_FullMethodName                = "/api.GoBgpService/ListPeer"
+	GoBgpService_UpdatePeer_FullMethodName              = "/api.GoBgpService/UpdatePeer"
+	GoBgpService_ResetPeer_FullMethodName               = "/api.GoBgpService/ResetPeer"
+	GoBgpService_ShutdownPeer_FullMethodName            = "/api.GoBgpService/ShutdownPeer"
+	GoBgpService_EnablePeer_FullMethodName              = "/api.GoBgpService/EnablePeer"
+	GoBgpService_DisablePeer_FullMethodName             = "/api.GoBgpService/DisablePeer"
+	GoBgpService_AddPeerGroup_FullMethodName            = "/api.GoBgpService/AddPeerGroup"
+	GoBgpService_DeletePeerGroup_FullMethodName         = "/api.GoBgpService/DeletePeerGroup"
+	GoBgpService_ListPeerGroup_FullMethodName           = "/api.GoBgpService/ListPeerGroup"
+	GoBgpService_UpdatePeerGroup_FullMethodName         = "/api.GoBgpService/UpdatePeerGroup"
+	GoBgpService_AddDynamicNeighbor_FullMethodName      = "/api.GoBgpService/AddDynamicNeighbor"
+	GoBgpService_ListDynamicNeighbor_FullMethodName     = "/api.GoBgpService/ListDynamicNeighbor"
+	GoBgpService_DeleteDynamicNeighbor_FullMethodName   = "/api.GoBgpService/DeleteDynamicNeighbor"
+	GoBgpService_AddPath_FullMethodName                 = "/api.GoBgpService/AddPath"
+	GoBgpService_DeletePath_FullMethodName              = "/api.GoBgpService/DeletePath"
+	GoBgpService_ListPath_FullMethodName                = "/api.GoBgpService/ListPath"
+	GoBgpService_AddPathStream_FullMethodName           = "/api.GoBgpService/AddPathStream"
+	GoBgpService_GetTable_FullMethodName                = "/api.GoBgpService/GetTable"
+	GoBgpService_AddVrf_FullMethodName                  = "/api.GoBgpService/AddVrf"
+	GoBgpService_DeleteVrf_FullMethodName               = "/api.GoBgpService/DeleteVrf"
+	GoBgpService_ListVrf_FullMethodName                 = "/api.GoBgpService/ListVrf"
+	GoBgpService_AddPolicy_FullMethodName               = "/api.GoBgpService/AddPolicy"
+	GoBgpService_DeletePolicy_FullMethodName            = "/api.GoBgpService/DeletePolicy"
+	GoBgpService_ListPolicy_FullMethodName              = "/api.GoBgpService/ListPolicy"
+	GoBgpService_SetPolicies_FullMethodName             = "/api.GoBgpService/SetPolicies"
+	GoBgpService_AddDefinedSet_FullMethodName           = "/api.GoBgpService/AddDefinedSet"
+	GoBgpService_DeleteDefinedSet_FullMethodName        = "/api.GoBgpService/DeleteDefinedSet"
+	GoBgpService_ListDefinedSet_FullMethodName          = "/api.GoBgpService/ListDefinedSet"
+	GoBgpService_AddStatement_FullMethodName            = "/api.GoBgpService/AddStatement"
+	GoBgpService_DeleteStatement_FullMethodName         = "/api.GoBgpService/DeleteStatement"
+	GoBgpService_ListStatement_FullMethodName           = "/api.GoBgpService/ListStatement"
+	GoBgpService_AddPolicyAssignment_FullMethodName     = "/api.GoBgpService/AddPolicyAssignment"
+	GoBgpService_DeletePolicyAssignment_FullMethodName  = "/api.GoBgpService/DeletePolicyAssignment"
+	GoBgpService_ListPolicyAssignment_FullMethodName    = "/api.GoBgpService/ListPolicyAssignment"
+	GoBgpService_SetPolicyAssignment_FullMethodName     = "/api.GoBgpService/SetPolicyAssignment"
+	GoBgpService_AddRpki_FullMethodName                 = "/api.GoBgpService/AddRpki"
+	GoBgpService_DeleteRpki_FullMethodName              = "/api.GoBgpService/DeleteRpki"
+	GoBgpService_ListRpki_FullMethodName                = "/api.GoBgpService/ListRpki"
+	GoBgpService_EnableRpki_FullMethodName              = "/api.GoBgpService/EnableRpki"
+	GoBgpService_DisableRpki_FullMethodName             = "/api.GoBgpService/DisableRpki"
+	GoBgpService_ResetRpki_FullMethodName               = "/api.GoBgpService/ResetRpki"
+	GoBgpService_ListRpkiTable_FullMethodName           = "/api.GoBgpService/ListRpkiTable"
+	GoBgpService_EnableZebra_FullMethodName             = "/api.GoBgpService/EnableZebra"
+	GoBgpService_GetNetlink_FullMethodName              = "/api.GoBgpService/GetNetlink"
+	GoBgpService_EnableNetlinkImport_FullMethodName     = "/api.GoBgpService/EnableNetlinkImport"
+	GoBgpService_DisableNetlinkImport_FullMethodName    = "/api.GoBgpService/DisableNetlinkImport"
+	GoBgpService_EnableNetlinkExport_FullMethodName     = "/api.GoBgpService/EnableNetlinkExport"
+	GoBgpService_DisableNetlinkExport_FullMethodName    = "/api.GoBgpService/DisableNetlinkExport"
+	GoBgpService_EnableVrfNetlinkImport_FullMethodName  = "/api.GoBgpService/EnableVrfNetlinkImport"
+	GoBgpService_DisableVrfNetlinkImport_FullMethodName = "/api.GoBgpService/DisableVrfNetlinkImport"
+	GoBgpService_EnableVrfNetlinkExport_FullMethodName  = "/api.GoBgpService/EnableVrfNetlinkExport"
+	GoBgpService_DisableVrfNetlinkExport_FullMethodName = "/api.GoBgpService/DisableVrfNetlinkExport"
+	GoBgpService_GetNetlinkImportStats_FullMethodName   = "/api.GoBgpService/GetNetlinkImportStats"
+	GoBgpService_ListNetlinkExport_FullMethodName       = "/api.GoBgpService/ListNetlinkExport"
+	GoBgpService_GetNetlinkExportStats_FullMethodName   = "/api.GoBgpService/GetNetlinkExportStats"
+	GoBgpService_FlushNetlinkExport_FullMethodName      = "/api.GoBgpService/FlushNetlinkExport"
+	GoBgpService_ListNetlinkExportRules_FullMethodName  = "/api.GoBgpService/ListNetlinkExportRules"
+	GoBgpService_EnableMrt_FullMethodName               = "/api.GoBgpService/EnableMrt"
+	GoBgpService_DisableMrt_FullMethodName              = "/api.GoBgpService/DisableMrt"
+	GoBgpService_AddBmp_FullMethodName                  = "/api.GoBgpService/AddBmp"
+	GoBgpService_DeleteBmp_FullMethodName               = "/api.GoBgpService/DeleteBmp"
+	GoBgpService_ListBmp_FullMethodName                 = "/api.GoBgpService/ListBmp"
+	GoBgpService_SetLogLevel_FullMethodName             = "/api.GoBgpService/SetLogLevel"
 )
 
 // GoBgpServiceClient is the client API for GoBgpService service.
@@ -152,6 +167,20 @@ type GoBgpServiceClient interface {
 	ResetRpki(ctx context.Context, in *ResetRpkiRequest, opts ...grpc.CallOption) (*ResetRpkiResponse, error)
 	ListRpkiTable(ctx context.Context, in *ListRpkiTableRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListRpkiTableResponse], error)
 	EnableZebra(ctx context.Context, in *EnableZebraRequest, opts ...grpc.CallOption) (*EnableZebraResponse, error)
+	GetNetlink(ctx context.Context, in *GetNetlinkRequest, opts ...grpc.CallOption) (*GetNetlinkResponse, error)
+	EnableNetlinkImport(ctx context.Context, in *EnableNetlinkImportRequest, opts ...grpc.CallOption) (*EnableNetlinkImportResponse, error)
+	DisableNetlinkImport(ctx context.Context, in *DisableNetlinkImportRequest, opts ...grpc.CallOption) (*DisableNetlinkImportResponse, error)
+	EnableNetlinkExport(ctx context.Context, in *EnableNetlinkExportRequest, opts ...grpc.CallOption) (*EnableNetlinkExportResponse, error)
+	DisableNetlinkExport(ctx context.Context, in *DisableNetlinkExportRequest, opts ...grpc.CallOption) (*DisableNetlinkExportResponse, error)
+	EnableVrfNetlinkImport(ctx context.Context, in *EnableVrfNetlinkImportRequest, opts ...grpc.CallOption) (*EnableVrfNetlinkImportResponse, error)
+	DisableVrfNetlinkImport(ctx context.Context, in *DisableVrfNetlinkImportRequest, opts ...grpc.CallOption) (*DisableVrfNetlinkImportResponse, error)
+	EnableVrfNetlinkExport(ctx context.Context, in *EnableVrfNetlinkExportRequest, opts ...grpc.CallOption) (*EnableVrfNetlinkExportResponse, error)
+	DisableVrfNetlinkExport(ctx context.Context, in *DisableVrfNetlinkExportRequest, opts ...grpc.CallOption) (*DisableVrfNetlinkExportResponse, error)
+	GetNetlinkImportStats(ctx context.Context, in *GetNetlinkImportStatsRequest, opts ...grpc.CallOption) (*GetNetlinkImportStatsResponse, error)
+	ListNetlinkExport(ctx context.Context, in *ListNetlinkExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListNetlinkExportResponse], error)
+	GetNetlinkExportStats(ctx context.Context, in *GetNetlinkExportStatsRequest, opts ...grpc.CallOption) (*GetNetlinkExportStatsResponse, error)
+	FlushNetlinkExport(ctx context.Context, in *FlushNetlinkExportRequest, opts ...grpc.CallOption) (*FlushNetlinkExportResponse, error)
+	ListNetlinkExportRules(ctx context.Context, in *ListNetlinkExportRulesRequest, opts ...grpc.CallOption) (*ListNetlinkExportRulesResponse, error)
 	EnableMrt(ctx context.Context, in *EnableMrtRequest, opts ...grpc.CallOption) (*EnableMrtResponse, error)
 	DisableMrt(ctx context.Context, in *DisableMrtRequest, opts ...grpc.CallOption) (*DisableMrtResponse, error)
 	AddBmp(ctx context.Context, in *AddBmpRequest, opts ...grpc.CallOption) (*AddBmpResponse, error)
@@ -769,6 +798,155 @@ func (c *goBgpServiceClient) EnableZebra(ctx context.Context, in *EnableZebraReq
 	return out, nil
 }
 
+func (c *goBgpServiceClient) GetNetlink(ctx context.Context, in *GetNetlinkRequest, opts ...grpc.CallOption) (*GetNetlinkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetlinkResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_GetNetlink_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) EnableNetlinkImport(ctx context.Context, in *EnableNetlinkImportRequest, opts ...grpc.CallOption) (*EnableNetlinkImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnableNetlinkImportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_EnableNetlinkImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) DisableNetlinkImport(ctx context.Context, in *DisableNetlinkImportRequest, opts ...grpc.CallOption) (*DisableNetlinkImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisableNetlinkImportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_DisableNetlinkImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) EnableNetlinkExport(ctx context.Context, in *EnableNetlinkExportRequest, opts ...grpc.CallOption) (*EnableNetlinkExportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnableNetlinkExportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_EnableNetlinkExport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) DisableNetlinkExport(ctx context.Context, in *DisableNetlinkExportRequest, opts ...grpc.CallOption) (*DisableNetlinkExportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisableNetlinkExportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_DisableNetlinkExport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) EnableVrfNetlinkImport(ctx context.Context, in *EnableVrfNetlinkImportRequest, opts ...grpc.CallOption) (*EnableVrfNetlinkImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnableVrfNetlinkImportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_EnableVrfNetlinkImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) DisableVrfNetlinkImport(ctx context.Context, in *DisableVrfNetlinkImportRequest, opts ...grpc.CallOption) (*DisableVrfNetlinkImportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisableVrfNetlinkImportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_DisableVrfNetlinkImport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) EnableVrfNetlinkExport(ctx context.Context, in *EnableVrfNetlinkExportRequest, opts ...grpc.CallOption) (*EnableVrfNetlinkExportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EnableVrfNetlinkExportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_EnableVrfNetlinkExport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) DisableVrfNetlinkExport(ctx context.Context, in *DisableVrfNetlinkExportRequest, opts ...grpc.CallOption) (*DisableVrfNetlinkExportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DisableVrfNetlinkExportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_DisableVrfNetlinkExport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) GetNetlinkImportStats(ctx context.Context, in *GetNetlinkImportStatsRequest, opts ...grpc.CallOption) (*GetNetlinkImportStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetlinkImportStatsResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_GetNetlinkImportStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) ListNetlinkExport(ctx context.Context, in *ListNetlinkExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListNetlinkExportResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[13], GoBgpService_ListNetlinkExport_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ListNetlinkExportRequest, ListNetlinkExportResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GoBgpService_ListNetlinkExportClient = grpc.ServerStreamingClient[ListNetlinkExportResponse]
+
+func (c *goBgpServiceClient) GetNetlinkExportStats(ctx context.Context, in *GetNetlinkExportStatsRequest, opts ...grpc.CallOption) (*GetNetlinkExportStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNetlinkExportStatsResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_GetNetlinkExportStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) FlushNetlinkExport(ctx context.Context, in *FlushNetlinkExportRequest, opts ...grpc.CallOption) (*FlushNetlinkExportResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FlushNetlinkExportResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_FlushNetlinkExport_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *goBgpServiceClient) ListNetlinkExportRules(ctx context.Context, in *ListNetlinkExportRulesRequest, opts ...grpc.CallOption) (*ListNetlinkExportRulesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListNetlinkExportRulesResponse)
+	err := c.cc.Invoke(ctx, GoBgpService_ListNetlinkExportRules_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *goBgpServiceClient) EnableMrt(ctx context.Context, in *EnableMrtRequest, opts ...grpc.CallOption) (*EnableMrtResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(EnableMrtResponse)
@@ -811,7 +989,7 @@ func (c *goBgpServiceClient) DeleteBmp(ctx context.Context, in *DeleteBmpRequest
 
 func (c *goBgpServiceClient) ListBmp(ctx context.Context, in *ListBmpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ListBmpResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[13], GoBgpService_ListBmp_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &GoBgpService_ServiceDesc.Streams[14], GoBgpService_ListBmp_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -893,6 +1071,20 @@ type GoBgpServiceServer interface {
 	ResetRpki(context.Context, *ResetRpkiRequest) (*ResetRpkiResponse, error)
 	ListRpkiTable(*ListRpkiTableRequest, grpc.ServerStreamingServer[ListRpkiTableResponse]) error
 	EnableZebra(context.Context, *EnableZebraRequest) (*EnableZebraResponse, error)
+	GetNetlink(context.Context, *GetNetlinkRequest) (*GetNetlinkResponse, error)
+	EnableNetlinkImport(context.Context, *EnableNetlinkImportRequest) (*EnableNetlinkImportResponse, error)
+	DisableNetlinkImport(context.Context, *DisableNetlinkImportRequest) (*DisableNetlinkImportResponse, error)
+	EnableNetlinkExport(context.Context, *EnableNetlinkExportRequest) (*EnableNetlinkExportResponse, error)
+	DisableNetlinkExport(context.Context, *DisableNetlinkExportRequest) (*DisableNetlinkExportResponse, error)
+	EnableVrfNetlinkImport(context.Context, *EnableVrfNetlinkImportRequest) (*EnableVrfNetlinkImportResponse, error)
+	DisableVrfNetlinkImport(context.Context, *DisableVrfNetlinkImportRequest) (*DisableVrfNetlinkImportResponse, error)
+	EnableVrfNetlinkExport(context.Context, *EnableVrfNetlinkExportRequest) (*EnableVrfNetlinkExportResponse, error)
+	DisableVrfNetlinkExport(context.Context, *DisableVrfNetlinkExportRequest) (*DisableVrfNetlinkExportResponse, error)
+	GetNetlinkImportStats(context.Context, *GetNetlinkImportStatsRequest) (*GetNetlinkImportStatsResponse, error)
+	ListNetlinkExport(*ListNetlinkExportRequest, grpc.ServerStreamingServer[ListNetlinkExportResponse]) error
+	GetNetlinkExportStats(context.Context, *GetNetlinkExportStatsRequest) (*GetNetlinkExportStatsResponse, error)
+	FlushNetlinkExport(context.Context, *FlushNetlinkExportRequest) (*FlushNetlinkExportResponse, error)
+	ListNetlinkExportRules(context.Context, *ListNetlinkExportRulesRequest) (*ListNetlinkExportRulesResponse, error)
 	EnableMrt(context.Context, *EnableMrtRequest) (*EnableMrtResponse, error)
 	DisableMrt(context.Context, *DisableMrtRequest) (*DisableMrtResponse, error)
 	AddBmp(context.Context, *AddBmpRequest) (*AddBmpResponse, error)
@@ -1055,6 +1247,48 @@ func (UnimplementedGoBgpServiceServer) ListRpkiTable(*ListRpkiTableRequest, grpc
 }
 func (UnimplementedGoBgpServiceServer) EnableZebra(context.Context, *EnableZebraRequest) (*EnableZebraResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EnableZebra not implemented")
+}
+func (UnimplementedGoBgpServiceServer) GetNetlink(context.Context, *GetNetlinkRequest) (*GetNetlinkResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetNetlink not implemented")
+}
+func (UnimplementedGoBgpServiceServer) EnableNetlinkImport(context.Context, *EnableNetlinkImportRequest) (*EnableNetlinkImportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method EnableNetlinkImport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) DisableNetlinkImport(context.Context, *DisableNetlinkImportRequest) (*DisableNetlinkImportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DisableNetlinkImport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) EnableNetlinkExport(context.Context, *EnableNetlinkExportRequest) (*EnableNetlinkExportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method EnableNetlinkExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) DisableNetlinkExport(context.Context, *DisableNetlinkExportRequest) (*DisableNetlinkExportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DisableNetlinkExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) EnableVrfNetlinkImport(context.Context, *EnableVrfNetlinkImportRequest) (*EnableVrfNetlinkImportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method EnableVrfNetlinkImport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) DisableVrfNetlinkImport(context.Context, *DisableVrfNetlinkImportRequest) (*DisableVrfNetlinkImportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DisableVrfNetlinkImport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) EnableVrfNetlinkExport(context.Context, *EnableVrfNetlinkExportRequest) (*EnableVrfNetlinkExportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method EnableVrfNetlinkExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) DisableVrfNetlinkExport(context.Context, *DisableVrfNetlinkExportRequest) (*DisableVrfNetlinkExportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method DisableVrfNetlinkExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) GetNetlinkImportStats(context.Context, *GetNetlinkImportStatsRequest) (*GetNetlinkImportStatsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetNetlinkImportStats not implemented")
+}
+func (UnimplementedGoBgpServiceServer) ListNetlinkExport(*ListNetlinkExportRequest, grpc.ServerStreamingServer[ListNetlinkExportResponse]) error {
+	return status.Errorf(codes.Unimplemented, "method ListNetlinkExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) GetNetlinkExportStats(context.Context, *GetNetlinkExportStatsRequest) (*GetNetlinkExportStatsResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetNetlinkExportStats not implemented")
+}
+func (UnimplementedGoBgpServiceServer) FlushNetlinkExport(context.Context, *FlushNetlinkExportRequest) (*FlushNetlinkExportResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method FlushNetlinkExport not implemented")
+}
+func (UnimplementedGoBgpServiceServer) ListNetlinkExportRules(context.Context, *ListNetlinkExportRulesRequest) (*ListNetlinkExportRulesResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method ListNetlinkExportRules not implemented")
 }
 func (UnimplementedGoBgpServiceServer) EnableMrt(context.Context, *EnableMrtRequest) (*EnableMrtResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EnableMrt not implemented")
@@ -1882,6 +2116,251 @@ func _GoBgpService_EnableZebra_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _GoBgpService_GetNetlink_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetlinkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).GetNetlink(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_GetNetlink_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).GetNetlink(ctx, req.(*GetNetlinkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_EnableNetlinkImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableNetlinkImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).EnableNetlinkImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_EnableNetlinkImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).EnableNetlinkImport(ctx, req.(*EnableNetlinkImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_DisableNetlinkImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableNetlinkImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).DisableNetlinkImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_DisableNetlinkImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).DisableNetlinkImport(ctx, req.(*DisableNetlinkImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_EnableNetlinkExport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableNetlinkExportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).EnableNetlinkExport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_EnableNetlinkExport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).EnableNetlinkExport(ctx, req.(*EnableNetlinkExportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_DisableNetlinkExport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableNetlinkExportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).DisableNetlinkExport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_DisableNetlinkExport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).DisableNetlinkExport(ctx, req.(*DisableNetlinkExportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_EnableVrfNetlinkImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableVrfNetlinkImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).EnableVrfNetlinkImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_EnableVrfNetlinkImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).EnableVrfNetlinkImport(ctx, req.(*EnableVrfNetlinkImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_DisableVrfNetlinkImport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableVrfNetlinkImportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).DisableVrfNetlinkImport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_DisableVrfNetlinkImport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).DisableVrfNetlinkImport(ctx, req.(*DisableVrfNetlinkImportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_EnableVrfNetlinkExport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EnableVrfNetlinkExportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).EnableVrfNetlinkExport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_EnableVrfNetlinkExport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).EnableVrfNetlinkExport(ctx, req.(*EnableVrfNetlinkExportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_DisableVrfNetlinkExport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DisableVrfNetlinkExportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).DisableVrfNetlinkExport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_DisableVrfNetlinkExport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).DisableVrfNetlinkExport(ctx, req.(*DisableVrfNetlinkExportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_GetNetlinkImportStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetlinkImportStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).GetNetlinkImportStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_GetNetlinkImportStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).GetNetlinkImportStats(ctx, req.(*GetNetlinkImportStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_ListNetlinkExport_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ListNetlinkExportRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(GoBgpServiceServer).ListNetlinkExport(m, &grpc.GenericServerStream[ListNetlinkExportRequest, ListNetlinkExportResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type GoBgpService_ListNetlinkExportServer = grpc.ServerStreamingServer[ListNetlinkExportResponse]
+
+func _GoBgpService_GetNetlinkExportStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNetlinkExportStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).GetNetlinkExportStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_GetNetlinkExportStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).GetNetlinkExportStats(ctx, req.(*GetNetlinkExportStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_FlushNetlinkExport_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FlushNetlinkExportRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).FlushNetlinkExport(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_FlushNetlinkExport_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).FlushNetlinkExport(ctx, req.(*FlushNetlinkExportRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _GoBgpService_ListNetlinkExportRules_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListNetlinkExportRulesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(GoBgpServiceServer).ListNetlinkExportRules(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: GoBgpService_ListNetlinkExportRules_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(GoBgpServiceServer).ListNetlinkExportRules(ctx, req.(*ListNetlinkExportRulesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _GoBgpService_EnableMrt_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(EnableMrtRequest)
 	if err := dec(in); err != nil {
@@ -2135,6 +2614,58 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _GoBgpService_EnableZebra_Handler,
 		},
 		{
+			MethodName: "GetNetlink",
+			Handler:    _GoBgpService_GetNetlink_Handler,
+		},
+		{
+			MethodName: "EnableNetlinkImport",
+			Handler:    _GoBgpService_EnableNetlinkImport_Handler,
+		},
+		{
+			MethodName: "DisableNetlinkImport",
+			Handler:    _GoBgpService_DisableNetlinkImport_Handler,
+		},
+		{
+			MethodName: "EnableNetlinkExport",
+			Handler:    _GoBgpService_EnableNetlinkExport_Handler,
+		},
+		{
+			MethodName: "DisableNetlinkExport",
+			Handler:    _GoBgpService_DisableNetlinkExport_Handler,
+		},
+		{
+			MethodName: "EnableVrfNetlinkImport",
+			Handler:    _GoBgpService_EnableVrfNetlinkImport_Handler,
+		},
+		{
+			MethodName: "DisableVrfNetlinkImport",
+			Handler:    _GoBgpService_DisableVrfNetlinkImport_Handler,
+		},
+		{
+			MethodName: "EnableVrfNetlinkExport",
+			Handler:    _GoBgpService_EnableVrfNetlinkExport_Handler,
+		},
+		{
+			MethodName: "DisableVrfNetlinkExport",
+			Handler:    _GoBgpService_DisableVrfNetlinkExport_Handler,
+		},
+		{
+			MethodName: "GetNetlinkImportStats",
+			Handler:    _GoBgpService_GetNetlinkImportStats_Handler,
+		},
+		{
+			MethodName: "GetNetlinkExportStats",
+			Handler:    _GoBgpService_GetNetlinkExportStats_Handler,
+		},
+		{
+			MethodName: "FlushNetlinkExport",
+			Handler:    _GoBgpService_FlushNetlinkExport_Handler,
+		},
+		{
+			MethodName: "ListNetlinkExportRules",
+			Handler:    _GoBgpService_ListNetlinkExportRules_Handler,
+		},
+		{
 			MethodName: "EnableMrt",
 			Handler:    _GoBgpService_EnableMrt_Handler,
 		},
@@ -2219,6 +2750,11 @@ var GoBgpService_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ListRpkiTable",
 			Handler:       _GoBgpService_ListRpkiTable_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ListNetlinkExport",
+			Handler:       _GoBgpService_ListNetlinkExport_Handler,
 			ServerStreams: true,
 		},
 		{

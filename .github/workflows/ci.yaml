@@ -7,7 +7,9 @@ on:
     branches: [main]
 
 env:
-  GO_VERSION: "1.22"
+  GO_VERSION: "1.24"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   lint:
@@ -73,6 +75,25 @@ jobs:
           go mod verify
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   security:
     name: Security Scan

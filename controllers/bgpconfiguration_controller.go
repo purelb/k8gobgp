@@ -95,6 +95,25 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	log.Info("Reconciling BGPConfiguration")
 
+	// Validate configuration before attempting to apply
+	validationResult := r.validateConfiguration(bgpConfig)
+	if !validationResult.Valid {
+		errMsg := validationResult.ErrorMessages()
+		log.Error(nil, "Configuration validation failed", "errors", errMsg)
+		r.updateStatusCondition(ctx, bgpConfig, "Ready", metav1.ConditionFalse, "ConfigurationInvalid", errMsg)
+		bgpConfig.Status.ObservedGeneration = bgpConfig.Generation
+		bgpConfig.Status.Message = "Configuration validation failed: " + errMsg
+		now := metav1.Now()
+		bgpConfig.Status.LastReconcileTime = &now
+		if err := r.Status().Update(ctx, bgpConfig); err != nil {
+			log.Error(err, "Failed to update BGPConfiguration status")
+		}
+		RecordReconcileResult(bgpConfig.Name, bgpConfig.Namespace, "validation_failed")
+		UpdateConfigurationReadyStatus(bgpConfig.Name, bgpConfig.Namespace, false)
+		// Don't requeue immediately - wait for user to fix config
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	// Connect to GoBGP
 	conn, err := r.dialGoBGP(ctx)
 	if err != nil {
@@ -129,6 +148,8 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		reconcileErr = fmt.Errorf("dynamic neighbors: %w", err)
 	} else if err := r.reconcileNeighbors(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("neighbors: %w", err)
+	} else if err := r.reconcileNetlink(ctx, apiClient, bgpConfig, log); err != nil {
+		reconcileErr = fmt.Errorf("netlink: %w", err)
 	}
 
 	// Update status
@@ -334,6 +355,82 @@ func (r *BGPConfigurationReconciler) updateStatusCondition(ctx context.Context, 
 	if !found {
 		bgpConfig.Status.Conditions = append(bgpConfig.Status.Conditions, condition)
 	}
+}
+
+// validateConfiguration validates the BGPConfiguration before applying it
+// Returns a ValidationResult with any errors found
+func (r *BGPConfigurationReconciler) validateConfiguration(bgpConfig *bgpv1.BGPConfiguration) *ValidationResult {
+	result := &ValidationResult{Valid: true}
+
+	// Validate global netlink export rules
+	if bgpConfig.Spec.NetlinkExport != nil {
+		for i, rule := range bgpConfig.Spec.NetlinkExport.Rules {
+			fieldPrefix := fmt.Sprintf("spec.netlinkExport.rules[%d]", i)
+
+			// Validate community list
+			for _, community := range rule.CommunityList {
+				if err := ValidateCommunity(community); err != nil {
+					result.AddError(fieldPrefix+".communityList", community, err.Error())
+				}
+			}
+
+			// Validate large community list
+			for _, community := range rule.LargeCommunityList {
+				if err := ValidateLargeCommunity(community); err != nil {
+					result.AddError(fieldPrefix+".largeCommunityList", community, err.Error())
+				}
+			}
+		}
+	}
+
+	// Validate VRF netlink export configurations
+	for i, vrf := range bgpConfig.Spec.Vrfs {
+		if vrf.NetlinkExport != nil {
+			fieldPrefix := fmt.Sprintf("spec.vrfs[%d].netlinkExport", i)
+
+			// Validate community list
+			for _, community := range vrf.NetlinkExport.CommunityList {
+				if err := ValidateCommunity(community); err != nil {
+					result.AddError(fieldPrefix+".communityList", community, err.Error())
+				}
+			}
+
+			// Validate large community list
+			for _, community := range vrf.NetlinkExport.LargeCommunityList {
+				if err := ValidateLargeCommunity(community); err != nil {
+					result.AddError(fieldPrefix+".largeCommunityList", community, err.Error())
+				}
+			}
+		}
+	}
+
+	// Validate community actions in policy definitions
+	for i, policy := range bgpConfig.Spec.PolicyDefinitions {
+		for j, stmt := range policy.Statements {
+			if stmt.Actions.Community != nil {
+				fieldPrefix := fmt.Sprintf("spec.policyDefinitions[%d].statements[%d].actions.community", i, j)
+				for _, community := range stmt.Actions.Community.Communities {
+					if err := ValidateCommunity(community); err != nil {
+						result.AddError(fieldPrefix+".communities", community, err.Error())
+					}
+				}
+			}
+		}
+	}
+
+	// Validate community defined sets
+	for i, set := range bgpConfig.Spec.DefinedSets {
+		if set.Type == "community" {
+			fieldPrefix := fmt.Sprintf("spec.definedSets[%d]", i)
+			for _, community := range set.List {
+				if err := ValidateCommunity(community); err != nil {
+					result.AddError(fieldPrefix+".list", community, err.Error())
+				}
+			}
+		}
+	}
+
+	return result
 }
 
 func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
@@ -662,6 +759,358 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 		}
 	}
 	return nil
+}
+
+func (r *BGPConfigurationReconciler) reconcileNetlink(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
+	// Get current netlink state
+	currentNetlink, err := apiClient.GetNetlink(ctx, &gobgpapi.GetNetlinkRequest{})
+	if err != nil {
+		log.Error(err, "Failed to get netlink state")
+		return err
+	}
+
+	// Determine desired state
+	desiredImportEnabled := bgpConfig.Spec.NetlinkImport != nil && bgpConfig.Spec.NetlinkImport.Enabled
+	desiredExportEnabled := bgpConfig.Spec.NetlinkExport != nil && bgpConfig.Spec.NetlinkExport.Enabled
+
+	var desiredInterfaces []string
+	var desiredVrf string
+	if bgpConfig.Spec.NetlinkImport != nil {
+		desiredInterfaces = bgpConfig.Spec.NetlinkImport.InterfaceList
+		desiredVrf = bgpConfig.Spec.NetlinkImport.Vrf
+	}
+
+	// Check if we need to update netlink import configuration
+	needsImportUpdate := false
+	if desiredImportEnabled != currentNetlink.ImportEnabled {
+		needsImportUpdate = true
+	}
+	if desiredImportEnabled && !reflect.DeepEqual(desiredInterfaces, currentNetlink.Interfaces) {
+		needsImportUpdate = true
+	}
+
+	// Handle netlink import configuration
+	if needsImportUpdate {
+		if desiredImportEnabled {
+			log.Info("Enabling netlink import",
+				"vrf", desiredVrf,
+				"interfaces", desiredInterfaces)
+
+			_, err := apiClient.EnableNetlinkImport(ctx, &gobgpapi.EnableNetlinkImportRequest{
+				Vrf:        desiredVrf,
+				Interfaces: desiredInterfaces,
+			})
+			if err != nil {
+				log.Error(err, "Failed to enable netlink import")
+				return err
+			}
+			log.Info("Enabled netlink import", "vrf", desiredVrf, "interfaces", desiredInterfaces)
+		} else if currentNetlink.ImportEnabled {
+			// Disable netlink import dynamically
+			log.Info("Disabling netlink import",
+				"currentlyEnabled", currentNetlink.ImportEnabled,
+				"desiredEnabled", desiredImportEnabled)
+
+			_, err := apiClient.DisableNetlinkImport(ctx, &gobgpapi.DisableNetlinkImportRequest{
+				KeepRoutes: false, // withdraw imported routes from RIB
+			})
+			if err != nil {
+				log.Error(err, "Failed to disable netlink import")
+				return err
+			}
+			log.Info("Disabled netlink import")
+		}
+	}
+
+	// Check if we need to update netlink export configuration
+	needsExportUpdate := false
+	if desiredExportEnabled != currentNetlink.ExportEnabled {
+		needsExportUpdate = true
+	}
+
+	// If export is enabled, also check if the rules have changed
+	if desiredExportEnabled && currentNetlink.ExportEnabled && !needsExportUpdate {
+		// Get current export rules from gobgpd
+		currentRulesResp, err := apiClient.ListNetlinkExportRules(ctx, &gobgpapi.ListNetlinkExportRulesRequest{})
+		if err != nil {
+			log.Error(err, "Failed to list current netlink export rules")
+			return err
+		}
+
+		// Compare with desired rules
+		desiredRules := bgpConfig.Spec.NetlinkExport.Rules
+		if !netlinkExportRulesMatch(currentRulesResp.Rules, desiredRules) {
+			log.Info("Netlink export rules changed, updating",
+				"currentRuleCount", len(currentRulesResp.Rules),
+				"desiredRuleCount", len(desiredRules))
+			needsExportUpdate = true
+		}
+	}
+
+	// Handle netlink export configuration
+	if needsExportUpdate {
+		if desiredExportEnabled {
+			exportConfig := bgpConfig.Spec.NetlinkExport
+			log.Info("Enabling netlink export",
+				"dampeningInterval", exportConfig.DampeningInterval,
+				"routeProtocol", exportConfig.RouteProtocol,
+				"rulesCount", len(exportConfig.Rules))
+
+			_, err := apiClient.EnableNetlinkExport(ctx, &gobgpapi.EnableNetlinkExportRequest{
+				DampeningInterval: exportConfig.DampeningInterval,
+				RouteProtocol:     exportConfig.RouteProtocol,
+				Rules:             crdToAPINetlinkExportRules(exportConfig.Rules),
+			})
+			if err != nil {
+				log.Error(err, "Failed to enable netlink export")
+				return err
+			}
+			log.Info("Enabled netlink export", "rulesCount", len(exportConfig.Rules))
+		} else if currentNetlink.ExportEnabled {
+			// Disable netlink export dynamically
+			log.Info("Disabling netlink export",
+				"currentlyEnabled", currentNetlink.ExportEnabled,
+				"desiredEnabled", desiredExportEnabled)
+
+			_, err := apiClient.DisableNetlinkExport(ctx, &gobgpapi.DisableNetlinkExportRequest{
+				KeepRoutes: false, // flush exported routes from Linux kernel
+			})
+			if err != nil {
+				log.Error(err, "Failed to disable netlink export")
+				return err
+			}
+			log.Info("Disabled netlink export")
+		}
+	}
+
+	// Reconcile VRF-level netlink configurations
+	if err := r.reconcileVrfNetlink(ctx, apiClient, bgpConfig, log); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// reconcileVrfNetlink handles per-VRF netlink import/export configuration
+func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
+	// Get current VRF states from gobgpd
+	currentVrfs := make(map[string]*gobgpapi.Vrf)
+	stream, err := apiClient.ListVrf(ctx, &gobgpapi.ListVrfRequest{})
+	if err != nil {
+		log.Error(err, "Failed to list VRFs for netlink reconciliation")
+		return err
+	}
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			break
+		}
+		currentVrfs[resp.Vrf.Name] = resp.Vrf
+	}
+
+	// Reconcile each VRF's netlink config
+	for _, vrf := range bgpConfig.Spec.Vrfs {
+		current := currentVrfs[vrf.Name]
+		if current == nil {
+			// VRF doesn't exist yet - should be created by reconcileVrfs first
+			log.V(1).Info("VRF not found in gobgpd, skipping netlink config", "vrf", vrf.Name)
+			continue
+		}
+
+		// Handle VRF netlink import
+		if vrf.NetlinkImport != nil {
+			desiredImportEnabled := vrf.NetlinkImport.Enabled
+			currentImportEnabled := current.NetlinkImportEnabled
+
+			if desiredImportEnabled != currentImportEnabled {
+				if desiredImportEnabled {
+					log.Info("Enabling VRF netlink import",
+						"vrf", vrf.Name,
+						"interfaces", vrf.NetlinkImport.InterfaceList)
+
+					_, err := apiClient.EnableVrfNetlinkImport(ctx, &gobgpapi.EnableVrfNetlinkImportRequest{
+						Vrf:        vrf.Name,
+						Interfaces: vrf.NetlinkImport.InterfaceList,
+					})
+					if err != nil {
+						log.Error(err, "Failed to enable VRF netlink import", "vrf", vrf.Name)
+						return err
+					}
+					log.Info("Enabled VRF netlink import", "vrf", vrf.Name)
+				} else {
+					log.Info("Disabling VRF netlink import", "vrf", vrf.Name)
+
+					_, err := apiClient.DisableVrfNetlinkImport(ctx, &gobgpapi.DisableVrfNetlinkImportRequest{
+						Vrf:        vrf.Name,
+						KeepRoutes: false, // withdraw imported routes from RIB
+					})
+					if err != nil {
+						log.Error(err, "Failed to disable VRF netlink import", "vrf", vrf.Name)
+						return err
+					}
+					log.Info("Disabled VRF netlink import", "vrf", vrf.Name)
+				}
+			} else if desiredImportEnabled {
+				// Check if interfaces changed
+				if !reflect.DeepEqual(vrf.NetlinkImport.InterfaceList, current.NetlinkImportInterfaces) {
+					// Re-enable with new interfaces (disable first, then enable)
+					log.Info("Updating VRF netlink import interfaces",
+						"vrf", vrf.Name,
+						"currentInterfaces", current.NetlinkImportInterfaces,
+						"desiredInterfaces", vrf.NetlinkImport.InterfaceList)
+
+					_, err := apiClient.DisableVrfNetlinkImport(ctx, &gobgpapi.DisableVrfNetlinkImportRequest{
+						Vrf:        vrf.Name,
+						KeepRoutes: false,
+					})
+					if err != nil {
+						log.Error(err, "Failed to disable VRF netlink import for update", "vrf", vrf.Name)
+						return err
+					}
+
+					_, err = apiClient.EnableVrfNetlinkImport(ctx, &gobgpapi.EnableVrfNetlinkImportRequest{
+						Vrf:        vrf.Name,
+						Interfaces: vrf.NetlinkImport.InterfaceList,
+					})
+					if err != nil {
+						log.Error(err, "Failed to re-enable VRF netlink import", "vrf", vrf.Name)
+						return err
+					}
+					log.Info("Updated VRF netlink import interfaces", "vrf", vrf.Name)
+				}
+			}
+		}
+
+		// Handle VRF netlink export
+		// Note: VRF struct doesn't expose NetlinkExportEnabled status currently,
+		// so we always attempt to enable if desired, or disable if not.
+		// The API calls are idempotent so this is safe.
+		if vrf.NetlinkExport != nil && vrf.NetlinkExport.Enabled {
+			log.Info("Enabling VRF netlink export",
+				"vrf", vrf.Name,
+				"linuxVrf", vrf.NetlinkExport.LinuxVrf,
+				"linuxTableId", vrf.NetlinkExport.LinuxTableId)
+
+			_, err := apiClient.EnableVrfNetlinkExport(ctx, &gobgpapi.EnableVrfNetlinkExportRequest{
+				Vrf:    vrf.Name,
+				Config: crdToAPIVrfNetlinkExportConfig(vrf.NetlinkExport),
+			})
+			if err != nil {
+				log.Error(err, "Failed to enable VRF netlink export", "vrf", vrf.Name)
+				return err
+			}
+			log.V(1).Info("VRF netlink export enabled/updated", "vrf", vrf.Name)
+		} else if vrf.NetlinkExport != nil && !vrf.NetlinkExport.Enabled {
+			log.Info("Disabling VRF netlink export", "vrf", vrf.Name)
+
+			_, err := apiClient.DisableVrfNetlinkExport(ctx, &gobgpapi.DisableVrfNetlinkExportRequest{
+				Vrf:        vrf.Name,
+				KeepRoutes: false, // flush exported routes from Linux kernel
+			})
+			if err != nil {
+				// Ignore "not enabled" errors when trying to disable
+				log.V(1).Info("DisableVrfNetlinkExport returned error (may not be enabled)", "vrf", vrf.Name, "error", err)
+			} else {
+				log.Info("Disabled VRF netlink export", "vrf", vrf.Name)
+			}
+		}
+	}
+
+	return nil
+}
+
+// crdToAPIVrfNetlinkExportConfig converts CRD VrfNetlinkExport to API VrfNetlinkExportConfig
+func crdToAPIVrfNetlinkExportConfig(crd *bgpv1.VrfNetlinkExport) *gobgpapi.VrfNetlinkExportConfig {
+	if crd == nil {
+		return nil
+	}
+	skipNexthopValidation := false // default to validate
+	if crd.ValidateNexthop != nil {
+		skipNexthopValidation = !*crd.ValidateNexthop // invert: ValidateNexthop=true means SkipNexthopValidation=false
+	}
+	return &gobgpapi.VrfNetlinkExportConfig{
+		LinuxVrf:              crd.LinuxVrf,
+		LinuxTableId:          crd.LinuxTableId,
+		Metric:                crd.Metric,
+		SkipNexthopValidation: skipNexthopValidation,
+		CommunityList:         crd.CommunityList,
+		LargeCommunityList:    crd.LargeCommunityList,
+	}
+}
+
+// crdToAPINetlinkExportRules converts CRD NetlinkExportRule slice to API NetlinkExportRuleConfig slice
+func crdToAPINetlinkExportRules(rules []bgpv1.NetlinkExportRule) []*gobgpapi.NetlinkExportRuleConfig {
+	if len(rules) == 0 {
+		return nil
+	}
+	apiRules := make([]*gobgpapi.NetlinkExportRuleConfig, 0, len(rules))
+	for _, rule := range rules {
+		validateNexthop := true // default to true
+		if rule.ValidateNexthop != nil {
+			validateNexthop = *rule.ValidateNexthop
+		}
+		apiRules = append(apiRules, &gobgpapi.NetlinkExportRuleConfig{
+			Name:               rule.Name,
+			CommunityList:      rule.CommunityList,
+			LargeCommunityList: rule.LargeCommunityList,
+			Vrf:                rule.Vrf,
+			TableId:            rule.TableId,
+			Metric:             rule.Metric,
+			ValidateNexthop:    validateNexthop,
+		})
+	}
+	return apiRules
+}
+
+// netlinkExportRulesMatch compares current gobgpd rules with desired CRD rules
+func netlinkExportRulesMatch(current []*gobgpapi.ListNetlinkExportRulesResponse_ExportRule, desired []bgpv1.NetlinkExportRule) bool {
+	if len(current) != len(desired) {
+		return false
+	}
+
+	// Build a map of current rules by name for easier lookup
+	currentMap := make(map[string]*gobgpapi.ListNetlinkExportRulesResponse_ExportRule)
+	for _, rule := range current {
+		currentMap[rule.Name] = rule
+	}
+
+	// Compare each desired rule with its current counterpart
+	for _, desiredRule := range desired {
+		currentRule, exists := currentMap[desiredRule.Name]
+		if !exists {
+			return false
+		}
+
+		// Compare community lists
+		if !reflect.DeepEqual(currentRule.CommunityList, desiredRule.CommunityList) {
+			return false
+		}
+		if !reflect.DeepEqual(currentRule.LargeCommunityList, desiredRule.LargeCommunityList) {
+			return false
+		}
+
+		// Compare other fields
+		if currentRule.Vrf != desiredRule.Vrf {
+			return false
+		}
+		if currentRule.TableId != desiredRule.TableId {
+			return false
+		}
+		if currentRule.Metric != desiredRule.Metric {
+			return false
+		}
+
+		// Compare ValidateNexthop (desired defaults to true if nil)
+		desiredValidateNexthop := true
+		if desiredRule.ValidateNexthop != nil {
+			desiredValidateNexthop = *desiredRule.ValidateNexthop
+		}
+		if currentRule.ValidateNexthop != desiredValidateNexthop {
+			return false
+		}
+	}
+
+	return true
 }
 
 // --- Conversion Helpers ---

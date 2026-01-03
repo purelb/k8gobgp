@@ -374,14 +374,17 @@ spec:
                       properties:
                         communityList:
                           description: 'CommunityList filters routes by standard BGP
-                            communities (format: "AS:VALUE")'
+                            communities (format: "AS:VALUE" where AS and VALUE are
+                            0-65535)'
                           items:
+                            pattern: ^\d{1,5}:\d{1,5}$
                             type: string
                           type: array
                         largeCommunityList:
                           description: 'LargeCommunityList filters routes by large
                             BGP communities (format: "ASN:LocalData1:LocalData2")'
                           items:
+                            pattern: ^\d+:\d+:\d+$
                             type: string
                           type: array
                         metric:
@@ -690,8 +693,10 @@ spec:
                       properties:
                         communityList:
                           description: 'CommunityList filters routes by standard BGP
-                            communities (format: "AS:VALUE")'
+                            communities (format: "AS:VALUE" where AS and VALUE are
+                            0-65535)'
                           items:
+                            pattern: ^\d{1,5}:\d{1,5}$
                             type: string
                           type: array
                         enabled:
@@ -701,6 +706,7 @@ spec:
                           description: 'LargeCommunityList filters routes by large
                             BGP communities (format: "ASN:LocalData1:LocalData2")'
                           items:
+                            pattern: ^\d+:\d+:\d+$
                             type: string
                           type: array
                         linuxTableId:

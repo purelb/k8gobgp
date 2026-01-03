@@ -17,6 +17,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -51,9 +52,15 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var gobgpEndpoint string
+	var metricsPollInterval time.Duration
+	var enablePerNeighborMetrics bool
+	var maxNeighborsForMetrics int
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.StringVar(&gobgpEndpoint, "gobgp-endpoint", "", "The GoBGP gRPC endpoint (e.g., localhost:50051 or unix:///var/run/gobgp/gobgp.sock). Can also be set via GOBGP_ENDPOINT env var.")
+	flag.DurationVar(&metricsPollInterval, "metrics-poll-interval", 15*time.Second, "Interval for polling BGP stats from gobgpd (minimum 15s).")
+	flag.BoolVar(&enablePerNeighborMetrics, "enable-per-neighbor-metrics", false, "Enable high-cardinality per-neighbor route metrics (use with caution in large deployments).")
+	flag.IntVar(&maxNeighborsForMetrics, "max-neighbors-metrics", 200, "Maximum number of neighbors to export per-neighbor metrics for (0=unlimited).")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -86,6 +93,21 @@ func main() {
 		GoBGPEndpoint: gobgpEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BGPConfiguration")
+		os.Exit(1)
+	}
+
+	// Add BGP metrics collector as a Runnable (runs in background goroutine)
+	metricsCollector := &controllers.BGPMetricsController{
+		Log:           ctrl.Log.WithName("controllers").WithName("BGPMetrics"),
+		GoBGPEndpoint: gobgpEndpoint,
+		Config: controllers.MetricsConfig{
+			PollInterval:             metricsPollInterval,
+			EnablePerNeighborMetrics: enablePerNeighborMetrics,
+			MaxNeighborsForMetrics:   maxNeighborsForMetrics,
+		},
+	}
+	if err := mgr.Add(metricsCollector); err != nil {
+		setupLog.Error(err, "unable to add metrics collector")
 		os.Exit(1)
 	}
 

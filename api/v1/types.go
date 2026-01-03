@@ -72,9 +72,11 @@ type NetlinkExport struct {
 type NetlinkExportRule struct {
 	// Name is a unique identifier for this export rule
 	Name string `json:"name"`
-	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE")
+	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE" where AS and VALUE are 0-65535)
+	// +kubebuilder:validation:items:Pattern=`^\d{1,5}:\d{1,5}$`
 	CommunityList []string `json:"communityList,omitempty"`
 	// LargeCommunityList filters routes by large BGP communities (format: "ASN:LocalData1:LocalData2")
+	// +kubebuilder:validation:items:Pattern=`^\d+:\d+:\d+$`
 	LargeCommunityList []string `json:"largeCommunityList,omitempty"`
 	// Vrf is the target VRF name (empty = global routing table)
 	Vrf string `json:"vrf,omitempty"`
@@ -257,9 +259,11 @@ type VrfNetlinkExport struct {
 	Metric uint32 `json:"metric,omitempty"`
 	// ValidateNexthop enables nexthop reachability validation before exporting (default: true)
 	ValidateNexthop *bool `json:"validateNexthop,omitempty"`
-	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE")
+	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE" where AS and VALUE are 0-65535)
+	// +kubebuilder:validation:items:Pattern=`^\d{1,5}:\d{1,5}$`
 	CommunityList []string `json:"communityList,omitempty"`
 	// LargeCommunityList filters routes by large BGP communities (format: "ASN:LocalData1:LocalData2")
+	// +kubebuilder:validation:items:Pattern=`^\d+:\d+:\d+$`
 	LargeCommunityList []string `json:"largeCommunityList,omitempty"`
 }
 

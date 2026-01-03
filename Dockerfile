@@ -5,8 +5,8 @@ RUN apk add --no-cache git
 
 WORKDIR /gobgp_app
 
-# Clone the purelb/gobgp-netlink fork at v4.0.0
-RUN git clone --depth 1 --branch v4.0.0 https://github.com/purelb/gobgp-netlink.git .
+# Clone the purelb/gobgp-netlink fork (v1.1.1 release with full netlink gRPC API)
+RUN git clone --depth 1 --branch v1.1.1 https://github.com/purelb/gobgp-netlink.git .
 
 RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gobgpd ./cmd/gobgpd
@@ -24,8 +24,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o manager ./
 # Final runtime image
 FROM alpine:3.20
 
-# Install ca-certificates for TLS and bash for entrypoint
-RUN apk add --no-cache ca-certificates bash
+# Install ca-certificates for TLS, bash for entrypoint, and iproute2 for debugging
+RUN apk add --no-cache ca-certificates bash iproute2
 
 # Create non-root user
 RUN adduser -D -u 65532 -g bgp bgp

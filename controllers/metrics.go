@@ -148,6 +148,123 @@ var (
 		},
 		[]string{"name", "namespace"},
 	)
+
+	// === BGP Stats Metrics (collected by BGPMetricsController) ===
+
+	// Global RIB route counts by address family
+	bgpRibRoutes = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_rib_route_count",
+			Help: "Number of route prefixes in the global RIB by address family",
+		},
+		[]string{"family"}, // family: ipv4_unicast, ipv6_unicast, l2vpn_evpn
+	)
+
+	// Global neighbor state counts (from periodic polling)
+	bgpNeighborsTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbors_total",
+			Help: "Total number of BGP neighbors (from gobgpd)",
+		},
+	)
+
+	bgpNeighborsEstablishedTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbors_established_total",
+			Help: "Number of BGP neighbors in ESTABLISHED FSM state",
+		},
+	)
+
+	bgpNeighborsActive = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbors_active",
+			Help: "Number of BGP neighbors in ACTIVE FSM state (attempting connection)",
+		},
+	)
+
+	bgpNeighborsIdle = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbors_idle",
+			Help: "Number of BGP neighbors in IDLE FSM state",
+		},
+	)
+
+	// Per-neighbor route stats (high cardinality - opt-in)
+	bgpNeighborRoutesReceived = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbor_routes_received",
+			Help: "Number of routes received from neighbor by address family (opt-in, high cardinality)",
+		},
+		[]string{"neighbor", "family"},
+	)
+
+	bgpNeighborRoutesAccepted = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbor_routes_accepted",
+			Help: "Number of routes accepted from neighbor by address family (opt-in, high cardinality)",
+		},
+		[]string{"neighbor", "family"},
+	)
+
+	bgpNeighborRoutesAdvertised = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbor_routes_advertised",
+			Help: "Number of routes advertised to neighbor by address family (opt-in, high cardinality)",
+		},
+		[]string{"neighbor", "family"},
+	)
+
+	// Aggregate route counts (low cardinality alternative)
+	bgpRoutesReceivedTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_routes_received_total",
+			Help: "Total routes received from all neighbors (sum across all neighbors and families)",
+		},
+	)
+
+	bgpRoutesAcceptedTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_routes_accepted_total",
+			Help: "Total routes accepted from all neighbors",
+		},
+	)
+
+	bgpRoutesAdvertisedTotal = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_routes_advertised_total",
+			Help: "Total routes advertised to all neighbors",
+		},
+	)
+
+	// Metrics collection health metrics
+	metricsCollectionDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "k8gobgp_metrics_collection_duration_seconds",
+			Help:    "Time taken to collect BGP metrics from gobgpd",
+			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30},
+		},
+	)
+
+	metricsCollectionErrors = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "k8gobgp_metrics_collection_errors_total",
+			Help: "Total errors during BGP metrics collection",
+		},
+	)
+
+	metricsCollectionSkipped = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "k8gobgp_metrics_collection_skipped_total",
+			Help: "Collections skipped due to previous collection still running",
+		},
+	)
+
+	metricsCardinalityLimitHit = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "k8gobgp_metrics_cardinality_limit_hit_total",
+			Help: "Number of times per-neighbor metrics cardinality limit was hit",
+		},
+	)
 )
 
 func init() {
@@ -168,6 +285,22 @@ func init() {
 		bgpDefinedSetsConfigured,
 		cleanupRetries,
 		cleanupDuration,
+		// BGP Stats Metrics (collected by BGPMetricsController)
+		bgpRibRoutes,
+		bgpNeighborsTotal,
+		bgpNeighborsEstablishedTotal,
+		bgpNeighborsActive,
+		bgpNeighborsIdle,
+		bgpNeighborRoutesReceived,
+		bgpNeighborRoutesAccepted,
+		bgpNeighborRoutesAdvertised,
+		bgpRoutesReceivedTotal,
+		bgpRoutesAcceptedTotal,
+		bgpRoutesAdvertisedTotal,
+		metricsCollectionDuration,
+		metricsCollectionErrors,
+		metricsCollectionSkipped,
+		metricsCardinalityLimitHit,
 	)
 }
 

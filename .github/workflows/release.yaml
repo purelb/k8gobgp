@@ -100,16 +100,32 @@ jobs:
       - name: Generate manifests
         run: |
           mkdir -p dist
-          # Generate install manifest
+          VERSION=${GITHUB_REF_NAME}
+
+          # Generate CRDs
           cat config/crd/bases/*.yaml > dist/crds.yaml
+
+          # Generate RBAC
           cat config/rbac/*.yaml > dist/rbac.yaml
-          cat config/daemonset/*.yaml > dist/daemonset.yaml
+
+          # Generate production daemonset with versioned image tag
+          sed "s|ghcr.io/purelb/k8gobgp:latest|ghcr.io/purelb/k8gobgp:${VERSION}|g" \
+            config/daemonset/gobgp-daemonset-prod.yaml > dist/daemonset.yaml
+
+          # Generate all-in-one install manifest
+          echo "---" > dist/install.yaml
+          cat dist/crds.yaml >> dist/install.yaml
+          echo "---" >> dist/install.yaml
+          cat dist/rbac.yaml >> dist/install.yaml
+          echo "---" >> dist/install.yaml
+          cat dist/daemonset.yaml >> dist/install.yaml
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           generate_release_notes: true
           files: |
+            dist/install.yaml
             dist/crds.yaml
             dist/rbac.yaml
             dist/daemonset.yaml
