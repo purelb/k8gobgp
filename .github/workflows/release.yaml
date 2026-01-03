@@ -100,7 +100,8 @@ jobs:
       - name: Generate manifests
         run: |
           mkdir -p dist
-          VERSION=${GITHUB_REF_NAME}
+          # Strip 'v' prefix from tag for docker image tag (v0.1.1 -> 0.1.1)
+          VERSION=${GITHUB_REF_NAME#v}
 
           # Generate CRDs (already has --- at start)
           cat config/crd/bases/*.yaml > dist/crds.yaml
