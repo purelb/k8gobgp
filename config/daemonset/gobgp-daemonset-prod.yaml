@@ -25,8 +25,8 @@ spec:
 
       containers:
       - name: k8gobgp
-        image: docker.io/library/k8gobgp:test
-        imagePullPolicy: Never
+        image: ghcr.io/purelb/k8gobgp:latest
+        imagePullPolicy: IfNotPresent
 
         # Security context - requires privileges for:
         # - Binding to port 179 (BGP)

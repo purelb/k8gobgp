@@ -1,3 +1,17 @@
+// Copyright 2025 Acnodal Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package v1
 
 import (
@@ -58,9 +72,11 @@ type NetlinkExport struct {
 type NetlinkExportRule struct {
 	// Name is a unique identifier for this export rule
 	Name string `json:"name"`
-	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE")
+	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE" where AS and VALUE are 0-65535)
+	// +kubebuilder:validation:items:Pattern=`^\d{1,5}:\d{1,5}$`
 	CommunityList []string `json:"communityList,omitempty"`
 	// LargeCommunityList filters routes by large BGP communities (format: "ASN:LocalData1:LocalData2")
+	// +kubebuilder:validation:items:Pattern=`^\d+:\d+:\d+$`
 	LargeCommunityList []string `json:"largeCommunityList,omitempty"`
 	// Vrf is the target VRF name (empty = global routing table)
 	Vrf string `json:"vrf,omitempty"`
@@ -243,9 +259,11 @@ type VrfNetlinkExport struct {
 	Metric uint32 `json:"metric,omitempty"`
 	// ValidateNexthop enables nexthop reachability validation before exporting (default: true)
 	ValidateNexthop *bool `json:"validateNexthop,omitempty"`
-	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE")
+	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE" where AS and VALUE are 0-65535)
+	// +kubebuilder:validation:items:Pattern=`^\d{1,5}:\d{1,5}$`
 	CommunityList []string `json:"communityList,omitempty"`
 	// LargeCommunityList filters routes by large BGP communities (format: "ASN:LocalData1:LocalData2")
+	// +kubebuilder:validation:items:Pattern=`^\d+:\d+:\d+$`
 	LargeCommunityList []string `json:"largeCommunityList,omitempty"`
 }
 
