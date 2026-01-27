@@ -290,36 +290,11 @@ func TestValidateLargeCommunity(t *testing.T) {
 	}
 }
 
-func TestValidateCommunityList(t *testing.T) {
-	tests := []struct {
-		name        string
-		communities []string
-		wantValid   bool
-		wantErrors  int
-	}{
-		{"empty list", []string{}, true, 0},
-		{"single valid", []string{"65000:100"}, true, 0},
-		{"multiple valid", []string{"65000:100", "65001:200", "1:1"}, true, 0},
-		{"single invalid", []string{"invalid"}, false, 1},
-		{"mixed valid and invalid", []string{"65000:100", "invalid", "65001:200"}, false, 1},
-		{"multiple invalid", []string{"invalid1", "invalid2"}, false, 2},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := ValidateCommunityList(tt.communities, "testField")
-			assert.Equal(t, tt.wantValid, result.Valid)
-			assert.Equal(t, tt.wantErrors, len(result.Errors))
-		})
-	}
-}
-
 func TestValidationResult(t *testing.T) {
 	t.Run("new result is valid", func(t *testing.T) {
 		result := &ValidationResult{Valid: true}
 		assert.True(t, result.Valid)
 		assert.Empty(t, result.Errors)
-		assert.Empty(t, result.Warnings)
 	})
 
 	t.Run("add error makes invalid", func(t *testing.T) {
@@ -330,13 +305,6 @@ func TestValidationResult(t *testing.T) {
 		assert.Equal(t, "field", result.Errors[0].Field)
 		assert.Equal(t, "value", result.Errors[0].Value)
 		assert.Equal(t, "error message", result.Errors[0].Message)
-	})
-
-	t.Run("add warning keeps valid", func(t *testing.T) {
-		result := &ValidationResult{Valid: true}
-		result.AddWarning("field", "value", "warning message")
-		assert.True(t, result.Valid)
-		assert.Len(t, result.Warnings, 1)
 	})
 
 	t.Run("error messages formatting", func(t *testing.T) {

@@ -90,13 +90,6 @@ var (
 	)
 
 	// Configuration metrics
-	bgpConfigurationCount = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "k8gobgp_configurations_total",
-			Help: "Total number of BGPConfiguration resources",
-		},
-	)
-
 	bgpConfigurationReady = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "k8gobgp_configuration_ready",
@@ -265,6 +258,44 @@ var (
 			Help: "Number of times per-neighbor metrics cardinality limit was hit",
 		},
 	)
+
+	// === Router ID Resolution Metrics ===
+
+	// Router ID resolution counter
+	routerIDResolutionTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8gobgp_router_id_resolution_total",
+			Help: "Total number of router ID resolution attempts",
+		},
+		[]string{"result"}, // result: success, failure
+	)
+
+	// Router ID resolution duration
+	routerIDResolutionDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "k8gobgp_router_id_resolution_duration_seconds",
+			Help:    "Duration of router ID resolution in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 12), // 1ms to ~2s
+		},
+	)
+
+	// Router ID source (shows the method used to determine router ID)
+	routerIDSource = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_router_id_source",
+			Help: "Router ID resolution source (1 = active source)",
+		},
+		[]string{"source"}, // source: explicit, template, node-ipv4, hash-from-node-name
+	)
+
+	// Resolved router ID info (provides the actual value for observability)
+	routerIDInfo = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_router_id_info",
+			Help: "Router ID information (value is always 1, labels provide details)",
+		},
+		[]string{"router_id", "source", "node", "asn"},
+	)
 )
 
 func init() {
@@ -278,7 +309,6 @@ func init() {
 		bgpDynamicNeighborsConfigured,
 		gobgpConnectionStatus,
 		gobgpConnectionErrors,
-		bgpConfigurationCount,
 		bgpConfigurationReady,
 		bgpVrfsConfigured,
 		bgpPoliciesConfigured,
@@ -301,6 +331,11 @@ func init() {
 		metricsCollectionErrors,
 		metricsCollectionSkipped,
 		metricsCardinalityLimitHit,
+		// Router ID resolution metrics
+		routerIDResolutionTotal,
+		routerIDResolutionDuration,
+		routerIDSource,
+		routerIDInfo,
 	)
 }
 
@@ -344,11 +379,6 @@ func RecordGoBGPConnectionError(endpoint string) {
 	gobgpConnectionErrors.WithLabelValues(endpoint).Inc()
 }
 
-// UpdateConfigurationCount updates the total configuration count
-func UpdateConfigurationCount(count int) {
-	bgpConfigurationCount.Set(float64(count))
-}
-
 // UpdateConfigurationReadyStatus updates the ready status of a configuration
 func UpdateConfigurationReadyStatus(name, namespace string, ready bool) {
 	if ready {
@@ -389,4 +419,36 @@ func DeleteMetricsForConfig(name, namespace string) {
 	bgpVrfsConfigured.DeleteLabelValues(name, namespace)
 	bgpPoliciesConfigured.DeleteLabelValues(name, namespace)
 	bgpDefinedSetsConfigured.DeleteLabelValues(name, namespace)
+}
+
+// RecordRouterIDResolution records the result of a router ID resolution attempt
+func RecordRouterIDResolution(result string, duration float64) {
+	routerIDResolutionTotal.WithLabelValues(result).Inc()
+	routerIDResolutionDuration.Observe(duration)
+}
+
+// UpdateRouterIDSource updates the active router ID source metric
+// This sets the specified source to 1 and resets others to 0
+func UpdateRouterIDSource(source string) {
+	// Reset all sources - values must match RouterIDSource* constants
+	for _, s := range []string{
+		RouterIDSourceExplicit,
+		RouterIDSourceTemplate,
+		RouterIDSourceNodeIPv4,
+		RouterIDSourceHashFromNode,
+	} {
+		if s == source {
+			routerIDSource.WithLabelValues(s).Set(1)
+		} else {
+			routerIDSource.WithLabelValues(s).Set(0)
+		}
+	}
+}
+
+// UpdateRouterIDInfo updates the router ID information metric
+func UpdateRouterIDInfo(routerID, source, nodeName, asn string) {
+	// Clear any previous values first (in case router ID changed)
+	routerIDInfo.Reset()
+	// Set the new value
+	routerIDInfo.WithLabelValues(sanitizeLabelValue(routerID), sanitizeLabelValue(source), sanitizeLabelValue(nodeName), sanitizeLabelValue(asn)).Set(1)
 }

@@ -1,0 +1,105 @@
+# Prometheus Alert Rules for k8gobgp Router ID Resolution
+#
+# These are sample alert rules for monitoring router ID resolution.
+# Import into your Prometheus/AlertManager setup.
+#
+# Usage with Prometheus Operator:
+#   kubectl apply -f router-id-alerts.yaml
+#
+# Manual Prometheus:
+#   Add to your prometheus.yml rule_files section
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k8gobgp-router-id-alerts
+  namespace: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+  - name: k8gobgp-router-id
+    rules:
+
+    # Alert when router ID resolution is failing
+    - alert: K8GoBGPRouterIDResolutionFailed
+      expr: increase(k8gobgp_router_id_resolution_total{result="failure"}[5m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Router ID resolution failures on {{ $labels.pod }}"
+        description: "k8gobgp pod {{ $labels.pod }} has experienced router ID resolution failures in the last 5 minutes. Check pod logs for details."
+        runbook_url: "https://github.com/purelb/k8gobgp#troubleshooting"
+
+    # Alert when router ID resolution is taking too long
+    - alert: K8GoBGPRouterIDResolutionSlow
+      expr: histogram_quantile(0.99, rate(k8gobgp_router_id_resolution_duration_seconds_bucket[5m])) > 5
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Slow router ID resolution on {{ $labels.pod }}"
+        description: "Router ID resolution p99 latency is above 5 seconds. This may indicate network issues or Kubernetes API slowness."
+
+    # Alert when many pods are using hash-based router IDs (potential IPv6-only or misconfiguration)
+    - alert: K8GoBGPHashBasedRouterIDsHigh
+      expr: count(k8gobgp_router_id_source{source="hash_from_node_name"} == 1) > 5
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: "Multiple pods using hash-based router IDs"
+        description: "{{ $value }} k8gobgp pods are using hash-based router IDs. This is normal for IPv6-only nodes, but may indicate misconfiguration if nodes have IPv4 addresses."
+
+    # Alert when BGP reconciliation is failing (general health)
+    - alert: K8GoBGPReconciliationFailed
+      expr: increase(k8gobgp_reconcile_total{result="error"}[5m]) > 3
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BGP reconciliation failures on {{ $labels.pod }}"
+        description: "k8gobgp pod {{ $labels.pod }} has had {{ $value }} reconciliation failures in the last 5 minutes."
+
+    # Alert when GoBGP daemon connection is lost
+    - alert: K8GoBGPDaemonDisconnected
+      expr: k8gobgp_gobgpd_connection_status == 0
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "GoBGP daemon disconnected on {{ $labels.pod }}"
+        description: "k8gobgp controller cannot connect to the local gobgpd daemon. BGP sessions may be affected."
+
+    # Alert when no BGP neighbors are established
+    - alert: K8GoBGPNoEstablishedNeighbors
+      expr: k8gobgp_neighbors_established_total == 0 and k8gobgp_neighbors_total > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "No BGP neighbors established"
+        description: "There are {{ $value }} configured BGP neighbors but none are in ESTABLISHED state. Check BGP configuration and network connectivity."
+
+---
+# For non-Prometheus Operator deployments, use this raw format
+# in your prometheus.yml:
+#
+# rule_files:
+#   - /etc/prometheus/rules/k8gobgp-router-id.rules
+#
+# File content (/etc/prometheus/rules/k8gobgp-router-id.rules):
+#
+# groups:
+# - name: k8gobgp-router-id
+#   rules:
+#   - alert: K8GoBGPRouterIDResolutionFailed
+#     expr: increase(k8gobgp_router_id_resolution_total{result="failure"}[5m]) > 0
+#     for: 5m
+#     labels:
+#       severity: warning
+#     annotations:
+#       summary: "Router ID resolution failures on {{ $labels.pod }}"

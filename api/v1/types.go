@@ -92,8 +92,23 @@ type NetlinkExportRule struct {
 
 // +kubebuilder:object:generate=true
 type GlobalSpec struct {
-	ASN                   uint32                 `json:"asn"`
-	RouterID              string                 `json:"routerID"`
+	// ASN is the Autonomous System Number for this BGP speaker
+	ASN uint32 `json:"asn"`
+	// RouterID is the BGP router identifier. Must be a valid IPv4 address.
+	// Supports three resolution modes:
+	// 1. Explicit IPv4: "192.168.1.1" - used as-is
+	// 2. Template variable: "${NODE_IP}", "${NODE_IPV4}", "${NODE_EXTERNAL_IP}",
+	//    or "${node.annotations['key']}" - resolved from node
+	// 3. Auto-detect: when omitted, auto-detects from node's internal IPv4,
+	//    or generates from node name hash if no IPv4 available
+	// +optional
+	RouterID string `json:"routerID,omitempty"`
+	// RouterIDPool is the CIDR pool for hash-based router ID generation.
+	// Used when RouterID is omitted and node has no IPv4 address (IPv6-only nodes).
+	// Must be at least /24 (256 addresses). Each cluster should use a unique pool.
+	// Default: "10.255.0.0/16"
+	// +optional
+	RouterIDPool          string                 `json:"routerIDPool,omitempty"`
 	ListenPort            int32                  `json:"listenPort,omitempty"`
 	ListenAddresses       []string               `json:"listenAddresses,omitempty"`
 	Families              []string               `json:"families,omitempty"`
@@ -387,6 +402,11 @@ type BGPConfigurationStatus struct {
 	EstablishedNeighbors int `json:"establishedNeighbors,omitempty"`
 	// Message provides additional information about the current state
 	Message string `json:"message,omitempty"`
+	// RouterIDSource indicates how the router ID was resolved:
+	// "explicit", "template", "node-ipv4", or "hash-from-node-name"
+	RouterIDSource string `json:"routerIDSource,omitempty"`
+	// RouterIDResolutionTime is when the router ID was resolved
+	RouterIDResolutionTime *metav1.Time `json:"routerIDResolutionTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true

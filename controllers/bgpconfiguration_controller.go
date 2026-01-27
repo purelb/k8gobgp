@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"reflect"
 	"strings"
@@ -30,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -59,12 +61,42 @@ type BGPConfigurationReconciler struct {
 
 	// GoBGPEndpoint is the gRPC endpoint for GoBGP (supports tcp:// or unix://)
 	GoBGPEndpoint string
+
+	// Recorder is for emitting Kubernetes Events (router ID resolution, etc.)
+	Recorder record.EventRecorder
+
+	// NodeName is the name of the node this controller is running on (from NODE_NAME env)
+	NodeName string
+
+	// PodName is this pod's name (from POD_NAME env, used for pod annotations)
+	PodName string
+
+	// PodNamespace is this pod's namespace (from POD_NAMESPACE env, used for pod annotations)
+	PodNamespace string
+
+	// nodeCache caches Node objects to reduce Kubernetes API calls
+	nodeCache *nodeCache
+
+	// localRouterIDCache stores per-BGPConfiguration resolved router IDs for
+	// this pod. Keyed by "namespace/name". Used for immutability: once resolved,
+	// a config's router ID won't change during the pod's lifetime. This is
+	// per-pod (not shared via status) because in a DaemonSet each pod resolves
+	// its own node's IP.
+	localRouterIDCache map[string]*localRouterIDEntry
+}
+
+type localRouterIDEntry struct {
+	routerID string
+	source   string
 }
 
 // +kubebuilder:rbac:groups=bgp.purelb.io,resources=configs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=bgp.purelb.io,resources=configs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=bgp.purelb.io,resources=configs/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	startTime := time.Now()
@@ -234,7 +266,6 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 
 	if controllerutil.ContainsFinalizer(bgpConfig, finalizerName) {
 		// Cleanup BGP configuration with retry logic
-		cleanupSucceeded := false
 		conn, err := r.dialGoBGP(ctx)
 		if err != nil {
 			log.Error(err, "Failed to connect to gobgpd for cleanup, will retry")
@@ -311,56 +342,64 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			RecordCleanupRetry(bgpConfig.Name, bgpConfig.Namespace)
 			return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 		}
-		cleanupSucceeded = true
 
-		if cleanupSucceeded {
-			// Record successful cleanup metrics
-			RecordCleanupDuration(bgpConfig.Name, bgpConfig.Namespace, time.Since(cleanupStart).Seconds())
-			// Delete all metrics for this configuration
-			DeleteMetricsForConfig(bgpConfig.Name, bgpConfig.Namespace)
+		// Record successful cleanup metrics
+		RecordCleanupDuration(bgpConfig.Name, bgpConfig.Namespace, time.Since(cleanupStart).Seconds())
+		// Delete all metrics for this configuration
+		DeleteMetricsForConfig(bgpConfig.Name, bgpConfig.Namespace)
 
-			// Remove finalizer only after successful cleanup
-			controllerutil.RemoveFinalizer(bgpConfig, finalizerName)
-			if err := r.Update(ctx, bgpConfig); err != nil {
-				return ctrl.Result{}, err
-			}
+		// Remove finalizer only after successful cleanup
+		controllerutil.RemoveFinalizer(bgpConfig, finalizerName)
+		if err := r.Update(ctx, bgpConfig); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// updateStatusCondition updates a condition on the BGPConfiguration status
+// updateStatusCondition updates a condition on the BGPConfiguration status.
+// Always updates Reason and Message. Only updates LastTransitionTime when
+// the Status value changes (per Kubernetes API conventions).
 func (r *BGPConfigurationReconciler) updateStatusCondition(ctx context.Context, bgpConfig *bgpv1.BGPConfiguration, condType string, status metav1.ConditionStatus, reason, message string) {
-	condition := metav1.Condition{
+	now := metav1.Now()
+
+	// Find existing condition
+	for i, c := range bgpConfig.Status.Conditions {
+		if c.Type == condType {
+			bgpConfig.Status.Conditions[i].ObservedGeneration = bgpConfig.Generation
+			bgpConfig.Status.Conditions[i].Reason = reason
+			bgpConfig.Status.Conditions[i].Message = message
+			if c.Status != status {
+				bgpConfig.Status.Conditions[i].Status = status
+				bgpConfig.Status.Conditions[i].LastTransitionTime = now
+			}
+			return
+		}
+	}
+
+	// Condition not found — append new one
+	bgpConfig.Status.Conditions = append(bgpConfig.Status.Conditions, metav1.Condition{
 		Type:               condType,
 		Status:             status,
 		ObservedGeneration: bgpConfig.Generation,
-		LastTransitionTime: metav1.Now(),
+		LastTransitionTime: now,
 		Reason:             reason,
 		Message:            message,
-	}
-
-	// Find and update existing condition or append new one
-	found := false
-	for i, c := range bgpConfig.Status.Conditions {
-		if c.Type == condType {
-			if c.Status != status {
-				bgpConfig.Status.Conditions[i] = condition
-			}
-			found = true
-			break
-		}
-	}
-	if !found {
-		bgpConfig.Status.Conditions = append(bgpConfig.Status.Conditions, condition)
-	}
+	})
 }
 
 // validateConfiguration validates the BGPConfiguration before applying it
 // Returns a ValidationResult with any errors found
 func (r *BGPConfigurationReconciler) validateConfiguration(bgpConfig *bgpv1.BGPConfiguration) *ValidationResult {
 	result := &ValidationResult{Valid: true}
+
+	// Validate routerIDPool if specified
+	if bgpConfig.Spec.Global.RouterIDPool != "" {
+		if err := ValidateRouterIDPool(bgpConfig.Spec.Global.RouterIDPool); err != nil {
+			result.AddError("spec.global.routerIDPool", bgpConfig.Spec.Global.RouterIDPool, err.Error())
+		}
+	}
 
 	// Validate global netlink export rules
 	if bgpConfig.Spec.NetlinkExport != nil {
@@ -434,18 +473,34 @@ func (r *BGPConfigurationReconciler) validateConfiguration(bgpConfig *bgpv1.BGPC
 }
 
 func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
-	desired := crdToAPIGlobal(&bgpConfig.Spec.Global)
+	// Resolve the router ID (with immutability - uses status if already resolved)
+	effectiveRouterID, err := r.resolveEffectiveRouterID(ctx, bgpConfig, log)
+	if err != nil {
+		r.emitRouterIDFailedEvent(bgpConfig, err)
+		r.updateStatusCondition(ctx, bgpConfig, "RouterIDResolved", metav1.ConditionFalse,
+			"ResolutionFailed", fmt.Sprintf("Router ID resolution failed: %s", err.Error()))
+		return fmt.Errorf("failed to resolve router ID: %w", err)
+	}
+
+	// Create desired config with resolved router ID
+	desired := &gobgpapi.Global{
+		Asn:             bgpConfig.Spec.Global.ASN,
+		RouterId:        effectiveRouterID,
+		ListenPort:      bgpConfig.Spec.Global.ListenPort,
+		ListenAddresses: bgpConfig.Spec.Global.ListenAddresses,
+	}
+
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
 	if err != nil {
 		// gRPC error - server may not be accessible
-		log.Info("BGP server not running, calling StartBgp")
+		log.Info("BGP server not running, calling StartBgp", "routerID", effectiveRouterID)
 		_, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired})
 		return startErr
 	}
 
 	// GetBgp returns empty config (ASN=0) when gobgpd started but StartBgp never called
 	if current.Global.Asn == 0 {
-		log.Info("BGP server not initialized, calling StartBgp")
+		log.Info("BGP server not initialized, calling StartBgp", "routerID", effectiveRouterID)
 		_, startErr := apiClient.StartBgp(ctx, &gobgpapi.StartBgpRequest{Global: desired})
 		return startErr
 	}
@@ -466,6 +521,96 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	return nil
 }
 
+// resolveEffectiveRouterID resolves the router ID, respecting immutability.
+// Uses a per-BGPConfiguration in-memory cache so each config gets its own
+// resolved ID, and the ID doesn't change during the pod's lifetime.
+func (r *BGPConfigurationReconciler) resolveEffectiveRouterID(ctx context.Context, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) (string, error) {
+	cacheKey := bgpConfig.Namespace + "/" + bgpConfig.Name
+
+	// Initialize cache map on first use
+	if r.localRouterIDCache == nil {
+		r.localRouterIDCache = make(map[string]*localRouterIDEntry)
+	}
+
+	// Immutability: if already resolved in-memory for this config on this pod, reuse it.
+	// We use an in-memory cache (not the shared status) because in a DaemonSet
+	// each pod reconciles the same BGPConfiguration but needs its own node's router ID.
+	if entry, ok := r.localRouterIDCache[cacheKey]; ok {
+		log.V(1).Info("using previously resolved router ID (immutable, in-memory)",
+			"routerID", entry.routerID,
+			"source", entry.source,
+			"nodeName", r.NodeName)
+
+		// Check if configured value differs from locked value
+		if bgpConfig.Spec.Global.RouterID != "" &&
+			bgpConfig.Spec.Global.RouterID != entry.routerID &&
+			!strings.HasPrefix(bgpConfig.Spec.Global.RouterID, "${") {
+			log.Info("WARNING: configured routerID differs from locked value - pod restart required to change",
+				"configured", bgpConfig.Spec.Global.RouterID,
+				"locked", entry.routerID)
+		}
+
+		// Set shared status field (only resolution method, not per-node details).
+		// In a DaemonSet, each pod resolves its own node's IP, so per-node details
+		// are available via pod annotations, metrics, and Kubernetes events instead.
+		bgpConfig.Status.RouterIDSource = entry.source
+
+		return entry.routerID, nil
+	}
+
+	// Resolve the router ID
+	startTime := time.Now()
+	resolution, err := r.ResolveRouterID(ctx, &bgpConfig.Spec.Global, log)
+	duration := time.Since(startTime).Seconds()
+
+	if err != nil {
+		RecordRouterIDResolution("failure", duration)
+		return "", err
+	}
+
+	// Record metrics
+	RecordRouterIDResolution("success", duration)
+	UpdateRouterIDSource(resolution.Source)
+	UpdateRouterIDInfo(resolution.RouterID, resolution.Source, resolution.NodeName, fmt.Sprintf("%d", bgpConfig.Spec.Global.ASN))
+
+	// Cache in-memory for immutability (per-config, per-pod)
+	r.localRouterIDCache[cacheKey] = &localRouterIDEntry{
+		routerID: resolution.RouterID,
+		source:   resolution.Source,
+	}
+
+	// Set shared status fields. Only write resolution method and timestamp
+	// to the shared status — not per-node details which would be misleading
+	// in a DaemonSet where each pod has a different value. Per-node router
+	// ID details are available via:
+	//   - Pod annotations: bgp.purelb.io/router-id, bgp.purelb.io/asn
+	//   - Prometheus metrics: k8gobgp_router_id_info{router_id, source, node, asn}
+	//   - Kubernetes events: RouterIDResolved
+	now := metav1.Now()
+	bgpConfig.Status.RouterIDSource = resolution.Source
+	bgpConfig.Status.RouterIDResolutionTime = &now
+
+	// Set a RouterIDResolved condition (generic, not per-node)
+	r.updateStatusCondition(ctx, bgpConfig, "RouterIDResolved", metav1.ConditionTrue,
+		"Resolved", fmt.Sprintf("Router ID resolved via %s", resolution.Source))
+
+	// Emit per-pod event (includes specific router ID and node for debugging)
+	r.emitRouterIDResolvedEvent(bgpConfig, resolution)
+
+	// Annotate this pod with the resolved router ID and ASN for per-pod visibility
+	if err := r.annotatePodWithRouterID(ctx, resolution, bgpConfig.Spec.Global.ASN); err != nil {
+		log.Error(err, "failed to annotate pod with router ID (non-fatal)")
+	}
+
+	log.Info("router ID resolved",
+		"routerID", resolution.RouterID,
+		"source", resolution.Source,
+		"nodeName", resolution.NodeName,
+		"duration", duration)
+
+	return resolution.RouterID, nil
+}
+
 func (r *BGPConfigurationReconciler) reconcileDefinedSets(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
 	// 1. Get current defined sets
 	currentSets := make(map[string]*gobgpapi.DefinedSet)
@@ -476,6 +621,9 @@ func (r *BGPConfigurationReconciler) reconcileDefinedSets(ctx context.Context, a
 	for {
 		res, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing defined sets from gobgpd")
+			}
 			break
 		}
 		currentSets[res.DefinedSet.Name] = res.DefinedSet
@@ -526,6 +674,9 @@ func (r *BGPConfigurationReconciler) reconcilePolicies(ctx context.Context, apiC
 	for {
 		res, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing policies from gobgpd")
+			}
 			break
 		}
 		currentPolicies[res.Policy.Name] = res.Policy
@@ -568,6 +719,9 @@ func (r *BGPConfigurationReconciler) reconcileVrfs(ctx context.Context, apiClien
 	for {
 		res, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing VRFs from gobgpd")
+			}
 			break
 		}
 		currentVrfs[res.Vrf.Name] = res.Vrf
@@ -612,6 +766,9 @@ func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Conte
 	for {
 		res, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing dynamic neighbors from gobgpd")
+			}
 			break
 		}
 		currentDynNeighbors[res.DynamicNeighbor.Prefix] = res.DynamicNeighbor
@@ -667,6 +824,9 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 	for {
 		res, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing peer groups from gobgpd")
+			}
 			break
 		}
 		currentPeerGroups[res.PeerGroup.Conf.PeerGroupName] = res.PeerGroup
@@ -676,7 +836,10 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 	desiredPeerGroups := make(map[string]*gobgpapi.PeerGroup)
 	for _, pg := range bgpConfig.Spec.PeerGroups {
 		// Resolve auth password from Secret or inline value
-		authPassword := r.resolveAuthPassword(ctx, bgpConfig.Namespace, pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
+		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
+		if err != nil {
+			return fmt.Errorf("peer group %q: %w", pg.Config.PeerGroupName, err)
+		}
 		desiredPeerGroups[pg.Config.PeerGroupName] = r.crdToAPIPeerGroupWithPassword(&pg, authPassword)
 	}
 
@@ -719,6 +882,9 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 	for {
 		res, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing neighbors from gobgpd")
+			}
 			break
 		}
 		currentNeighbors[res.Peer.Conf.NeighborAddress] = res.Peer
@@ -728,7 +894,10 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 	desiredNeighbors := make(map[string]*gobgpapi.Peer)
 	for _, n := range bgpConfig.Spec.Neighbors {
 		// Resolve auth password from Secret or inline value
-		authPassword := r.resolveAuthPassword(ctx, bgpConfig.Namespace, n.Config.AuthPassword, n.Config.AuthPasswordSecretRef, log)
+		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, n.Config.AuthPassword, n.Config.AuthPasswordSecretRef, log)
+		if err != nil {
+			return fmt.Errorf("neighbor %q: %w", n.Config.NeighborAddress, err)
+		}
 		desiredNeighbors[n.Config.NeighborAddress] = r.crdToAPINeighborWithPassword(&n, authPassword)
 	}
 
@@ -903,6 +1072,9 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 	for {
 		resp, err := stream.Recv()
 		if err != nil {
+			if err != io.EOF {
+				log.Error(err, "error listing VRFs for netlink reconciliation")
+			}
 			break
 		}
 		currentVrfs[resp.Vrf.Name] = resp.Vrf
@@ -1115,15 +1287,6 @@ func netlinkExportRulesMatch(current []*gobgpapi.ListNetlinkExportRulesResponse_
 
 // --- Conversion Helpers ---
 
-func crdToAPIGlobal(crd *bgpv1.GlobalSpec) *gobgpapi.Global {
-	return &gobgpapi.Global{
-		Asn:             crd.ASN,
-		RouterId:        crd.RouterID,
-		ListenPort:      crd.ListenPort,
-		ListenAddresses: crd.ListenAddresses,
-	}
-}
-
 func crdToAPIDefinedSet(crd *bgpv1.DefinedSet) *gobgpapi.DefinedSet {
 	var prefixes []*gobgpapi.Prefix
 	for _, p := range crd.Prefixes {
@@ -1298,8 +1461,9 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 
 // --- Secret Resolution Helper ---
 
-// resolveAuthPassword resolves the authentication password from either inline value or Secret reference
-func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, namespace string, authPassword string, secretRef *corev1.SecretKeySelector, log logr.Logger) string {
+// resolveAuthPassword resolves the authentication password from either inline value or Secret reference.
+// Returns an error if a SecretRef is specified but the Secret or key cannot be found.
+func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, namespace string, authPassword string, secretRef *corev1.SecretKeySelector, log logr.Logger) (string, error) {
 	// If SecretRef is specified, prefer it over inline password
 	if secretRef != nil && secretRef.Name != "" {
 		secret := &corev1.Secret{}
@@ -1308,17 +1472,15 @@ func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, na
 			Name:      secretRef.Name,
 		}
 		if err := r.Get(ctx, secretName, secret); err != nil {
-			log.Error(err, "Failed to get Secret for auth password", "secret", secretRef.Name)
-			return ""
+			return "", fmt.Errorf("failed to get Secret %q for auth password: %w", secretRef.Name, err)
 		}
 		if password, ok := secret.Data[secretRef.Key]; ok {
-			return string(password)
+			return string(password), nil
 		}
-		log.Error(nil, "Secret key not found", "secret", secretRef.Name, "key", secretRef.Key)
-		return ""
+		return "", fmt.Errorf("key %q not found in Secret %q", secretRef.Key, secretRef.Name)
 	}
 	// Fall back to inline password (deprecated)
-	return authPassword
+	return authPassword, nil
 }
 
 // --- Enum and Struct Conversion Helpers ---
@@ -1511,6 +1673,9 @@ func crdToAPIFamily(s string) *gobgpapi.Family {
 }
 
 func (r *BGPConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Initialize node cache for router ID resolution
+	r.InitNodeCache()
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&bgpv1.BGPConfiguration{}).
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
