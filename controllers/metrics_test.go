@@ -106,16 +106,6 @@ func TestRecordGoBGPConnectionError(t *testing.T) {
 	assert.Equal(t, float64(2), count)
 }
 
-func TestUpdateConfigurationCount(t *testing.T) {
-	UpdateConfigurationCount(5)
-	count := testutil.ToFloat64(bgpConfigurationCount)
-	assert.Equal(t, float64(5), count)
-
-	UpdateConfigurationCount(10)
-	count = testutil.ToFloat64(bgpConfigurationCount)
-	assert.Equal(t, float64(10), count)
-}
-
 func TestUpdateConfigurationReadyStatus(t *testing.T) {
 	// Reset gauge
 	bgpConfigurationReady.Reset()
@@ -192,4 +182,66 @@ func TestDeleteMetricsForConfig(t *testing.T) {
 	// Accessing them again creates new ones initialized to 0
 	configured = testutil.ToFloat64(bgpNeighborsConfigured.WithLabelValues("delete-test", "test-ns"))
 	assert.Equal(t, float64(0), configured)
+}
+
+func TestRecordRouterIDResolution(t *testing.T) {
+	routerIDResolutionTotal.Reset()
+
+	RecordRouterIDResolution("success", 0.05)
+	RecordRouterIDResolution("success", 0.10)
+	RecordRouterIDResolution("failure", 0.02)
+
+	successCount := testutil.ToFloat64(routerIDResolutionTotal.WithLabelValues("success"))
+	assert.Equal(t, float64(2), successCount)
+
+	failureCount := testutil.ToFloat64(routerIDResolutionTotal.WithLabelValues("failure"))
+	assert.Equal(t, float64(1), failureCount)
+}
+
+func TestUpdateRouterIDSource(t *testing.T) {
+	routerIDSource.Reset()
+
+	UpdateRouterIDSource(RouterIDSourceNodeIPv4)
+
+	// Active source should be 1
+	activeVal := testutil.ToFloat64(routerIDSource.WithLabelValues(RouterIDSourceNodeIPv4))
+	assert.Equal(t, float64(1), activeVal)
+
+	// All other sources should be 0
+	explicitVal := testutil.ToFloat64(routerIDSource.WithLabelValues(RouterIDSourceExplicit))
+	assert.Equal(t, float64(0), explicitVal)
+
+	templateVal := testutil.ToFloat64(routerIDSource.WithLabelValues(RouterIDSourceTemplate))
+	assert.Equal(t, float64(0), templateVal)
+
+	hashVal := testutil.ToFloat64(routerIDSource.WithLabelValues(RouterIDSourceHashFromNode))
+	assert.Equal(t, float64(0), hashVal)
+
+	// Switch source — previous active should become 0
+	UpdateRouterIDSource(RouterIDSourceExplicit)
+
+	explicitVal = testutil.ToFloat64(routerIDSource.WithLabelValues(RouterIDSourceExplicit))
+	assert.Equal(t, float64(1), explicitVal)
+
+	nodeVal := testutil.ToFloat64(routerIDSource.WithLabelValues(RouterIDSourceNodeIPv4))
+	assert.Equal(t, float64(0), nodeVal)
+}
+
+func TestUpdateRouterIDInfo(t *testing.T) {
+	routerIDInfo.Reset()
+
+	UpdateRouterIDInfo("10.0.0.5", "node-ipv4", "worker-1", "64512")
+
+	val := testutil.ToFloat64(routerIDInfo.WithLabelValues("10.0.0.5", "node-ipv4", "worker-1", "64512"))
+	assert.Equal(t, float64(1), val)
+
+	// Calling again with different values should reset the old entry
+	UpdateRouterIDInfo("10.255.0.42", "hash-from-node-name", "worker-2", "64513")
+
+	newVal := testutil.ToFloat64(routerIDInfo.WithLabelValues("10.255.0.42", "hash-from-node-name", "worker-2", "64513"))
+	assert.Equal(t, float64(1), newVal)
+
+	// Old labels should be gone (reset to 0 after Reset())
+	oldVal := testutil.ToFloat64(routerIDInfo.WithLabelValues("10.0.0.5", "node-ipv4", "worker-1", "64512"))
+	assert.Equal(t, float64(0), oldVal)
 }

@@ -23,57 +23,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 	bgpv1 "github.com/purelb/k8gobgp/api/v1"
 )
-
-func TestCrdToAPIGlobal(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    *bgpv1.GlobalSpec
-		expected *gobgpapi.Global
-	}{
-		{
-			name: "basic global config",
-			input: &bgpv1.GlobalSpec{
-				ASN:      64512,
-				RouterID: "192.168.1.1",
-			},
-			expected: &gobgpapi.Global{
-				Asn:      64512,
-				RouterId: "192.168.1.1",
-			},
-		},
-		{
-			name: "global config with listen port",
-			input: &bgpv1.GlobalSpec{
-				ASN:             64512,
-				RouterID:        "10.0.0.1",
-				ListenPort:      179,
-				ListenAddresses: []string{"0.0.0.0", "::"},
-			},
-			expected: &gobgpapi.Global{
-				Asn:             64512,
-				RouterId:        "10.0.0.1",
-				ListenPort:      179,
-				ListenAddresses: []string{"0.0.0.0", "::"},
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := crdToAPIGlobal(tt.input)
-			assert.Equal(t, tt.expected.Asn, result.Asn)
-			assert.Equal(t, tt.expected.RouterId, result.RouterId)
-			assert.Equal(t, tt.expected.ListenPort, result.ListenPort)
-			assert.Equal(t, tt.expected.ListenAddresses, result.ListenAddresses)
-		})
-	}
-}
 
 func TestCrdToAPIFamily(t *testing.T) {
 	tests := []struct {
@@ -305,6 +262,7 @@ func TestResolveAuthPassword(t *testing.T) {
 		secretRef      *corev1.SecretKeySelector
 		secret         *corev1.Secret
 		expected       string
+		wantErr        bool
 	}{
 		{
 			name:           "inline password only",
@@ -333,17 +291,17 @@ func TestResolveAuthPassword(t *testing.T) {
 			expected: "secret-pass",
 		},
 		{
-			name:           "missing secret returns empty",
+			name:           "missing secret returns error",
 			namespace:      "default",
 			inlinePassword: "",
 			secretRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: "missing-secret"},
 				Key:                  "password",
 			},
-			expected: "",
+			wantErr: true,
 		},
 		{
-			name:           "missing key returns empty",
+			name:           "missing key returns error",
 			namespace:      "default",
 			inlinePassword: "",
 			secretRef: &corev1.SecretKeySelector{
@@ -359,7 +317,7 @@ func TestResolveAuthPassword(t *testing.T) {
 					"password": []byte("secret-pass"),
 				},
 			},
-			expected: "",
+			wantErr: true,
 		},
 	}
 
@@ -377,8 +335,13 @@ func TestResolveAuthPassword(t *testing.T) {
 				Scheme: scheme,
 			}
 
-			result := r.resolveAuthPassword(context.Background(), tt.namespace, tt.inlinePassword, tt.secretRef, r.Log)
-			assert.Equal(t, tt.expected, result)
+			result, err := r.resolveAuthPassword(context.Background(), tt.namespace, tt.inlinePassword, tt.secretRef, r.Log)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expected, result)
+			}
 		})
 	}
 }
@@ -646,4 +609,238 @@ func TestCrdToAPIPeerGroupWithPassword(t *testing.T) {
 	assert.Equal(t, "Upstream peer group", result.Conf.Description)
 	assert.Equal(t, "group-password", result.Conf.AuthPassword)
 	assert.Len(t, result.AfiSafis, 1)
+}
+
+// TestValidateConfiguration_RouterIDPool tests the routerIDPool validation path
+func TestValidateConfiguration_RouterIDPool(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = bgpv1.AddToScheme(scheme)
+
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &BGPConfigurationReconciler{
+		Client: client,
+		Log:    zap.New(zap.UseDevMode(true)),
+		Scheme: scheme,
+	}
+
+	tests := []struct {
+		name      string
+		pool      string
+		wantValid bool
+	}{
+		{
+			name:      "valid pool",
+			pool:      "10.255.0.0/16",
+			wantValid: true,
+		},
+		{
+			name:      "empty pool (allowed)",
+			pool:      "",
+			wantValid: true,
+		},
+		{
+			name:      "pool too small /25",
+			pool:      "10.0.0.0/25",
+			wantValid: false,
+		},
+		{
+			name:      "invalid CIDR",
+			pool:      "not-a-cidr",
+			wantValid: false,
+		},
+		{
+			name:      "IPv6 pool",
+			pool:      "2001:db8::/32",
+			wantValid: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &bgpv1.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-config",
+					Namespace: "default",
+				},
+				Spec: bgpv1.BGPConfigurationSpec{
+					Global: bgpv1.GlobalSpec{
+						ASN:          64512,
+						RouterID:     "192.168.1.1",
+						RouterIDPool: tt.pool,
+					},
+				},
+			}
+
+			result := r.validateConfiguration(config)
+			assert.Equal(t, tt.wantValid, result.Valid, "pool=%q: valid=%v, errors=%v", tt.pool, result.Valid, result.ErrorMessages())
+		})
+	}
+}
+
+// TestAnnotatePodWithRouterID tests pod annotation patching
+func TestAnnotatePodWithRouterID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "k8gobgp-abc123",
+			Namespace: "k8gobgp-system",
+		},
+	}
+
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
+	r := &BGPConfigurationReconciler{
+		Client:       client,
+		Log:          zap.New(zap.UseDevMode(true)),
+		Scheme:       scheme,
+		PodName:      "k8gobgp-abc123",
+		PodNamespace: "k8gobgp-system",
+	}
+
+	resolution := &RouterIDResolution{
+		RouterID: "192.168.1.10",
+		Source:   RouterIDSourceNodeIPv4,
+		NodeName: "worker-1",
+	}
+
+	err := r.annotatePodWithRouterID(context.Background(), resolution, 64512)
+	assert.NoError(t, err)
+
+	// Verify annotations were set by fetching the pod back
+	var updatedPod corev1.Pod
+	err = client.Get(context.Background(), types.NamespacedName{
+		Name: "k8gobgp-abc123", Namespace: "k8gobgp-system",
+	}, &updatedPod)
+	require.NoError(t, err)
+
+	assert.Equal(t, "192.168.1.10", updatedPod.Annotations["bgp.purelb.io/router-id"])
+	assert.Equal(t, "node-ipv4", updatedPod.Annotations["bgp.purelb.io/router-id-source"])
+	assert.Equal(t, "64512", updatedPod.Annotations["bgp.purelb.io/asn"])
+}
+
+// TestAnnotatePodWithRouterID_MissingPodInfo tests error when PodName/PodNamespace not set
+func TestAnnotatePodWithRouterID_MissingPodInfo(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	client := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &BGPConfigurationReconciler{
+		Client: client,
+		Log:    zap.New(zap.UseDevMode(true)),
+		Scheme: scheme,
+		// PodName and PodNamespace intentionally empty
+	}
+
+	resolution := &RouterIDResolution{
+		RouterID: "192.168.1.10",
+		Source:   RouterIDSourceNodeIPv4,
+		NodeName: "worker-1",
+	}
+
+	err := r.annotatePodWithRouterID(context.Background(), resolution, 64512)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "PodName or PodNamespace not set")
+}
+
+// TestEmitRouterIDResolvedEvent tests event emission for successful resolution
+func TestEmitRouterIDResolvedEvent(t *testing.T) {
+	fakeRecorder := record.NewFakeRecorder(10)
+
+	r := &BGPConfigurationReconciler{
+		Recorder: fakeRecorder,
+	}
+
+	config := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+	}
+
+	resolution := &RouterIDResolution{
+		RouterID: "192.168.1.10",
+		Source:   RouterIDSourceNodeIPv4,
+		NodeName: "worker-1",
+	}
+
+	r.emitRouterIDResolvedEvent(config, resolution)
+
+	// Read event from the fake recorder channel
+	select {
+	case event := <-fakeRecorder.Events:
+		assert.Contains(t, event, "Normal")
+		assert.Contains(t, event, EventReasonRouterIDResolved)
+		assert.Contains(t, event, "192.168.1.10")
+		assert.Contains(t, event, "node-ipv4")
+		assert.Contains(t, event, "worker-1")
+	default:
+		t.Error("expected an event to be emitted, got none")
+	}
+}
+
+// TestEmitRouterIDResolvedEvent_NilRecorder tests graceful handling when recorder is nil
+func TestEmitRouterIDResolvedEvent_NilRecorder(t *testing.T) {
+	r := &BGPConfigurationReconciler{
+		// Recorder intentionally nil
+	}
+
+	config := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+	}
+
+	resolution := &RouterIDResolution{
+		RouterID: "192.168.1.10",
+		Source:   RouterIDSourceNodeIPv4,
+		NodeName: "worker-1",
+	}
+
+	// Should not panic
+	r.emitRouterIDResolvedEvent(config, resolution)
+}
+
+// TestEmitRouterIDFailedEvent tests event emission for failed resolution
+func TestEmitRouterIDFailedEvent(t *testing.T) {
+	fakeRecorder := record.NewFakeRecorder(10)
+
+	r := &BGPConfigurationReconciler{
+		Recorder: fakeRecorder,
+	}
+
+	config := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+	}
+
+	r.emitRouterIDFailedEvent(config, assert.AnError)
+
+	select {
+	case event := <-fakeRecorder.Events:
+		assert.Contains(t, event, "Warning")
+		assert.Contains(t, event, EventReasonRouterIDFailed)
+	default:
+		t.Error("expected a warning event to be emitted, got none")
+	}
+}
+
+// TestEmitRouterIDFailedEvent_NilRecorder tests graceful handling when recorder is nil
+func TestEmitRouterIDFailedEvent_NilRecorder(t *testing.T) {
+	r := &BGPConfigurationReconciler{
+		// Recorder intentionally nil
+	}
+
+	config := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-config",
+			Namespace: "default",
+		},
+	}
+
+	// Should not panic
+	r.emitRouterIDFailedEvent(config, assert.AnError)
 }

@@ -69,6 +69,31 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	// Enforce minimum poll interval to prevent excessive API calls to gobgpd
+	const minPollInterval = 15 * time.Second
+	if metricsPollInterval < minPollInterval {
+		setupLog.Info("metrics-poll-interval below minimum, using minimum", "requested", metricsPollInterval, "minimum", minPollInterval)
+		metricsPollInterval = minPollInterval
+	}
+
+	// Validate required environment variables (set via Downward API in DaemonSet)
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		setupLog.Error(nil, "NODE_NAME environment variable not set - required for dynamic router ID resolution")
+		os.Exit(1)
+	}
+	podName := os.Getenv("POD_NAME")
+	if podName == "" {
+		setupLog.Error(nil, "POD_NAME environment variable not set - required for pod annotations")
+		os.Exit(1)
+	}
+	podNamespace := os.Getenv("POD_NAMESPACE")
+	if podNamespace == "" {
+		setupLog.Error(nil, "POD_NAMESPACE environment variable not set - required for pod annotations")
+		os.Exit(1)
+	}
+	setupLog.Info("pod identity configured", "nodeName", nodeName, "podName", podName, "podNamespace", podNamespace)
+
 	// Note: Leader election is disabled because this controller runs as a DaemonSet.
 	// Each node runs its own instance that manages the local GoBGP daemon.
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -91,6 +116,10 @@ func main() {
 		Log:           ctrl.Log.WithName("controllers").WithName("BGPConfiguration"),
 		Scheme:        mgr.GetScheme(),
 		GoBGPEndpoint: gobgpEndpoint,
+		Recorder:      mgr.GetEventRecorderFor("bgpconfiguration-controller"),
+		NodeName:      nodeName,
+		PodName:       podName,
+		PodNamespace:  podNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BGPConfiguration")
 		os.Exit(1)

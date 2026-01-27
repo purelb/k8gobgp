@@ -44,3 +44,15 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	docker push ${IMG}
+
+##@ Testing
+
+.PHONY: test
+test: ## Run unit tests.
+	go test ./... -short -v
+
+.PHONY: test-e2e
+test-e2e: ## Run E2E tests against the current kubeconfig context.
+	@echo "Running E2E tests against current kubeconfig context..."
+	@echo "KUBECONFIG: $${KUBECONFIG:-~/.kube/config}"
+	go test -v -tags=e2e ./test/e2e/...

@@ -98,20 +98,14 @@ func (e ValidationError) Error() string {
 
 // ValidationResult holds the results of configuration validation
 type ValidationResult struct {
-	Valid    bool
-	Errors   []ValidationError
-	Warnings []ValidationError
+	Valid  bool
+	Errors []ValidationError
 }
 
 // AddError adds an error to the validation result
 func (v *ValidationResult) AddError(field, value, message string) {
 	v.Valid = false
 	v.Errors = append(v.Errors, ValidationError{Field: field, Value: value, Message: message})
-}
-
-// AddWarning adds a warning to the validation result
-func (v *ValidationResult) AddWarning(field, value, message string) {
-	v.Warnings = append(v.Warnings, ValidationError{Field: field, Value: value, Message: message})
 }
 
 // ErrorMessages returns all error messages as a single string
@@ -122,18 +116,6 @@ func (v *ValidationResult) ErrorMessages() string {
 	messages := make([]string, len(v.Errors))
 	for i, e := range v.Errors {
 		messages[i] = e.Error()
-	}
-	return strings.Join(messages, "; ")
-}
-
-// WarningMessages returns all warning messages as a single string
-func (v *ValidationResult) WarningMessages() string {
-	if len(v.Warnings) == 0 {
-		return ""
-	}
-	messages := make([]string, len(v.Warnings))
-	for i, w := range v.Warnings {
-		messages[i] = w.Error()
 	}
 	return strings.Join(messages, "; ")
 }
@@ -176,30 +158,4 @@ func ValidateLargeCommunity(community string) error {
 	}
 
 	return nil
-}
-
-// ValidateCommunityList validates a list of standard BGP communities
-func ValidateCommunityList(communities []string, fieldName string) *ValidationResult {
-	result := &ValidationResult{Valid: true}
-
-	for _, community := range communities {
-		if err := ValidateCommunity(community); err != nil {
-			result.AddError(fieldName, community, err.Error())
-		}
-	}
-
-	return result
-}
-
-// ValidateLargeCommunityList validates a list of large BGP communities
-func ValidateLargeCommunityList(communities []string, fieldName string) *ValidationResult {
-	result := &ValidationResult{Valid: true}
-
-	for _, community := range communities {
-		if err := ValidateLargeCommunity(community); err != nil {
-			result.AddError(fieldName, community, err.Error())
-		}
-	}
-
-	return result
 }

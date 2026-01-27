@@ -58,6 +58,101 @@ make deploy IMG=<your-registry>/k8gobgp:latest
 
 ## Usage
 
+### Dynamic Router ID Resolution
+
+The BGP router ID can be configured in three ways, providing flexibility for different deployment scenarios:
+
+#### 1. Auto-Detection (Default)
+
+When `routerID` is omitted, k8gobgp automatically detects the router ID from the node's primary internal IPv4 address:
+
+```yaml
+spec:
+  global:
+    asn: 64512
+    # routerID omitted - auto-detected from node IPv4
+```
+
+For **IPv6-only nodes** (no IPv4 address available), a deterministic router ID is generated using FNV-1a hash of the node name, mapped to an address within the `routerIDPool`.
+
+#### 2. Template Variables
+
+Use template variables for dynamic resolution at runtime:
+
+```yaml
+spec:
+  global:
+    asn: 64512
+    routerID: "${NODE_IP}"  # Resolved to node's internal IPv4
+```
+
+Supported template variables:
+
+| Variable | Description |
+|----------|-------------|
+| `${NODE_IP}` | Node's primary internal IPv4 address |
+| `${NODE_IPV4}` | Same as `${NODE_IP}` |
+| `${NODE_EXTERNAL_IP}` | Node's external IPv4 address |
+| `${node.annotations['key']}` | Value from node annotation |
+
+Example using a node annotation:
+
+```yaml
+spec:
+  global:
+    asn: 64512
+    routerID: "${node.annotations['bgp.purelb.io/router-id']}"
+```
+
+#### 3. Explicit IPv4 Address
+
+Specify an explicit IPv4 address (backward compatible):
+
+```yaml
+spec:
+  global:
+    asn: 64512
+    routerID: "192.168.1.1"  # Explicit IPv4
+```
+
+#### Router ID Pool for IPv6-Only Nodes
+
+For clusters with IPv6-only nodes, configure a custom pool for hash-based router ID generation:
+
+```yaml
+spec:
+  global:
+    asn: 64512
+    routerIDPool: "172.30.0.0/24"  # Custom pool (default: 10.255.0.0/16)
+```
+
+**Requirements:**
+- Must be a valid IPv4 CIDR
+- Minimum size: /24 (256 addresses)
+- **Multi-cluster deployments:** Each cluster MUST use a unique `routerIDPool` to avoid router ID collisions
+
+#### Checking Resolved Router ID
+
+After the BGPConfiguration is reconciled, check the resolved router ID in the status:
+
+```bash
+kubectl -n k8gobgp-system get bgpconfig <name> -o yaml
+```
+
+```yaml
+status:
+  resolvedRouterID: "192.168.1.10"
+  routerIDSource: "node-ipv4"        # explicit | template | node-ipv4 | hash-from-node-name
+  routerIDNode: "worker-1"
+  routerIDResolutionTime: "2026-01-26T10:00:00Z"
+```
+
+#### Router ID Immutability
+
+Once resolved, the router ID is **immutable** for the lifetime of the pod. This prevents BGP session flapping if node annotations change. To change the router ID:
+
+1. Update the BGPConfiguration spec
+2. Delete and recreate the k8gobgp pods
 
 ### Basic BGP Configuration
 
@@ -70,7 +165,7 @@ metadata:
 spec:
   global:
     asn: 64512
-    routerID: "192.168.1.1"
+    routerID: "192.168.1.1"  # Can be omitted for auto-detection
     listenPort: 179
     families:
       - "ipv4-unicast"
@@ -305,6 +400,15 @@ The controller exposes Prometheus metrics on `:8080/metrics`:
 | `k8gobgp_cleanup_retries_total` | Counter | Cleanup retries during deletion |
 | `k8gobgp_cleanup_duration_seconds` | Histogram | Cleanup operation duration |
 
+### Router ID Resolution Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `k8gobgp_router_id_resolution_total` | Counter | Resolution attempts by result (success/failure) |
+| `k8gobgp_router_id_resolution_duration_seconds` | Histogram | Time to resolve router ID |
+| `k8gobgp_router_id_source` | Gauge | Active resolution source (explicit/template/node_ipv4/hash_from_node_name) |
+| `k8gobgp_router_id_info` | Gauge | Router ID details (labels: router_id, source, node) |
+
 ### BGP Stats Metrics (from periodic polling)
 
 These metrics are collected every `--metrics-poll-interval` (default 15s) directly from gobgpd:
@@ -424,6 +528,43 @@ kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip> adj-out
 | No routes imported | Netlink config missing | Check `netlinkImport.enabled` and interface patterns |
 | ConfigurationInvalid status | Invalid community format | Communities must be `AS:VALUE` (0-65535:0-65535) |
 | CRD validation error | Invalid community pattern | Check community format matches `^\d{1,5}:\d{1,5}$` |
+| Router ID resolution failed | Missing NODE_NAME env | Ensure DaemonSet has `NODE_NAME` from downward API |
+| Router ID shows hash-based | IPv6-only node | Expected behavior; configure `routerIDPool` if needed |
+
+### Migration Guide: Switching to Dynamic Router ID
+
+If you're upgrading from an explicit `routerID` to dynamic resolution:
+
+1. **Existing explicit routerID** - No changes required. Explicit values continue to work.
+
+2. **Switching to auto-detection**:
+   ```yaml
+   # Before
+   spec:
+     global:
+       asn: 64512
+       routerID: "192.168.1.1"
+
+   # After (remove routerID for auto-detection)
+   spec:
+     global:
+       asn: 64512
+   ```
+   Then restart the k8gobgp pods: `kubectl -n k8gobgp-system rollout restart daemonset/k8gobgp`
+
+3. **Switching to templates**:
+   ```yaml
+   spec:
+     global:
+       asn: 64512
+       routerID: "${NODE_IP}"
+   ```
+   Restart pods to apply.
+
+4. **Verification checklist**:
+   - Confirm `NODE_NAME` env var is set in DaemonSet
+   - Verify RBAC includes `nodes:get` permission
+   - Check `status.resolvedRouterID` after reconciliation
 
 ## Contributing
 
