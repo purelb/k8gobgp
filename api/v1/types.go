@@ -123,28 +123,31 @@ type GlobalSpec struct {
 
 // +kubebuilder:object:generate=true
 type Neighbor struct {
-	Config          NeighborConfig   `json:"config"`
-	AfiSafis        []AfiSafi        `json:"afiSafis,omitempty"`
-	ApplyPolicy     *ApplyPolicy     `json:"applyPolicy,omitempty"`
-	Timers          *Timers          `json:"timers,omitempty"`
-	Transport       *Transport       `json:"transport,omitempty"`
-	GracefulRestart *GracefulRestart `json:"gracefulRestart,omitempty"`
-	RouteReflector  *RouteReflector  `json:"routeReflector,omitempty"`
-	EbgpMultihop    *EbgpMultihop    `json:"ebgpMultihop,omitempty"`
+	Config          NeighborConfig        `json:"config"`
+	NodeSelector    *metav1.LabelSelector `json:"nodeSelector,omitempty"`
+	AfiSafis        []AfiSafi             `json:"afiSafis,omitempty"`
+	ApplyPolicy     *ApplyPolicy          `json:"applyPolicy,omitempty"`
+	Timers          *Timers               `json:"timers,omitempty"`
+	Transport       *Transport            `json:"transport,omitempty"`
+	GracefulRestart *GracefulRestart      `json:"gracefulRestart,omitempty"`
+	RouteReflector  *RouteReflector       `json:"routeReflector,omitempty"`
+	EbgpMultihop    *EbgpMultihop         `json:"ebgpMultihop,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
 type PeerGroup struct {
-	Config      PeerGroupConfig `json:"config"`
-	AfiSafis    []AfiSafi       `json:"afiSafis,omitempty"`
-	ApplyPolicy *ApplyPolicy    `json:"applyPolicy,omitempty"`
-	Timers      *Timers         `json:"timers,omitempty"`
-	Transport   *Transport      `json:"transport,omitempty"`
+	Config       PeerGroupConfig       `json:"config"`
+	NodeSelector *metav1.LabelSelector `json:"nodeSelector,omitempty"`
+	AfiSafis     []AfiSafi             `json:"afiSafis,omitempty"`
+	ApplyPolicy  *ApplyPolicy          `json:"applyPolicy,omitempty"`
+	Timers       *Timers               `json:"timers,omitempty"`
+	Transport    *Transport            `json:"transport,omitempty"`
 }
 
 // --- Detailed Sub-structs ---
 
 // +kubebuilder:object:generate=true
+// +kubebuilder:validation:XValidation:rule="self.neighborAddress != '' || self.neighborInterface != ''",message="either neighborAddress or neighborInterface must be set"
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
 	// +optional
@@ -155,12 +158,13 @@ type NeighborConfig struct {
 	AuthPasswordSecretRef *corev1.SecretKeySelector `json:"authPasswordSecretRef,omitempty"`
 	Description           string                    `json:"description,omitempty"`
 	LocalAsn              uint32                    `json:"localAsn,omitempty"`
-	NeighborAddress       string                    `json:"neighborAddress"`
-	PeerAsn               uint32                    `json:"peerAsn"`
-	PeerGroup             string                    `json:"peerGroup,omitempty"`
-	AdminDown             bool                      `json:"adminDown,omitempty"`
-	NeighborInterface     string                    `json:"neighborInterface,omitempty"`
-	Vrf                   string                    `json:"vrf,omitempty"`
+	// +optional
+	NeighborAddress   string `json:"neighborAddress,omitempty"`
+	PeerAsn           uint32 `json:"peerAsn"`
+	PeerGroup         string `json:"peerGroup,omitempty"`
+	AdminDown         bool   `json:"adminDown,omitempty"`
+	NeighborInterface string `json:"neighborInterface,omitempty"`
+	Vrf               string `json:"vrf,omitempty"`
 }
 
 // +kubebuilder:object:generate=true

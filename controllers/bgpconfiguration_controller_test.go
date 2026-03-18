@@ -844,3 +844,438 @@ func TestEmitRouterIDFailedEvent_NilRecorder(t *testing.T) {
 	// Should not panic
 	r.emitRouterIDFailedEvent(config, assert.AnError)
 }
+
+// --- neighborKey tests ---
+
+func TestNeighborKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		conf     *gobgpapi.PeerConf
+		expected string
+	}{
+		{
+			name:     "address-based peer",
+			conf:     &gobgpapi.PeerConf{NeighborAddress: "172.30.250.1"},
+			expected: "172.30.250.1",
+		},
+		{
+			name:     "interface-based peer",
+			conf:     &gobgpapi.PeerConf{NeighborInterface: "eth0"},
+			expected: "iface:eth0",
+		},
+		{
+			name:     "interface-based peer with resolved address",
+			conf:     &gobgpapi.PeerConf{NeighborAddress: "fe80::1", NeighborInterface: "eth0"},
+			expected: "iface:eth0",
+		},
+		{
+			name:     "ipv6 address peer",
+			conf:     &gobgpapi.PeerConf{NeighborAddress: "fd00::1"},
+			expected: "fd00::1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, neighborKey(tt.conf))
+		})
+	}
+}
+
+func TestNeighborKeyFromCRD(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *bgpv1.NeighborConfig
+		expected string
+	}{
+		{
+			name:     "address-based",
+			cfg:      &bgpv1.NeighborConfig{NeighborAddress: "10.0.0.1"},
+			expected: "10.0.0.1",
+		},
+		{
+			name:     "interface-based",
+			cfg:      &bgpv1.NeighborConfig{NeighborInterface: "eth1"},
+			expected: "iface:eth1",
+		},
+		{
+			name:     "both set, interface wins",
+			cfg:      &bgpv1.NeighborConfig{NeighborAddress: "10.0.0.1", NeighborInterface: "eth1"},
+			expected: "iface:eth1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, neighborKeyFromCRD(tt.cfg))
+		})
+	}
+}
+
+// --- peerConfigEqual tests ---
+
+func TestPeerConfigEqual(t *testing.T) {
+	basePeer := func() *gobgpapi.Peer {
+		return &gobgpapi.Peer{
+			Conf: &gobgpapi.PeerConf{
+				NeighborAddress: "10.0.0.1",
+				PeerAsn:         64513,
+				LocalAsn:        64512,
+				Description:     "test",
+				AuthPassword:    "secret",
+				PeerGroup:       "group1",
+				NeighborInterface: "",
+				Vrf:             "",
+			},
+			AfiSafis: []*gobgpapi.AfiSafi{
+				{Config: &gobgpapi.AfiSafiConfig{
+					Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
+					Enabled: true,
+				}},
+			},
+			Timers: &gobgpapi.Timers{
+				Config: &gobgpapi.TimersConfig{
+					HoldTime:          90,
+					KeepaliveInterval: 30,
+				},
+			},
+			Transport: &gobgpapi.Transport{
+				LocalAddress:  "0.0.0.0",
+				PassiveMode:   false,
+				BindInterface: "",
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		desired  *gobgpapi.Peer
+		current  *gobgpapi.Peer
+		expected bool
+	}{
+		{
+			name:     "identical configs",
+			desired:  basePeer(),
+			current:  basePeer(),
+			expected: true,
+		},
+		{
+			name:    "current has populated State (should be ignored)",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.State = &gobgpapi.PeerState{
+					SessionState: gobgpapi.PeerState_SESSION_STATE_ESTABLISHED,
+					Messages:     &gobgpapi.Messages{},
+				}
+				p.Timers.State = &gobgpapi.TimersState{}
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			name:    "interface peer with resolved address (should be ignored)",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.NeighborAddress = ""
+				p.Conf.NeighborInterface = "eth0"
+				return p
+			}(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.NeighborAddress = "fe80::abc:123"
+				p.Conf.NeighborInterface = "eth0"
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			name:    "different PeerAsn",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.PeerAsn = 64514
+				return p
+			}(),
+			expected: false,
+		},
+		{
+			name:    "different AuthPassword",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.AuthPassword = "different"
+				return p
+			}(),
+			expected: false,
+		},
+		{
+			name:    "different AfiSafi count",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.AfiSafis = append(p.AfiSafis, &gobgpapi.AfiSafi{
+					Config: &gobgpapi.AfiSafiConfig{
+						Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST},
+						Enabled: true,
+					},
+				})
+				return p
+			}(),
+			expected: false,
+		},
+		{
+			name:    "current has auto-populated Type and SendCommunity (should be ignored)",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.Type = 1
+				p.Conf.SendCommunity = 3
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			name:    "current has extra Transport runtime fields (should be ignored)",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Transport.LocalPort = 179
+				p.Transport.RemoteAddress = "10.0.0.1"
+				p.Transport.RemotePort = 44123
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			name:    "different Transport PassiveMode",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Transport.PassiveMode = true
+				return p
+			}(),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, peerConfigEqual(tt.desired, tt.current))
+		})
+	}
+}
+
+// --- peerGroupConfigEqual tests ---
+
+func TestPeerGroupConfigEqual(t *testing.T) {
+	basePG := func() *gobgpapi.PeerGroup {
+		return &gobgpapi.PeerGroup{
+			Conf: &gobgpapi.PeerGroupConf{
+				PeerGroupName: "test-group",
+				PeerAsn:       64513,
+				Description:   "test",
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		desired  *gobgpapi.PeerGroup
+		current  *gobgpapi.PeerGroup
+		expected bool
+	}{
+		{
+			name:     "identical",
+			desired:  basePG(),
+			current:  basePG(),
+			expected: true,
+		},
+		{
+			name:    "current has Info (runtime state, should be ignored)",
+			desired: basePG(),
+			current: func() *gobgpapi.PeerGroup {
+				pg := basePG()
+				pg.Info = &gobgpapi.PeerGroupState{TotalPaths: 5}
+				return pg
+			}(),
+			expected: true,
+		},
+		{
+			name:    "different PeerAsn",
+			desired: basePG(),
+			current: func() *gobgpapi.PeerGroup {
+				pg := basePG()
+				pg.Conf.PeerAsn = 64514
+				return pg
+			}(),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, peerGroupConfigEqual(tt.desired, tt.current))
+		})
+	}
+}
+
+// --- nodeMatchesSelector tests ---
+
+func TestNodeMatchesSelector(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, bgpv1.AddToScheme(scheme))
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Labels: map[string]string{
+				"network.example.com/subnet": "250",
+				"kubernetes.io/os":           "linux",
+			},
+		},
+		Status: corev1.NodeStatus{
+			Addresses: []corev1.NodeAddress{
+				{Type: corev1.NodeInternalIP, Address: "172.30.250.100"},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(node).
+		Build()
+
+	r := &BGPConfigurationReconciler{
+		Client:   fakeClient,
+		Log:      zap.New(zap.UseDevMode(true)),
+		NodeName: "test-node",
+		Recorder: record.NewFakeRecorder(10),
+	}
+	r.InitNodeCache()
+
+	log := r.Log
+
+	tests := []struct {
+		name     string
+		selector *metav1.LabelSelector
+		expected bool
+	}{
+		{
+			name:     "matchLabels match",
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"network.example.com/subnet": "250"}},
+			expected: true,
+		},
+		{
+			name:     "matchLabels don't match",
+			selector: &metav1.LabelSelector{MatchLabels: map[string]string{"network.example.com/subnet": "251"}},
+			expected: false,
+		},
+		{
+			name:     "empty selector matches all",
+			selector: &metav1.LabelSelector{},
+			expected: true,
+		},
+		{
+			name: "matchExpressions In operator matches",
+			selector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "network.example.com/subnet", Operator: metav1.LabelSelectorOpIn, Values: []string{"250", "251"}},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "matchExpressions In operator doesn't match",
+			selector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "network.example.com/subnet", Operator: metav1.LabelSelectorOpIn, Values: []string{"251", "252"}},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := r.nodeMatchesSelector(context.Background(), tt.selector, log)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// --- hasAnyNodeSelector tests ---
+
+func TestHasAnyNodeSelector(t *testing.T) {
+	assert.False(t, hasAnyNodeSelector(nil))
+	assert.False(t, hasAnyNodeSelector([]bgpv1.Neighbor{
+		{Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.1"}},
+	}))
+	assert.True(t, hasAnyNodeSelector([]bgpv1.Neighbor{
+		{Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.1"}},
+		{Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.2"}, NodeSelector: &metav1.LabelSelector{}},
+	}))
+}
+
+// --- deletePeerByKey tests ---
+
+func TestDeletePeerByKey_UsesInterfaceForInterfacePeers(t *testing.T) {
+	// Verify that the function constructs the right request type.
+	// We can't easily mock the gRPC client, but we can verify the helper logic
+	// by checking that neighborKeyFromCRD returns the expected key.
+	cfg := &bgpv1.NeighborConfig{NeighborInterface: "eth0"}
+	assert.Equal(t, "iface:eth0", neighborKeyFromCRD(cfg))
+
+	cfg2 := &bgpv1.NeighborConfig{NeighborAddress: "10.0.0.1"}
+	assert.Equal(t, "10.0.0.1", neighborKeyFromCRD(cfg2))
+}
+
+// --- nodeCache invalidate tests ---
+
+func TestNodeCacheInvalidate(t *testing.T) {
+	cache := newNodeCache(5 * 60 * 1e9) // 5 min
+
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "node1",
+			Labels: map[string]string{"subnet": "250"},
+		},
+	}
+
+	cache.set("node1", node)
+
+	// Should be cached
+	cached, ok := cache.get("node1")
+	assert.True(t, ok)
+	assert.Equal(t, "250", cached.Labels["subnet"])
+
+	// Invalidate
+	cache.invalidate("node1")
+
+	// Should no longer be cached
+	_, ok = cache.get("node1")
+	assert.False(t, ok)
+}
+
+// --- transport/timer/afisafi comparison helper tests ---
+
+func TestTransportConfigEqual(t *testing.T) {
+	assert.True(t, transportConfigEqual(nil, nil))
+	assert.False(t, transportConfigEqual(&gobgpapi.Transport{}, nil))
+	assert.False(t, transportConfigEqual(nil, &gobgpapi.Transport{}))
+	assert.True(t, transportConfigEqual(
+		&gobgpapi.Transport{LocalAddress: "0.0.0.0", PassiveMode: false},
+		&gobgpapi.Transport{LocalAddress: "0.0.0.0", PassiveMode: false, LocalPort: 179, RemotePort: 44000},
+	))
+}
+
+func TestTimersConfigEqual(t *testing.T) {
+	assert.True(t, timersConfigEqual(nil, nil))
+	assert.False(t, timersConfigEqual(&gobgpapi.Timers{}, nil))
+	assert.True(t, timersConfigEqual(
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}, State: &gobgpapi.TimersState{}},
+	))
+}

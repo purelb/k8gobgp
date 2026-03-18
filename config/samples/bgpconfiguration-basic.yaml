@@ -6,13 +6,13 @@ metadata:
 spec:
   global:
     asn: 64512
-    routerID: "192.168.1.1"
     listenPort: 179
     families:
       - "ipv4-unicast"
       - "ipv6-unicast"
 
   neighbors:
+    # Simple neighbor (no nodeSelector — applied to all nodes)
     - config:
         neighborAddress: "192.168.1.254"
         peerAsn: 64513
@@ -24,3 +24,43 @@ spec:
         config:
           holdTime: 90
           keepaliveInterval: 30
+
+    # IPv4 peer targeted to a specific subnet using nodeSelector
+    - config:
+        neighborAddress: "172.30.250.1"
+        peerAsn: 64513
+        description: "Router on subnet-250"
+      nodeSelector:
+        matchLabels:
+          network.example.com/subnet: "250"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+
+    # IPv6 peer targeted to a different subnet
+    - config:
+        neighborAddress: "fd00:251::1"
+        peerAsn: 64513
+        description: "Router on subnet-251"
+      nodeSelector:
+        matchLabels:
+          network.example.com/subnet: "251"
+      afiSafis:
+        - family: "ipv6-unicast"
+          enabled: true
+
+    # IPv6 unnumbered peer (interface-based, no neighborAddress needed)
+    # RFC 5549 Extended Next-Hop capability is negotiated automatically
+    # by GoBGP when neighborInterface is set with ipv4-unicast.
+    - config:
+        neighborInterface: "eth1"
+        peerAsn: 64514
+        description: "Spine switch via unnumbered BGP"
+      nodeSelector:
+        matchLabels:
+          network.example.com/role: "leaf"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+        - family: "ipv6-unicast"
+          enabled: true

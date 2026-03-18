@@ -28,16 +28,21 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 	bgpv1 "github.com/purelb/k8gobgp/api/v1"
@@ -97,6 +102,196 @@ type localRouterIDEntry struct {
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+
+// neighborKey returns a stable map key for a GoBGP peer. For interface-based
+// (unnumbered) peers, the key is "iface:<name>" since GoBGP resolves the
+// link-local address internally and NeighborAddress would differ between
+// desired (empty) and current (fe80::...) state.
+func neighborKey(conf *gobgpapi.PeerConf) string {
+	if conf.NeighborInterface != "" {
+		return "iface:" + conf.NeighborInterface
+	}
+	return conf.NeighborAddress
+}
+
+// neighborKeyFromCRD returns a stable map key from CRD neighbor config.
+func neighborKeyFromCRD(cfg *bgpv1.NeighborConfig) string {
+	if cfg.NeighborInterface != "" {
+		return "iface:" + cfg.NeighborInterface
+	}
+	return cfg.NeighborAddress
+}
+
+// deletePeerByKey issues a DeletePeer request using either Interface or Address
+// depending on whether the peer is interface-based.
+func deletePeerByKey(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, cfg *bgpv1.NeighborConfig) error {
+	if cfg.NeighborInterface != "" {
+		_, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Interface: cfg.NeighborInterface})
+		return err
+	}
+	_, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: cfg.NeighborAddress})
+	return err
+}
+
+// peerConfigEqual compares only the controller-managed fields of two GoBGP Peers,
+// ignoring runtime state fields that GoBGP populates (State, Timers.State,
+// AfiSafi.State, resolved NeighborAddress for interface peers, auto-populated
+// Type/SendCommunity). This avoids spurious UpdatePeer calls every reconcile cycle.
+func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
+	if desired.Conf == nil || current.Conf == nil {
+		return desired.Conf == current.Conf
+	}
+
+	dc, cc := desired.Conf, current.Conf
+
+	// For interface-based peers, skip NeighborAddress comparison since GoBGP
+	// resolves the link-local address and populates it in the current peer.
+	if dc.NeighborInterface == "" && dc.NeighborAddress != cc.NeighborAddress {
+		return false
+	}
+	if dc.PeerAsn != cc.PeerAsn ||
+		dc.LocalAsn != cc.LocalAsn ||
+		dc.Description != cc.Description ||
+		dc.AuthPassword != cc.AuthPassword ||
+		dc.PeerGroup != cc.PeerGroup ||
+		dc.AdminDown != cc.AdminDown ||
+		dc.NeighborInterface != cc.NeighborInterface ||
+		dc.Vrf != cc.Vrf {
+		return false
+	}
+
+	if !afiSafisConfigEqual(desired.AfiSafis, current.AfiSafis) {
+		return false
+	}
+	if !reflect.DeepEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+		return false
+	}
+	if !timersConfigEqual(desired.Timers, current.Timers) {
+		return false
+	}
+	if !transportConfigEqual(desired.Transport, current.Transport) {
+		return false
+	}
+	if !reflect.DeepEqual(desired.GracefulRestart, current.GracefulRestart) {
+		return false
+	}
+	if !reflect.DeepEqual(desired.RouteReflector, current.RouteReflector) {
+		return false
+	}
+	if !reflect.DeepEqual(desired.EbgpMultihop, current.EbgpMultihop) {
+		return false
+	}
+	return true
+}
+
+// peerGroupConfigEqual compares only the controller-managed fields of two GoBGP PeerGroups,
+// ignoring runtime state (Info field).
+func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
+	if desired.Conf == nil || current.Conf == nil {
+		return desired.Conf == current.Conf
+	}
+
+	dc, cc := desired.Conf, current.Conf
+	if dc.PeerGroupName != cc.PeerGroupName ||
+		dc.PeerAsn != cc.PeerAsn ||
+		dc.LocalAsn != cc.LocalAsn ||
+		dc.Description != cc.Description ||
+		dc.AuthPassword != cc.AuthPassword {
+		return false
+	}
+
+	if !afiSafisConfigEqual(desired.AfiSafis, current.AfiSafis) {
+		return false
+	}
+	if !reflect.DeepEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+		return false
+	}
+	if !timersConfigEqual(desired.Timers, current.Timers) {
+		return false
+	}
+	if !transportConfigEqual(desired.Transport, current.Transport) {
+		return false
+	}
+	if !reflect.DeepEqual(desired.GracefulRestart, current.GracefulRestart) {
+		return false
+	}
+	return true
+}
+
+// afiSafisConfigEqual compares AFI/SAFI config only (ignoring State).
+func afiSafisConfigEqual(desired, current []*gobgpapi.AfiSafi) bool {
+	if len(desired) != len(current) {
+		return false
+	}
+	for i := range desired {
+		if desired[i].Config == nil || current[i].Config == nil {
+			if desired[i].Config != current[i].Config {
+				return false
+			}
+			continue
+		}
+		if desired[i].Config.Family == nil || current[i].Config.Family == nil {
+			if desired[i].Config.Family != current[i].Config.Family {
+				return false
+			}
+			continue
+		}
+		if desired[i].Config.Family.Afi != current[i].Config.Family.Afi ||
+			desired[i].Config.Family.Safi != current[i].Config.Family.Safi ||
+			desired[i].Config.Enabled != current[i].Config.Enabled {
+			return false
+		}
+	}
+	return true
+}
+
+// timersConfigEqual compares only Timers.Config, ignoring Timers.State.
+func timersConfigEqual(desired, current *gobgpapi.Timers) bool {
+	if desired == nil && current == nil {
+		return true
+	}
+	if desired == nil || current == nil {
+		return false
+	}
+	return reflect.DeepEqual(desired.Config, current.Config)
+}
+
+// transportConfigEqual compares only the controller-managed Transport fields,
+// ignoring runtime fields like LocalPort, RemoteAddress, RemotePort, etc.
+func transportConfigEqual(desired, current *gobgpapi.Transport) bool {
+	if desired == nil && current == nil {
+		return true
+	}
+	if desired == nil || current == nil {
+		return false
+	}
+	return desired.LocalAddress == current.LocalAddress &&
+		desired.PassiveMode == current.PassiveMode &&
+		desired.BindInterface == current.BindInterface
+}
+
+// nodeMatchesSelector checks if this pod's node matches the given label selector.
+func (r *BGPConfigurationReconciler) nodeMatchesSelector(ctx context.Context, selector *metav1.LabelSelector, log logr.Logger) (bool, error) {
+	node, err := r.getNodeWithRetry(ctx, log)
+	if err != nil {
+		return false, err
+	}
+	sel, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return false, err
+	}
+	return sel.Matches(labels.Set(node.Labels)), nil
+}
+
+// hasAnyNodeSelector returns true if any neighbor in the list has a nodeSelector.
+func hasAnyNodeSelector(neighbors []bgpv1.Neighbor) bool {
+	for i := range neighbors {
+		if neighbors[i].NodeSelector != nil {
+			return true
+		}
+	}
+	return false
+}
 
 func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	startTime := time.Now()
@@ -174,11 +369,11 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		reconcileErr = fmt.Errorf("policies: %w", err)
 	} else if err := r.reconcileVrfs(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("vrfs: %w", err)
-	} else if err := r.reconcilePeerGroups(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if desiredPeerGroups, err := r.reconcilePeerGroups(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("peer groups: %w", err)
-	} else if err := r.reconcileDynamicNeighbors(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if err := r.reconcileDynamicNeighbors(ctx, apiClient, bgpConfig, desiredPeerGroups, log); err != nil {
 		reconcileErr = fmt.Errorf("dynamic neighbors: %w", err)
-	} else if err := r.reconcileNeighbors(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if err := r.reconcileNeighbors(ctx, apiClient, bgpConfig, desiredPeerGroups, log); err != nil {
 		reconcileErr = fmt.Errorf("neighbors: %w", err)
 	} else if err := r.reconcileNetlink(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("netlink: %w", err)
@@ -186,12 +381,11 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Update status
 	bgpConfig.Status.ObservedGeneration = bgpConfig.Generation
-	bgpConfig.Status.NeighborCount = len(bgpConfig.Spec.Neighbors)
 	now := metav1.Now()
 	bgpConfig.Status.LastReconcileTime = &now
 
-	// Update configuration metrics
-	UpdateNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.Neighbors), bgpConfig.Status.EstablishedNeighbors)
+	// Update configuration metrics (NeighborCount is set in reconcileNeighbors with post-filter count)
+	UpdateNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, bgpConfig.Status.NeighborCount, bgpConfig.Status.EstablishedNeighbors)
 	UpdatePeerGroupMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.PeerGroups))
 	UpdateDynamicNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.DynamicNeighbors))
 	UpdateVrfMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.Vrfs))
@@ -283,10 +477,12 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 		// Track cleanup errors
 		var cleanupErrors []error
 
-		// Delete neighbors first (must be done before peer groups)
+		// Delete neighbors first (must be done before peer groups).
+		// Delete unconditionally (don't check nodeSelector) using interface or address as appropriate.
 		for _, n := range bgpConfig.Spec.Neighbors {
-			if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: n.Config.NeighborAddress}); err != nil {
-				log.Error(err, "Failed to delete neighbor during cleanup", "address", n.Config.NeighborAddress)
+			key := neighborKeyFromCRD(&n.Config)
+			if err := deletePeerByKey(ctx, apiClient, &n.Config); err != nil {
+				log.Error(err, "Failed to delete neighbor during cleanup", "key", key)
 				cleanupErrors = append(cleanupErrors, err)
 			}
 		}
@@ -756,7 +952,7 @@ func (r *BGPConfigurationReconciler) reconcileVrfs(ctx context.Context, apiClien
 	return nil
 }
 
-func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
+func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, desiredPeerGroups map[string]*gobgpapi.PeerGroup, log logr.Logger) error {
 	// 1. Get current dynamic neighbors
 	currentDynNeighbors := make(map[string]*gobgpapi.DynamicNeighbor)
 	stream, err := apiClient.ListDynamicNeighbor(ctx, &gobgpapi.ListDynamicNeighborRequest{})
@@ -774,9 +970,18 @@ func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Conte
 		currentDynNeighbors[res.DynamicNeighbor.Prefix] = res.DynamicNeighbor
 	}
 
-	// 2. Get desired dynamic neighbors
+	// 2. Get desired dynamic neighbors (with peer group consistency validation)
 	desiredDynNeighbors := make(map[string]*gobgpapi.DynamicNeighbor)
 	for _, dn := range bgpConfig.Spec.DynamicNeighbors {
+		// Validate peer group reference exists in filtered set
+		if _, pgExists := desiredPeerGroups[dn.PeerGroup]; !pgExists {
+			log.Info("Skipping dynamic neighbor: referenced peer group not configured on this node",
+				"prefix", dn.Prefix, "peerGroup", dn.PeerGroup)
+			r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerGroupMissing",
+				"Dynamic neighbor %s references peer group %q which is not configured on node %s (filtered by nodeSelector)",
+				dn.Prefix, dn.PeerGroup, r.NodeName)
+			continue
+		}
 		desiredDynNeighbors[dn.Prefix] = &gobgpapi.DynamicNeighbor{
 			Prefix:    dn.Prefix,
 			PeerGroup: dn.PeerGroup,
@@ -814,12 +1019,12 @@ func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Conte
 	return nil
 }
 
-func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
+func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) (map[string]*gobgpapi.PeerGroup, error) {
 	// 1. Get current peer groups
 	currentPeerGroups := make(map[string]*gobgpapi.PeerGroup)
 	stream, err := apiClient.ListPeerGroup(ctx, &gobgpapi.ListPeerGroupRequest{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for {
 		res, err := stream.Recv()
@@ -832,13 +1037,25 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 		currentPeerGroups[res.PeerGroup.Conf.PeerGroupName] = res.PeerGroup
 	}
 
-	// 2. Get desired peer groups (with password resolution from Secrets)
+	// 2. Get desired peer groups (with nodeSelector filtering and password resolution)
 	desiredPeerGroups := make(map[string]*gobgpapi.PeerGroup)
 	for _, pg := range bgpConfig.Spec.PeerGroups {
+		// Filter by nodeSelector
+		if pg.NodeSelector != nil {
+			matches, err := r.nodeMatchesSelector(ctx, pg.NodeSelector, log)
+			if err != nil {
+				return nil, fmt.Errorf("peer group %q nodeSelector: %w", pg.Config.PeerGroupName, err)
+			}
+			if !matches {
+				log.V(1).Info("Skipping peer group (nodeSelector doesn't match)", "name", pg.Config.PeerGroupName)
+				continue
+			}
+		}
+
 		// Resolve auth password from Secret or inline value
 		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
 		if err != nil {
-			return fmt.Errorf("peer group %q: %w", pg.Config.PeerGroupName, err)
+			return nil, fmt.Errorf("peer group %q: %w", pg.Config.PeerGroupName, err)
 		}
 		desiredPeerGroups[pg.Config.PeerGroupName] = r.crdToAPIPeerGroupWithPassword(&pg, authPassword)
 	}
@@ -861,7 +1078,7 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 				log.Error(err, "Failed to add peer group", "name", name)
 			}
 		} else {
-			if !reflect.DeepEqual(desired, current) {
+			if !peerGroupConfigEqual(desired, current) {
 				log.Info("Updating peer group", "name", name)
 				if _, err := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: desired}); err != nil {
 					log.Error(err, "Failed to update peer group", "name", name)
@@ -869,10 +1086,10 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 			}
 		}
 	}
-	return nil
+	return desiredPeerGroups, nil
 }
 
-func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
+func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, desiredPeerGroups map[string]*gobgpapi.PeerGroup, log logr.Logger) error {
 	// 1. Get current neighbors
 	currentNeighbors := make(map[string]*gobgpapi.Peer)
 	stream, err := apiClient.ListPeer(ctx, &gobgpapi.ListPeerRequest{})
@@ -887,42 +1104,84 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 			}
 			break
 		}
-		currentNeighbors[res.Peer.Conf.NeighborAddress] = res.Peer
+		currentNeighbors[neighborKey(res.Peer.Conf)] = res.Peer
 	}
 
-	// 2. Get desired neighbors (with password resolution from Secrets)
+	// 2. Get desired neighbors (with nodeSelector filtering and password resolution)
 	desiredNeighbors := make(map[string]*gobgpapi.Peer)
 	for _, n := range bgpConfig.Spec.Neighbors {
+		key := neighborKeyFromCRD(&n.Config)
+
+		// Filter by nodeSelector
+		if n.NodeSelector != nil {
+			matches, err := r.nodeMatchesSelector(ctx, n.NodeSelector, log)
+			if err != nil {
+				return fmt.Errorf("neighbor %q nodeSelector: %w", key, err)
+			}
+			if !matches {
+				log.V(1).Info("Skipping neighbor (nodeSelector doesn't match)", "key", key)
+				continue
+			}
+		}
+
+		// Validate peer group reference exists in filtered set
+		if n.Config.PeerGroup != "" {
+			if _, pgExists := desiredPeerGroups[n.Config.PeerGroup]; !pgExists {
+				log.Info("Skipping neighbor: referenced peer group not configured on this node",
+					"key", key, "peerGroup", n.Config.PeerGroup)
+				r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerGroupMissing",
+					"Neighbor %s references peer group %q which is not configured on node %s (filtered by nodeSelector)",
+					key, n.Config.PeerGroup, r.NodeName)
+				continue
+			}
+		}
+
 		// Resolve auth password from Secret or inline value
 		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, n.Config.AuthPassword, n.Config.AuthPasswordSecretRef, log)
 		if err != nil {
-			return fmt.Errorf("neighbor %q: %w", n.Config.NeighborAddress, err)
+			return fmt.Errorf("neighbor %q: %w", key, err)
 		}
-		desiredNeighbors[n.Config.NeighborAddress] = r.crdToAPINeighborWithPassword(&n, authPassword)
+		desiredNeighbors[key] = r.crdToAPINeighborWithPassword(&n, authPassword)
 	}
 
+	// Emit warning if all neighbors were filtered out by nodeSelector
+	if len(desiredNeighbors) == 0 && hasAnyNodeSelector(bgpConfig.Spec.Neighbors) {
+		r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "NoMatchingNeighbors",
+			"No neighbors match node %s labels — check nodeSelector configuration and node labels",
+			r.NodeName)
+	}
+
+	// Update status with post-filter count
+	bgpConfig.Status.NeighborCount = len(desiredNeighbors)
+
 	// 3. Delete unwanted neighbors
-	for addr := range currentNeighbors {
-		if _, ok := desiredNeighbors[addr]; !ok {
-			log.Info("Deleting neighbor", "address", addr)
-			if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr}); err != nil {
-				log.Error(err, "Failed to delete neighbor", "address", addr)
+	for key, peer := range currentNeighbors {
+		if _, ok := desiredNeighbors[key]; !ok {
+			log.Info("Deleting neighbor", "key", key)
+			if peer.Conf.NeighborInterface != "" {
+				if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Interface: peer.Conf.NeighborInterface}); err != nil {
+					log.Error(err, "Failed to delete neighbor", "key", key)
+				}
+			} else {
+				if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: peer.Conf.NeighborAddress}); err != nil {
+					log.Error(err, "Failed to delete neighbor", "key", key)
+				}
 			}
 		}
 	}
 
 	// 4. Add or update neighbors
-	for addr, desired := range desiredNeighbors {
-		if current, ok := currentNeighbors[addr]; !ok {
-			log.Info("Adding neighbor", "address", addr)
+	for key, desired := range desiredNeighbors {
+		if current, ok := currentNeighbors[key]; !ok {
+			log.Info("Adding neighbor", "key", key)
 			if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired}); err != nil {
-				log.Error(err, "Failed to add neighbor", "address", addr)
+				log.Error(err, "Failed to add neighbor", "key", key)
 			}
 		} else {
-			if !reflect.DeepEqual(desired, current) {
-				log.Info("Updating neighbor", "address", addr)
+			if !peerConfigEqual(desired, current) {
+				log.Info("Updating neighbor", "key", key)
 				if _, err := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: desired}); err != nil {
-					log.Error(err, "Failed to update neighbor", "address", addr)
+					log.Error(err, "Failed to update neighbor", "key", key)
 				}
 			}
 		}
@@ -1678,10 +1937,63 @@ func (r *BGPConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&bgpv1.BGPConfiguration{}).
+		Watches(&corev1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.nodeToRequests),
+			builder.WithPredicates(r.nodeLabelChangePredicate()),
+		).
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 1,
 			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[ctrl.Request](time.Second, 5*time.Minute),
 		}).
 		Complete(r)
+}
+
+// nodeLabelChangePredicate returns a predicate that only passes events for this
+// pod's node when labels change.
+func (r *BGPConfigurationReconciler) nodeLabelChangePredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return false
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			if e.ObjectNew.GetName() != r.NodeName {
+				return false
+			}
+			oldLabels := e.ObjectOld.GetLabels()
+			newLabels := e.ObjectNew.GetLabels()
+			if !reflect.DeepEqual(oldLabels, newLabels) {
+				// Invalidate cached node so reconciler reads fresh labels
+				if r.nodeCache != nil {
+					r.nodeCache.invalidate(r.NodeName)
+				}
+				return true
+			}
+			return false
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+// nodeToRequests maps a Node event to reconcile requests for all BGPConfigurations.
+func (r *BGPConfigurationReconciler) nodeToRequests(ctx context.Context, obj client.Object) []reconcile.Request {
+	var configs bgpv1.BGPConfigurationList
+	if err := r.List(ctx, &configs); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for _, cfg := range configs.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      cfg.Name,
+				Namespace: cfg.Namespace,
+			},
+		})
+	}
+	return requests
 }

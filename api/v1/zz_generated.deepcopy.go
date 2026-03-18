@@ -535,6 +535,11 @@ func (in *MedAction) DeepCopy() *MedAction {
 func (in *Neighbor) DeepCopyInto(out *Neighbor) {
 	*out = *in
 	in.Config.DeepCopyInto(&out.Config)
+	if in.NodeSelector != nil {
+		in, out := &in.NodeSelector, &out.NodeSelector
+		*out = new(metav1.LabelSelector)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.AfiSafis != nil {
 		in, out := &in.AfiSafis, &out.AfiSafis
 		*out = make([]AfiSafi, len(*in))
@@ -680,6 +685,11 @@ func (in *NetlinkImport) DeepCopy() *NetlinkImport {
 func (in *PeerGroup) DeepCopyInto(out *PeerGroup) {
 	*out = *in
 	in.Config.DeepCopyInto(&out.Config)
+	if in.NodeSelector != nil {
+		in, out := &in.NodeSelector, &out.NodeSelector
+		*out = new(metav1.LabelSelector)
+		(*in).DeepCopyInto(*out)
+	}
 	if in.AfiSafis != nil {
 		in, out := &in.AfiSafis, &out.AfiSafis
 		*out = make([]AfiSafi, len(*in))
