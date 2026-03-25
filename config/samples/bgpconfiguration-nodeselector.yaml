@@ -1,0 +1,54 @@
+apiVersion: bgp.purelb.io/v1
+kind: BGPConfiguration
+metadata:
+  name: multi-subnet-bgp
+  namespace: k8gobgp-system
+spec:
+  global:
+    asn: 64515
+    listenPort: 179
+    families:
+      - "ipv4-unicast"
+      - "ipv6-unicast"
+
+  netlinkImport:
+    enabled: true
+    interfaceList:
+      - "kube-lb0"
+
+  neighbors:
+    # Router on 2001:470:b8f3:250::/64 — only for nodes on subnet 250
+    - config:
+        neighborAddress: "2001:470:b8f3:250::1"
+        peerAsn: 64514
+        description: "Gateway router on subnet-250 (IPv6)"
+      nodeSelector:
+        matchLabels:
+          network.example.com/subnet: "250"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+        - family: "ipv6-unicast"
+          enabled: true
+      timers:
+        config:
+          holdTime: 90
+          keepaliveInterval: 30
+
+    # Router on 2001:470:b8f3:251::/64 — only for nodes on subnet 251
+    - config:
+        neighborAddress: "2001:470:b8f3:251::1"
+        peerAsn: 64514
+        description: "Gateway router on subnet-251 (IPv6)"
+      nodeSelector:
+        matchLabels:
+          network.example.com/subnet: "251"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+        - family: "ipv6-unicast"
+          enabled: true
+      timers:
+        config:
+          holdTime: 90
+          keepaliveInterval: 30

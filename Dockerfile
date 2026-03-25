@@ -5,8 +5,8 @@ RUN apk add --no-cache git
 
 WORKDIR /gobgp_app
 
-# Clone the purelb/gobgp-netlink fork (v1.1.1 release with full netlink gRPC API)
-RUN git clone --depth 1 --branch v1.1.1 https://github.com/purelb/gobgp-netlink.git .
+# Clone the purelb/gobgp-netlink fork (v1.1.2 release with unnumbered BGP gRPC fix)
+RUN git clone --depth 1 --branch v1.1.2 https://github.com/purelb/gobgp-netlink.git .
 
 RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gobgpd ./cmd/gobgpd
