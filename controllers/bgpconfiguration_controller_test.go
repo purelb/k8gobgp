@@ -918,14 +918,14 @@ func TestPeerConfigEqual(t *testing.T) {
 	basePeer := func() *gobgpapi.Peer {
 		return &gobgpapi.Peer{
 			Conf: &gobgpapi.PeerConf{
-				NeighborAddress: "10.0.0.1",
-				PeerAsn:         64513,
-				LocalAsn:        64512,
-				Description:     "test",
-				AuthPassword:    "secret",
-				PeerGroup:       "group1",
+				NeighborAddress:   "10.0.0.1",
+				PeerAsn:           64513,
+				LocalAsn:          64512,
+				Description:       "test",
+				AuthPassword:      "secret",
+				PeerGroup:         "group1",
 				NeighborInterface: "",
-				Vrf:             "",
+				Vrf:               "",
 			},
 			AfiSafis: []*gobgpapi.AfiSafi{
 				{Config: &gobgpapi.AfiSafiConfig{
@@ -974,7 +974,7 @@ func TestPeerConfigEqual(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:    "interface peer with resolved address (should be ignored)",
+			name: "interface peer with resolved address (should be ignored)",
 			desired: func() *gobgpapi.Peer {
 				p := basePeer()
 				p.Conf.NeighborAddress = ""

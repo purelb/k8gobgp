@@ -147,7 +147,7 @@ type PeerGroup struct {
 // --- Detailed Sub-structs ---
 
 // +kubebuilder:object:generate=true
-// +kubebuilder:validation:XValidation:rule="self.neighborAddress != '' || self.neighborInterface != ''",message="either neighborAddress or neighborInterface must be set"
+// +kubebuilder:validation:XValidation:rule="self.neighborAddress != ” || self.neighborInterface != ”",message="either neighborAddress or neighborInterface must be set"
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
 	// +optional
