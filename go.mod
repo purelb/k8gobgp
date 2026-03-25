@@ -1,8 +1,6 @@
 module github.com/purelb/k8gobgp
 
-go 1.24.5
-
-toolchain go1.24.11
+go 1.26
 
 require (
 	github.com/go-logr/logr v1.4.3
