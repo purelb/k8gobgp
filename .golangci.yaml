@@ -1,54 +1,59 @@
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
+  default: none
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
     - unused
-    - gofmt
-    - goimports
     - misspell
     - unconvert
     - bodyclose
     - noctx
     - gosec
     - copyloopvar
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    govet:
+      enable:
+        - shadow
+    staticcheck:
+      checks:
+        - "all"
+        - "-QF*"
+        - "-ST*"
+    gosec:
+      excludes:
+        - G101
+        - G304
+        - G404
+    misspell:
+      locale: US
+  exclusions:
+    paths:
+      - vendor
+    presets: []
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+      - path: zz_generated
+        linters:
+          - all
 
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: false
-  govet:
-    enable:
-      - shadow
-  gofmt:
-    simplify: true
-  gosec:
-    excludes:
-      - G101  # Potential hardcoded credentials (too many false positives)
-      - G304  # File path provided as taint input
-      - G404  # Insecure random number source (math/rand)
-  misspell:
-    locale: US
-
-issues:
-  exclude-dirs:
-    - vendor
-  exclude-use-default: false
-  max-issues-per-linter: 0
-  max-same-issues: 0
-  exclude-rules:
-    # Exclude some linters from running on tests files
-    - path: _test\.go
-      linters:
-        - gosec
-        - errcheck
-    # Exclude controller-runtime generated code
-    - path: zz_generated
-      linters:
-        - all
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
