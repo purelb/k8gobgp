@@ -1,0 +1,32 @@
+apiVersion: bgp.purelb.io/v1
+kind: BGPConfiguration
+metadata:
+  name: unnumbered-bgp
+  namespace: k8gobgp-system
+spec:
+  global:
+    asn: 64515
+    listenPort: 179
+    families:
+      - "ipv4-unicast"
+      - "ipv6-unicast"
+
+  netlinkImport:
+    enabled: true
+    interfaceList:
+      - "kube-lb0"
+
+  neighbors:
+    - config:
+        neighborInterface: "eth1"
+        peerAsn: 64514
+        description: "FRR router via unnumbered BGP"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+        - family: "ipv6-unicast"
+          enabled: true
+      timers:
+        config:
+          holdTime: 90
+          keepaliveInterval: 30

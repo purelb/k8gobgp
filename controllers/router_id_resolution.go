@@ -134,6 +134,13 @@ func (c *nodeCache) set(nodeName string, node *corev1.Node) {
 	}
 }
 
+// invalidate removes a node from the cache, forcing a fresh fetch on next access.
+func (c *nodeCache) invalidate(nodeName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.cache, nodeName)
+}
+
 // RouterIDResolution holds the result of router ID resolution
 type RouterIDResolution struct {
 	RouterID string
