@@ -239,13 +239,12 @@ func (r *BGPNodeStatusReporter) markShutdown(log logr.Logger) {
 		return
 	}
 
-	patched := existing.DeepCopy()
-	patched.Status.Healthy = false
+	existing.Status.Healthy = false
 	now := metav1.Now()
-	patched.Status.LastUpdated = &now
-	setCondition(&patched.Status, "Ready", metav1.ConditionFalse, "AgentShutdown", "k8gobgp agent is shutting down")
+	existing.Status.LastUpdated = &now
+	setCondition(&existing.Status, "Ready", metav1.ConditionFalse, "AgentShutdown", "k8gobgp agent is shutting down")
 
-	if err := r.Client.Status().Patch(ctx, patched, client.MergeFrom(existing)); err != nil {
+	if err := r.Client.Status().Update(ctx, existing); err != nil {
 		log.V(1).Info("Could not set shutdown condition on BGPNodeStatus", "error", err)
 	}
 }
@@ -305,8 +304,8 @@ func (r *BGPNodeStatusReporter) collectStatus(ctx context.Context, log logr.Logg
 		status.NetlinkImport = importStatus
 	}
 
-	// Collect RIB status
-	ribStatus, err := r.collectRIBStatus(ctx, apiClient)
+	// Collect RIB status (pass neighbors so adj-out can be queried for advertisedTo)
+	ribStatus, err := r.collectRIBStatus(ctx, apiClient, status.Neighbors)
 	if err != nil {
 		log.V(1).Info("Failed to collect RIB status", "error", err)
 	} else {
@@ -501,7 +500,7 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 	return status, nil
 }
 
-func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient GoBGPNodeStatusClient) (*bgpv1.RIBStatus, error) {
+func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient GoBGPNodeStatusClient, neighbors []bgpv1.NeighborStatus) (*bgpv1.RIBStatus, error) {
 	status := &bgpv1.RIBStatus{}
 	families := defaultFamilies()
 
@@ -553,6 +552,27 @@ func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient 
 		}
 	}
 
+	// Build advertisedTo for local routes by querying adj-out per established neighbor.
+	// This is O(neighbors x adj-out-size), efficient for LoadBalancer use cases.
+	if len(localRoutes) > 0 {
+		localPrefixIndex := make(map[string]int, len(localRoutes))
+		for i, route := range localRoutes {
+			localPrefixIndex[route.Prefix] = i
+		}
+
+		for _, neighbor := range neighbors {
+			if neighbor.State != "Established" {
+				continue
+			}
+			adjOutPrefixes := r.getAdjOutPrefixes(ctx, apiClient, neighbor.Address, families)
+			for prefix := range adjOutPrefixes {
+				if idx, ok := localPrefixIndex[prefix]; ok {
+					localRoutes[idx].AdvertisedTo = append(localRoutes[idx].AdvertisedTo, neighbor.Address)
+				}
+			}
+		}
+	}
+
 	status.LocalRouteCount = len(localRoutes)
 	status.ReceivedRouteCount = len(receivedRoutes)
 
@@ -569,6 +589,31 @@ func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient 
 	status.ReceivedRoutes = receivedRoutes
 
 	return status, nil
+}
+
+// getAdjOutPrefixes returns the set of prefixes advertised to a specific neighbor.
+func (r *BGPNodeStatusReporter) getAdjOutPrefixes(ctx context.Context, apiClient GoBGPNodeStatusClient, neighborAddr string, families []*gobgpapi.Family) map[string]bool {
+	prefixes := make(map[string]bool)
+	for _, family := range families {
+		stream, err := apiClient.ListPath(ctx, &gobgpapi.ListPathRequest{
+			TableType: gobgpapi.TableType_TABLE_TYPE_ADJ_OUT,
+			Name:      neighborAddr,
+			Family:    family,
+		})
+		if err != nil {
+			continue
+		}
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				break
+			}
+			if resp.Destination != nil {
+				prefixes[resp.Destination.Prefix] = true
+			}
+		}
+	}
+	return prefixes
 }
 
 func (r *BGPNodeStatusReporter) collectNetlinkExportStatus(ctx context.Context, apiClient GoBGPNodeStatusClient, nlClient NetlinkClient, log logr.Logger) (*bgpv1.NetlinkExportStatus, error) {
@@ -662,10 +707,38 @@ func (r *BGPNodeStatusReporter) collectVRFStatus(ctx context.Context, apiClient 
 			continue
 		}
 
-		vrfs = append(vrfs, bgpv1.VRFStatus{
+		vrfStatus := bgpv1.VRFStatus{
 			Name: resp.Vrf.Name,
 			RD:   formatRouteDistinguisher(resp.Vrf.Rd),
+		}
+
+		// Get imported route count via GetTable (cheap unary RPC, not streaming)
+		for _, family := range defaultFamilies() {
+			tableResp, err := apiClient.GetTable(ctx, &gobgpapi.GetTableRequest{
+				TableType: gobgpapi.TableType_TABLE_TYPE_VRF,
+				Name:      resp.Vrf.Name,
+				Family:    family,
+			})
+			if err == nil {
+				vrfStatus.ImportedRouteCount += int(tableResp.NumPath)
+			}
+		}
+
+		// Get exported route count via ListNetlinkExport filtered by VRF
+		exportStream, err := apiClient.ListNetlinkExport(ctx, &gobgpapi.ListNetlinkExportRequest{
+			Vrf: resp.Vrf.Name,
 		})
+		if err == nil {
+			for {
+				_, recvErr := exportStream.Recv()
+				if recvErr != nil {
+					break
+				}
+				vrfStatus.ExportedRouteCount++
+			}
+		}
+
+		vrfs = append(vrfs, vrfStatus)
 	}
 
 	return vrfs, nil
@@ -696,19 +769,21 @@ func (r *BGPNodeStatusReporter) writeStatus(ctx context.Context, status *bgpv1.B
 	status.LastUpdated = &now
 	status.HeartbeatSeconds = r.heartbeatSeconds.Load()
 
-	// Get existing object for merge diff
+	// Get existing object, set status, and update.
+	// We use Status().Update() (not Patch) because MergePatch cannot add
+	// zero-valued required fields that were previously absent. Each node
+	// has a single writer so ResourceVersion conflicts don't occur.
 	existing := &bgpv1.BGPNodeStatus{}
 	if err := r.Client.Get(ctx, client.ObjectKey{Name: r.NodeName}, existing); err != nil {
 		nodeStatusWriteTotal.WithLabelValues("error").Inc()
-		return fmt.Errorf("get BGPNodeStatus for patch: %w", err)
+		return fmt.Errorf("get BGPNodeStatus for update: %w", err)
 	}
 
-	patched := existing.DeepCopy()
-	patched.Status = *status
+	existing.Status = *status
 
-	if err := r.Client.Status().Patch(ctx, patched, client.MergeFrom(existing)); err != nil {
+	if err := r.Client.Status().Update(ctx, existing); err != nil {
 		nodeStatusWriteTotal.WithLabelValues("error").Inc()
-		return fmt.Errorf("patch BGPNodeStatus status: %w", err)
+		return fmt.Errorf("update BGPNodeStatus status: %w", err)
 	}
 
 	nodeStatusWriteTotal.WithLabelValues("success").Inc()
@@ -1000,6 +1075,9 @@ func ribRoutesEqual(a, b []bgpv1.RIBRoute) bool {
 			sortedA[i].FromPeer != sortedB[i].FromPeer {
 			return false
 		}
+		if !stringSlicesEqual(sortedA[i].AdvertisedTo, sortedB[i].AdvertisedTo) {
+			return false
+		}
 		if !stringSlicesEqual(sortedA[i].Communities, sortedB[i].Communities) {
 			return false
 		}
@@ -1014,7 +1092,7 @@ func exportStatusEqual(a, b *bgpv1.NetlinkExportStatus) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	if a.Enabled != b.Enabled || a.Protocol != b.Protocol || a.DampeningInterval != b.DampeningInterval ||
+	if a.Enabled != b.Enabled || a.Protocol != b.Protocol ||
 		a.TotalExported != b.TotalExported || a.Truncated != b.Truncated {
 		return false
 	}

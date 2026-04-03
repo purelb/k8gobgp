@@ -198,10 +198,6 @@ spec:
               netlinkExport:
                 description: NetlinkExport reports the netlink export pipeline state
                 properties:
-                  dampeningInterval:
-                    description: DampeningInterval is the dampening interval in milliseconds
-                    format: int32
-                    type: integer
                   enabled:
                     description: Enabled indicates whether netlink export is active
                     type: boolean
@@ -277,7 +273,6 @@ spec:
                       at the maximum
                     type: boolean
                 required:
-                - dampeningInterval
                 - enabled
                 - protocol
                 - totalExported
@@ -366,6 +361,12 @@ spec:
                     items:
                       description: RIBRoute reports a single route in the BGP RIB.
                       properties:
+                        advertisedTo:
+                          description: AdvertisedTo lists neighbor addresses this
+                            route is advertised to (only for local routes)
+                          items:
+                            type: string
+                          type: array
                         communities:
                           description: Communities lists BGP communities attached
                             to this route
@@ -397,6 +398,12 @@ spec:
                     items:
                       description: RIBRoute reports a single route in the BGP RIB.
                       properties:
+                        advertisedTo:
+                          description: AdvertisedTo lists neighbor addresses this
+                            route is advertised to (only for local routes)
+                          items:
+                            type: string
+                          type: array
                         communities:
                           description: Communities lists BGP communities attached
                             to this route
@@ -462,6 +469,7 @@ spec:
                   type: object
                 type: array
             required:
+            - neighborCount
             - nodeName
             type: object
         type: object

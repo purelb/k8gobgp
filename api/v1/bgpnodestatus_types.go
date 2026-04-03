@@ -67,7 +67,7 @@ type BGPNodeStatusData struct {
 	// Neighbors is the list of BGP neighbor session states
 	Neighbors []NeighborStatus `json:"neighbors,omitempty"`
 	// NeighborCount is the total number of configured neighbors
-	NeighborCount int `json:"neighborCount,omitempty"`
+	NeighborCount int `json:"neighborCount"`
 
 	// NetlinkImport reports the netlink import pipeline state
 	NetlinkImport *NetlinkImportStatus `json:"netlinkImport,omitempty"`
@@ -172,6 +172,8 @@ type RIBRoute struct {
 	NextHop string `json:"nextHop"`
 	// FromPeer is the peer that advertised this route (only for received routes)
 	FromPeer string `json:"fromPeer,omitempty"`
+	// AdvertisedTo lists neighbor addresses this route is advertised to (only for local routes)
+	AdvertisedTo []string `json:"advertisedTo,omitempty"`
 	// Communities lists BGP communities attached to this route
 	Communities []string `json:"communities,omitempty"`
 }
@@ -183,8 +185,6 @@ type NetlinkExportStatus struct {
 	Enabled bool `json:"enabled"`
 	// Protocol is the Linux route protocol identifier (e.g., 186 = RTPROT_BGP)
 	Protocol int32 `json:"protocol"`
-	// DampeningInterval is the dampening interval in milliseconds
-	DampeningInterval uint32 `json:"dampeningInterval"`
 	// Rules lists the configured export rules
 	Rules []ExportRuleStatus `json:"rules,omitempty"`
 	// ExportedRoutes lists routes exported to the Linux kernel
