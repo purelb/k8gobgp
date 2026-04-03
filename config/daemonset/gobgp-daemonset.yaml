@@ -75,24 +75,24 @@ spec:
           hostPort: 179
           name: bgp
           protocol: TCP
-        - containerPort: 8080
+        - containerPort: 7473
           name: metrics
           protocol: TCP
-        - containerPort: 8081
+        - containerPort: 7474
           name: health
           protocol: TCP
 
         livenessProbe:
           httpGet:
             path: /healthz
-            port: 8081
+            port: 7474
           initialDelaySeconds: 15
           periodSeconds: 20
 
         readinessProbe:
           httpGet:
             path: /readyz
-            port: 8081
+            port: 7474
           initialDelaySeconds: 5
           periodSeconds: 10
 
