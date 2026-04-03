@@ -20,6 +20,7 @@ A Kubernetes controller for managing GoBGP configurations using Custom Resource 
   - Secret-based authentication (no plaintext passwords in CRDs)
   - Non-root container execution with minimal capabilities
   - Unix socket communication option for GoBGP
+- **Per-Node Status Reporting**: `BGPNodeStatus` CRD provides cluster-wide BGP visibility — neighbor sessions, netlink import/export pipeline, RIB routes, VRFs, and health per node
 - **Observability**:
   - Prometheus metrics for reconciliation, connections, and BGP state
   - Structured logging
@@ -322,6 +323,55 @@ spec:
         description: "Secondary upstream"
 ```
 
+### Per-Node BGP Status (BGPNodeStatus)
+
+Each k8gobgp instance automatically writes a `BGPNodeStatus` CRD for its node, providing cluster-wide BGP visibility without `kubectl exec`.
+
+```bash
+# View all node statuses
+kubectl get bgpns
+
+# Example output:
+# NAME      NODE      ROUTERID          HEALTHY   NEIGHBORS   LASTUPDATED   AGE
+# node-a    node-a    192.168.1.10      true      2           30s           5d
+# node-b    node-b    192.168.1.11      false     2           15s           5d
+
+# View detailed status for a node
+kubectl get bgpns node-a -o yaml
+```
+
+The status includes:
+- **Neighbor sessions**: state, uptime, prefixes sent/received, last error for non-Established peers
+- **Netlink import pipeline**: interface exists/operState, imported addresses with RIB membership
+- **BGP RIB**: local and received routes with next-hop and communities
+- **Netlink export pipeline**: export rules, exported routes with kernel installation status
+- **VRF summary**: route counts per VRF
+- **Health**: `healthy` boolean + standard Kubernetes conditions
+
+#### Configuration
+
+Status reporting is enabled by default. Configure via the `nodeStatus` section in `spec.global`:
+
+```yaml
+spec:
+  global:
+    asn: 64512
+    nodeStatus:
+      enabled: true         # default: true. Set false to disable.
+      heartbeatSeconds: 60  # default: 60. Periodic status write interval. Minimum: 10.
+```
+
+The `heartbeatSeconds` value is echoed in the status so consumers can calculate staleness:
+- **60s** (default): good for most clusters
+- **10s**: near-real-time, useful during debugging
+- **300s**: minimal API server load for large clusters
+
+#### Lifecycle
+
+- **Startup**: creates `BGPNodeStatus` with an OwnerReference to the Node (enables GC on node removal)
+- **Running**: writes status on state change; heartbeat ensures `lastUpdated` advances even when stable
+- **Shutdown**: sets condition `Ready=False, reason=AgentShutdown` (does **not** delete the object, so rolling updates don't create visibility gaps)
+
 ## Configuration Reference
 
 See the [config/samples/](config/samples/) directory for comprehensive examples including:
@@ -434,6 +484,20 @@ Enable with `--enable-per-neighbor-metrics`. Limited to `--max-neighbors-metrics
 | `k8gobgp_neighbor_routes_accepted` | Gauge | Routes accepted by neighbor and family |
 | `k8gobgp_neighbor_routes_advertised` | Gauge | Routes advertised by neighbor and family |
 
+### BGPNodeStatus Reporter Metrics
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `k8gobgp_nodestatus_write_total` | Counter | Status write attempts by result (success/error/skipped) |
+| `k8gobgp_nodestatus_collection_duration_seconds` | Histogram | Time to collect node status from gobgpd and netlink |
+| `k8gobgp_nodestatus_last_successful_write_timestamp` | Gauge | Unix timestamp of last successful write (for staleness alerts) |
+| `k8gobgp_nodestatus_object_size_bytes` | Gauge | Approximate BGPNodeStatus object size |
+
+Example staleness alert:
+```
+time() - k8gobgp_nodestatus_last_successful_write_timestamp > 300
+```
+
 ### Metrics Collection Health
 
 | Metric | Type | Description |
@@ -479,6 +543,19 @@ make run
 ```
 
 ## Troubleshooting
+
+### Check BGPNodeStatus
+
+```bash
+# List per-node BGP status across the cluster
+kubectl get bgpns
+
+# View detailed status for a specific node
+kubectl get bgpns <node-name> -o yaml
+
+# Check if status is stale (compare lastUpdated with heartbeatSeconds)
+kubectl get bgpns -o custom-columns=NODE:.status.nodeName,HEALTHY:.status.healthy,LAST:.status.lastUpdated,HB:.status.heartbeatSeconds
+```
 
 ### Check BGPConfiguration Status
 
@@ -530,6 +607,9 @@ kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip> adj-out
 | CRD validation error | Invalid community pattern | Check community format matches `^\d{1,5}:\d{1,5}$` |
 | Router ID resolution failed | Missing NODE_NAME env | Ensure DaemonSet has `NODE_NAME` from downward API |
 | Router ID shows hash-based | IPv6-only node | Expected behavior; configure `routerIDPool` if needed |
+| `kubectl get bgpns` empty | Status reporting disabled | Check `spec.global.nodeStatus.enabled` in BGPConfiguration (default: true) |
+| BGPNodeStatus `lastUpdated` stale | Reporter failing | Check pod logs for collection errors; verify readyz at `/readyz/nodestatus-writer` |
+| BGPNodeStatus shows `AgentShutdown` | Pod was gracefully stopped | Expected during rolling updates; new pod will overwrite with fresh data |
 
 ### Migration Guide: Switching to Dynamic Router ID
 
