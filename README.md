@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/purelb/k8gobgp)](https://goreportcard.com/report/github.com/purelb/k8gobgp)
 
-A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.1.1) for enhanced Linux kernel integration.
+A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.1.2) for enhanced Linux kernel integration.
 
 ## Features
 
@@ -371,8 +371,8 @@ The manager supports the following command-line flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metrics-bind-address` | `:8080` | Address for the metrics endpoint |
-| `--health-probe-bind-address` | `:8081` | Address for health probes |
+| `--metrics-bind-address` | `:7473` | Address for the metrics endpoint |
+| `--health-probe-bind-address` | `:7474` | Address for health probes |
 | `--gobgp-endpoint` | (env: `GOBGP_ENDPOINT`) | GoBGP gRPC endpoint (e.g., `localhost:50051` or `unix:///var/run/gobgp/gobgp.sock`) |
 | `--metrics-poll-interval` | `15s` | Interval for polling BGP stats from gobgpd (minimum 15s) |
 | `--enable-per-neighbor-metrics` | `false` | Enable high-cardinality per-neighbor route metrics |
@@ -380,7 +380,7 @@ The manager supports the following command-line flags:
 
 ## Metrics
 
-The controller exposes Prometheus metrics on `:8080/metrics`:
+The controller exposes Prometheus metrics on `:7473/metrics`:
 
 ### Controller Metrics
 
@@ -447,7 +447,7 @@ Enable with `--enable-per-neighbor-metrics`. Limited to `--max-neighbors-metrics
 
 ### Prerequisites
 
-- Go 1.24+
+- Go 1.25+
 - Docker
 - kubectl
 - [kubebuilder](https://kubebuilder.io/)
@@ -589,5 +589,5 @@ limitations under the License.
 ## Acknowledgments
 
 - [GoBGP](https://github.com/osrg/gobgp) - The BGP implementation
-- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.1.1 - Enhanced GoBGP fork with netlink integration
+- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.1.2 - Enhanced GoBGP fork with netlink integration
 - [PureLB](https://purelb.io) - Kubernetes load balancer project
