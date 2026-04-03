@@ -111,15 +111,25 @@ func main() {
 
 	// +kubebuilder:scaffold:builder
 
-	if err = (&controllers.BGPConfigurationReconciler{
+	// Create BGPNodeStatus reporter (runs as a background Runnable)
+	nodeStatusReporter := &controllers.BGPNodeStatusReporter{
 		Client:        mgr.GetClient(),
-		Log:           ctrl.Log.WithName("controllers").WithName("BGPConfiguration"),
+		Log:           ctrl.Log.WithName("controllers").WithName("BGPNodeStatus"),
 		Scheme:        mgr.GetScheme(),
 		GoBGPEndpoint: gobgpEndpoint,
-		Recorder:      mgr.GetEventRecorderFor("bgpconfiguration-controller"),
 		NodeName:      nodeName,
-		PodName:       podName,
-		PodNamespace:  podNamespace,
+	}
+
+	if err = (&controllers.BGPConfigurationReconciler{
+		Client:             mgr.GetClient(),
+		Log:                ctrl.Log.WithName("controllers").WithName("BGPConfiguration"),
+		Scheme:             mgr.GetScheme(),
+		GoBGPEndpoint:      gobgpEndpoint,
+		Recorder:           mgr.GetEventRecorderFor("bgpconfiguration-controller"),
+		NodeName:           nodeName,
+		PodName:            podName,
+		PodNamespace:       podNamespace,
+		NodeStatusReporter: nodeStatusReporter,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BGPConfiguration")
 		os.Exit(1)
@@ -140,12 +150,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Add BGP node status reporter as a Runnable (runs in background goroutine)
+	if err := mgr.Add(nodeStatusReporter); err != nil {
+		setupLog.Error(err, "unable to add node status reporter")
+		os.Exit(1)
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("nodestatus-writer", nodeStatusReporter.ReadyzCheck); err != nil {
+		setupLog.Error(err, "unable to set up node status readiness check")
 		os.Exit(1)
 	}
 

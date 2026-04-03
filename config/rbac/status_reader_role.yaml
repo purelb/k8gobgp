@@ -1,0 +1,10 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8gobgp-status-reader
+  labels:
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+- apiGroups: [bgp.purelb.io]
+  resources: [bgpnodestatuses]
+  verbs: [get, list, watch]

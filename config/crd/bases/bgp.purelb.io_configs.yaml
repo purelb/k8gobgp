@@ -159,6 +159,21 @@ spec:
                   listenPort:
                     format: int32
                     type: integer
+                  nodeStatus:
+                    description: NodeStatus configures per-node BGPNodeStatus reporting
+                    properties:
+                      enabled:
+                        description: 'Enabled activates BGPNodeStatus reporting. Default:
+                          true.'
+                        type: boolean
+                      heartbeatSeconds:
+                        description: |-
+                          HeartbeatSeconds is the interval for unconditional status writes even when state is unchanged.
+                          Default: 60. Minimum: 10.
+                        format: int32
+                        minimum: 10
+                        type: integer
+                    type: object
                   routeSelectionOptions:
                     properties:
                       advertiseInactiveRoutes:
@@ -300,11 +315,6 @@ spec:
                       required:
                       - peerAsn
                       type: object
-                      x-kubernetes-validations:
-                      - message: either neighborAddress or neighborInterface must
-                          be set
-                        rule: self.neighborAddress != '' || self.neighborInterface
-                          != ''
                     ebgpMultihop:
                       properties:
                         enabled:

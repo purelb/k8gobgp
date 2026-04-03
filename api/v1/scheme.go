@@ -32,4 +32,5 @@ var (
 
 func init() {
 	SchemeBuilder.Register(&BGPConfiguration{}, &BGPConfigurationList{})
+	SchemeBuilder.Register(&BGPNodeStatus{}, &BGPNodeStatusList{})
 }
