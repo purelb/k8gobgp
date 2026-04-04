@@ -714,12 +714,13 @@ func (r *BGPNodeStatusReporter) collectVRFStatus(ctx context.Context, apiClient 
 
 		// Get imported route count via GetTable (cheap unary RPC, not streaming)
 		for _, family := range defaultFamilies() {
-			tableResp, err := apiClient.GetTable(ctx, &gobgpapi.GetTableRequest{
+			tableResp, tableErr := apiClient.GetTable(ctx, &gobgpapi.GetTableRequest{
 				TableType: gobgpapi.TableType_TABLE_TYPE_VRF,
 				Name:      resp.Vrf.Name,
 				Family:    family,
 			})
-			if err == nil {
+			if tableErr == nil {
+				// #nosec G115 -- NumPath is a route count that fits in int on all platforms
 				vrfStatus.ImportedRouteCount += int(tableResp.NumPath)
 			}
 		}
@@ -759,7 +760,7 @@ func (r *BGPNodeStatusReporter) writeStatus(ctx context.Context, status *bgpv1.B
 		heartbeat := r.heartbeatSeconds.Load()
 		jitterMax := heartbeat / 4
 		if jitterMax > 0 {
-			jitter := time.Duration(rand.Intn(int(jitterMax))) * time.Second
+			jitter := time.Duration(rand.Intn(int(jitterMax))) * time.Second // #nosec G404 -- jitter timing, not security
 			time.Sleep(jitter)
 		}
 	}

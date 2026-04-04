@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
+	gobgpapi "github.com/osrg/gobgp/v4/api"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vishvananda/netlink"
-	gobgpapi "github.com/osrg/gobgp/v4/api"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -136,7 +136,7 @@ func TestInterfaceOperState(t *testing.T) {
 	}{
 		{"oper_up", netlink.OperUp, net.FlagUp, "up"},
 		{"oper_down", netlink.OperDown, 0, "down"},
-		{"oper_unknown_flag_up", netlink.OperUnknown, net.FlagUp, "up"},    // dummy interface pattern
+		{"oper_unknown_flag_up", netlink.OperUnknown, net.FlagUp, "up"}, // dummy interface pattern
 		{"oper_unknown_flag_down", netlink.OperUnknown, 0, "down"},
 		{"oper_not_present", netlink.OperNotPresent, 0, "down"},
 	}
@@ -170,16 +170,16 @@ func TestStatusEqual_OneNil(t *testing.T) {
 func TestStatusEqual_IdenticalSimple(t *testing.T) {
 	r := &BGPNodeStatusReporter{}
 	a := &bgpv1.BGPNodeStatusData{
-		NodeName:  "node-a",
-		RouterID:  "10.0.0.1",
-		ASN:       65000,
-		Healthy:   true,
+		NodeName: "node-a",
+		RouterID: "10.0.0.1",
+		ASN:      65000,
+		Healthy:  true,
 	}
 	b := &bgpv1.BGPNodeStatusData{
-		NodeName:  "node-a",
-		RouterID:  "10.0.0.1",
-		ASN:       65000,
-		Healthy:   true,
+		NodeName: "node-a",
+		RouterID: "10.0.0.1",
+		ASN:      65000,
+		Healthy:  true,
 	}
 	assert.True(t, r.statusEqual(a, b))
 }
