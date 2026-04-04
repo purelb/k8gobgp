@@ -296,6 +296,38 @@ var (
 		},
 		[]string{"router_id", "source", "node", "asn"},
 	)
+
+	// === BGPNodeStatus Reporter Metrics ===
+
+	nodeStatusWriteTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8gobgp_nodestatus_write_total",
+			Help: "Total number of BGPNodeStatus write attempts",
+		},
+		[]string{"result"}, // success, error, skipped
+	)
+
+	nodeStatusCollectionDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "k8gobgp_nodestatus_collection_duration_seconds",
+			Help:    "Time taken to collect node status data from gobgpd and netlink",
+			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30},
+		},
+	)
+
+	nodeStatusLastSuccessfulWrite = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_nodestatus_last_successful_write_timestamp",
+			Help: "Unix timestamp of the last successful BGPNodeStatus write",
+		},
+	)
+
+	nodeStatusObjectSizeBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_nodestatus_object_size_bytes",
+			Help: "Approximate size of the BGPNodeStatus object in bytes",
+		},
+	)
 )
 
 func init() {
@@ -336,6 +368,11 @@ func init() {
 		routerIDResolutionDuration,
 		routerIDSource,
 		routerIDInfo,
+		// BGPNodeStatus reporter metrics
+		nodeStatusWriteTotal,
+		nodeStatusCollectionDuration,
+		nodeStatusLastSuccessfulWrite,
+		nodeStatusObjectSizeBytes,
 	)
 }
 

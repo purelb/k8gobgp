@@ -6,9 +6,11 @@ namespace: k8gobgp-system
 resources:
   - namespace.yaml
   - ../crd/bases/bgp.purelb.io_configs.yaml
+  - ../crd/bases/bgp.purelb.io_bgpnodestatuses.yaml
   - ../rbac/service_account.yaml
   - ../rbac/role.yaml
   - ../rbac/role_binding.yaml
+  - ../rbac/status_reader_role.yaml
   - ../daemonset/gobgp-daemonset.yaml
 
 commonLabels:

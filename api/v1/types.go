@@ -119,6 +119,9 @@ type GlobalSpec struct {
 	GracefulRestart       *GracefulRestart       `json:"gracefulRestart,omitempty"`
 	ApplyPolicy           *ApplyPolicy           `json:"applyPolicy,omitempty"`
 	BindToDevice          string                 `json:"bindToDevice,omitempty"`
+	// NodeStatus configures per-node BGPNodeStatus reporting
+	// +optional
+	NodeStatus *NodeStatusConfig `json:"nodeStatus,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -147,7 +150,6 @@ type PeerGroup struct {
 // --- Detailed Sub-structs ---
 
 // +kubebuilder:object:generate=true
-// +kubebuilder:validation:XValidation:rule="self.neighborAddress != ” || self.neighborInterface != ”",message="either neighborAddress or neighborInterface must be set"
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
 	// +optional

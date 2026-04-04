@@ -29,6 +29,7 @@ rules:
 - apiGroups:
   - bgp.purelb.io
   resources:
+  - bgpnodestatuses
   - configs
   verbs:
   - create
@@ -41,14 +42,15 @@ rules:
 - apiGroups:
   - bgp.purelb.io
   resources:
-  - configs/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - bgp.purelb.io
-  resources:
+  - bgpnodestatuses/status
   - configs/status
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - bgp.purelb.io
+  resources:
+  - configs/finalizers
+  verbs:
   - update

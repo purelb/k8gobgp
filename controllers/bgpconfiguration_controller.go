@@ -88,6 +88,9 @@ type BGPConfigurationReconciler struct {
 	// per-pod (not shared via status) because in a DaemonSet each pod resolves
 	// its own node's IP.
 	localRouterIDCache map[string]*localRouterIDEntry
+
+	// NodeStatusReporter is the BGPNodeStatus reporter (set during setup in main.go)
+	NodeStatusReporter *BGPNodeStatusReporter
 }
 
 type localRouterIDEntry struct {
@@ -414,6 +417,29 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	RecordReconcileResult(bgpConfig.Name, bgpConfig.Namespace, "success")
 	RecordReconcileDuration(bgpConfig.Name, bgpConfig.Namespace, time.Since(startTime).Seconds())
 	UpdateConfigurationReadyStatus(bgpConfig.Name, bgpConfig.Namespace, true)
+
+	// Pass config to the BGPNodeStatus reporter
+	if r.NodeStatusReporter != nil {
+		enabled := true
+		heartbeat := int32(60)
+		if bgpConfig.Spec.Global.NodeStatus != nil {
+			if bgpConfig.Spec.Global.NodeStatus.Enabled != nil {
+				enabled = *bgpConfig.Spec.Global.NodeStatus.Enabled
+			}
+			if bgpConfig.Spec.Global.NodeStatus.HeartbeatSeconds != nil {
+				heartbeat = *bgpConfig.Spec.Global.NodeStatus.HeartbeatSeconds
+			}
+		}
+		// Get router ID from the cache entry (stored in status during resolveEffectiveRouterID)
+		routerID := ""
+		routerIDSource := ""
+		cacheKey := bgpConfig.Namespace + "/" + bgpConfig.Name
+		if entry, ok := r.localRouterIDCache[cacheKey]; ok {
+			routerID = entry.routerID
+			routerIDSource = entry.source
+		}
+		r.NodeStatusReporter.UpdateConfig(enabled, heartbeat, routerID, routerIDSource, bgpConfig.Spec.Global.ASN)
+	}
 
 	log.Info("Successfully reconciled BGPConfiguration")
 	return ctrl.Result{}, nil
