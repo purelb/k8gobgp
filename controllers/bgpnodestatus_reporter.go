@@ -459,7 +459,9 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 		}
 	}
 
-	// Also add addresses from interfaces that are NOT in the RIB (for display)
+	// Also add addresses from interfaces that are NOT in the RIB (for display).
+	// Use the actual prefix length from the interface (e.g. /24), not /32.
+	// GoBGP imports routes with the prefix length as assigned on the interface.
 	nlImportedPrefixes := make(map[string]bool)
 	for _, addr := range importedAddresses {
 		nlImportedPrefixes[addr.Address] = true
@@ -481,7 +483,10 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 			if addr.IP.IsLinkLocalUnicast() || addr.IP.IsLinkLocalMulticast() {
 				continue
 			}
-			prefix := addrToHostPrefix(addr)
+			if addr.IPNet == nil {
+				continue
+			}
+			prefix := addr.IPNet.String()
 			if !nlImportedPrefixes[prefix] {
 				importedAddresses = append(importedAddresses, bgpv1.ImportedAddress{
 					Address:   prefix,
