@@ -336,7 +336,9 @@ func (r *BGPNodeStatusReporter) collectStatus(ctx context.Context, log logr.Logg
 }
 
 func (r *BGPNodeStatusReporter) collectNeighborStatus(ctx context.Context, client GoBGPNodeStatusClient) ([]bgpv1.NeighborStatus, error) {
-	stream, err := client.ListPeer(ctx, &gobgpapi.ListPeerRequest{})
+	stream, err := client.ListPeer(ctx, &gobgpapi.ListPeerRequest{
+		EnableAdvertised: true,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("ListPeer: %w", err)
 	}
@@ -457,7 +459,9 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 		}
 	}
 
-	// Also add addresses from interfaces that are NOT in the RIB (for display)
+	// Also add addresses from interfaces that are NOT in the RIB (for display).
+	// Use the actual prefix length from the interface (e.g. /24), not /32.
+	// GoBGP imports routes with the prefix length as assigned on the interface.
 	nlImportedPrefixes := make(map[string]bool)
 	for _, addr := range importedAddresses {
 		nlImportedPrefixes[addr.Address] = true
@@ -479,7 +483,10 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 			if addr.IP.IsLinkLocalUnicast() || addr.IP.IsLinkLocalMulticast() {
 				continue
 			}
-			prefix := addrToHostPrefix(addr)
+			if addr.IPNet == nil {
+				continue
+			}
+			prefix := addr.IPNet.String()
 			if !nlImportedPrefixes[prefix] {
 				importedAddresses = append(importedAddresses, bgpv1.ImportedAddress{
 					Address:   prefix,
@@ -529,24 +536,39 @@ func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient 
 			}
 
 			for _, path := range resp.Destination.Paths {
-				if path.GetIsNexthopInvalid() || !path.GetBest() {
+				if path.GetIsNexthopInvalid() {
 					continue
 				}
 
-				route := bgpv1.RIBRoute{
-					Prefix:  resp.Destination.Prefix,
-					NextHop: path.GetNeighborIp(),
+				// Netlink-imported routes have IsNetlink=true, Best=false,
+				// and NeighborIp="0.0.0.1" (GoBGP synthetic peer). Use
+				// IsNetlink as the primary classifier, not Best or NeighborIp.
+				if path.GetIsNetlink() {
+					localRoutes = append(localRoutes, bgpv1.RIBRoute{
+						Prefix:  resp.Destination.Prefix,
+						NextHop: "0.0.0.0",
+					})
+					continue
+				}
+
+				// Non-netlink routes: only include best paths
+				if !path.GetBest() {
+					continue
 				}
 
 				if path.GetNeighborIp() == "" {
-					// Locally originated route
-					route.NextHop = "0.0.0.0"
-					localRoutes = append(localRoutes, route)
+					// Other locally originated routes (e.g. AddPath API)
+					localRoutes = append(localRoutes, bgpv1.RIBRoute{
+						Prefix:  resp.Destination.Prefix,
+						NextHop: "0.0.0.0",
+					})
 				} else {
-					// Received route
-					route.FromPeer = path.GetNeighborIp()
-					route.NextHop = getNextHopFromPath(path)
-					receivedRoutes = append(receivedRoutes, route)
+					// Received from a peer
+					receivedRoutes = append(receivedRoutes, bgpv1.RIBRoute{
+						Prefix:   resp.Destination.Prefix,
+						NextHop:  getNextHopFromPath(path),
+						FromPeer: path.GetNeighborIp(),
+					})
 				}
 			}
 		}
