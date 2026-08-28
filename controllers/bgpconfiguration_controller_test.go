@@ -1279,3 +1279,69 @@ func TestTimersConfigEqual(t *testing.T) {
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}, State: &gobgpapi.TimersState{}},
 	))
 }
+
+// --- Dynamic neighbor teardown protection -----------------------------------
+//
+// Peers accepted from a dynamicNeighbors range are present in gobgpd's ListPeer
+// output but never in desiredNeighbors, which is built solely from
+// spec.neighbors. Without an explicit exclusion the reconcile delete-sweep tears
+// them down on every reconcile.
+
+func dynTestConfig(prefixes ...string) *bgpv1.BGPConfiguration {
+	cfg := &bgpv1.BGPConfiguration{}
+	for _, p := range prefixes {
+		cfg.Spec.DynamicNeighbors = append(cfg.Spec.DynamicNeighbors,
+			bgpv1.DynamicNeighbor{Prefix: p, PeerGroup: "dyn"})
+	}
+	return cfg
+}
+
+func TestDynamicNeighborPrefixes(t *testing.T) {
+	log := zap.New(zap.UseDevMode(true))
+
+	assert.Empty(t, dynamicNeighborPrefixes(dynTestConfig(), log),
+		"no dynamicNeighbors configured should yield no prefixes")
+
+	got := dynamicNeighborPrefixes(dynTestConfig("10.0.0.0/24", "2001:db8::/32"), log)
+	assert.Len(t, got, 2)
+
+	// A malformed prefix is skipped, not fatal, and must not discard the good ones.
+	got = dynamicNeighborPrefixes(dynTestConfig("10.0.0.0/24", "not-a-prefix", "192.168.0.0/16"), log)
+	assert.Len(t, got, 2, "malformed entries are skipped, valid ones retained")
+}
+
+func TestIsDynamicallyAcceptedPeer(t *testing.T) {
+	log := zap.New(zap.UseDevMode(true))
+	prefixes := dynamicNeighborPrefixes(dynTestConfig("10.0.0.0/24", "2001:db8::/32"), log)
+
+	peer := func(addr, iface string) *gobgpapi.Peer {
+		return &gobgpapi.Peer{Conf: &gobgpapi.PeerConf{
+			NeighborAddress: addr, NeighborInterface: iface,
+		}}
+	}
+
+	tests := []struct {
+		name string
+		peer *gobgpapi.Peer
+		want bool
+	}{
+		{"inside an IPv4 range", peer("10.0.0.7", ""), true},
+		{"inside an IPv6 range", peer("2001:db8::1", ""), true},
+		{"outside every range", peer("192.168.1.1", ""), false},
+		{"adjacent to but outside a range", peer("10.0.1.1", ""), false},
+		{"interface peer is never dynamic", peer("", "eth0"), false},
+		{"unnumbered zoned link-local is never dynamic", peer("fe80::1%eth0", "eth0"), false},
+		{"unparseable address", peer("invalid IP", ""), false},
+		{"nil peer", nil, false},
+		{"nil conf", &gobgpapi.Peer{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isDynamicallyAcceptedPeer(tt.peer, prefixes))
+		})
+	}
+
+	// With no ranges configured nothing is dynamic, so the sweep behaves as before.
+	assert.False(t, isDynamicallyAcceptedPeer(peer("10.0.0.7", ""), nil),
+		"no configured ranges means no peer is treated as dynamic")
+}

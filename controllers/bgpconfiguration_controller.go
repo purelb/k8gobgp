@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"reflect"
 	"strings"
@@ -123,6 +124,52 @@ func neighborKeyFromCRD(cfg *bgpv1.NeighborConfig) string {
 		return "iface:" + cfg.NeighborInterface
 	}
 	return cfg.NeighborAddress
+}
+
+// dynamicNeighborPrefixes parses the configured dynamic-neighbor ranges.
+// Malformed entries are logged and skipped rather than failing the reconcile:
+// CRD validation is the right place to reject them, and one bad prefix must not
+// stop the rest of the configuration being applied.
+func dynamicNeighborPrefixes(bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) []netip.Prefix {
+	if len(bgpConfig.Spec.DynamicNeighbors) == 0 {
+		return nil
+	}
+	prefixes := make([]netip.Prefix, 0, len(bgpConfig.Spec.DynamicNeighbors))
+	for _, dn := range bgpConfig.Spec.DynamicNeighbors {
+		p, err := netip.ParsePrefix(dn.Prefix)
+		if err != nil {
+			log.Error(err, "Ignoring malformed dynamicNeighbors prefix", "prefix", dn.Prefix)
+			continue
+		}
+		prefixes = append(prefixes, p)
+	}
+	return prefixes
+}
+
+// isDynamicallyAcceptedPeer reports whether a peer present in gobgpd arrived by
+// being accepted from one of the configured dynamic-neighbor ranges, rather
+// than from spec.neighbors.
+//
+// Such peers are never in desiredNeighbors — that map is built solely from
+// spec.neighbors — so without this check the reconcile sweep deletes them and
+// gobgpd tears the session down with a CEASE notification. Interface-based
+// peers are never dynamic, and are excluded by having no parseable address.
+func isDynamicallyAcceptedPeer(peer *gobgpapi.Peer, prefixes []netip.Prefix) bool {
+	if len(prefixes) == 0 || peer == nil || peer.Conf == nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(peer.Conf.NeighborAddress)
+	if err != nil {
+		return false
+	}
+	// Compare unzoned: a zone identifier is meaningless for range containment.
+	addr = addr.WithZone("")
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // deletePeerByKey issues a DeletePeer request using either Interface or Address
@@ -320,7 +367,10 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			log.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		// Requeue explicitly: adding a finalizer is a metadata-only change, so
+		// generation does not bump and GenerationChangedPredicate filters the
+		// resulting Update event. Without this the config is never applied.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	log.Info("Reconciling BGPConfiguration")
@@ -1180,18 +1230,28 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 	// Update status with post-filter count
 	bgpConfig.Status.NeighborCount = len(desiredNeighbors)
 
-	// 3. Delete unwanted neighbors
+	// 3. Delete unwanted neighbors.
+	//
+	// Peers accepted from a dynamicNeighbors range are never in desiredNeighbors,
+	// which is built solely from spec.neighbors — so they must be excluded here
+	// explicitly or every reconcile tears down live dynamic sessions.
+	dynPrefixes := dynamicNeighborPrefixes(bgpConfig, log)
 	for key, peer := range currentNeighbors {
-		if _, ok := desiredNeighbors[key]; !ok {
-			log.Info("Deleting neighbor", "key", key)
-			if peer.Conf.NeighborInterface != "" {
-				if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Interface: peer.Conf.NeighborInterface}); err != nil {
-					log.Error(err, "Failed to delete neighbor", "key", key)
-				}
-			} else {
-				if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: peer.Conf.NeighborAddress}); err != nil {
-					log.Error(err, "Failed to delete neighbor", "key", key)
-				}
+		if _, ok := desiredNeighbors[key]; ok {
+			continue
+		}
+		if isDynamicallyAcceptedPeer(peer, dynPrefixes) {
+			log.V(1).Info("Keeping dynamically-accepted neighbor", "key", key)
+			continue
+		}
+		log.Info("Deleting neighbor", "key", key)
+		if peer.Conf.NeighborInterface != "" {
+			if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Interface: peer.Conf.NeighborInterface}); err != nil {
+				log.Error(err, "Failed to delete neighbor", "key", key)
+			}
+		} else {
+			if _, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: peer.Conf.NeighborAddress}); err != nil {
+				log.Error(err, "Failed to delete neighbor", "key", key)
 			}
 		}
 	}
