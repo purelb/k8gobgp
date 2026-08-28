@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -1538,4 +1539,24 @@ func TestReconcile_DeletingIgnoredConfigSkipsCleanup(t *testing.T) {
 	var got bgpv1.BGPConfiguration
 	err = r.Get(context.Background(), types.NamespacedName{Namespace: "purelb", Name: "duplicate"}, &got)
 	assert.True(t, apierrors.IsNotFound(err), "expected the ignored config to be released, got %v", err)
+}
+
+// An ignored config never carries a finalizer, so Kubernetes deletes it
+// outright and reconcileDelete never runs — the NotFound path is the only
+// place its gauges can be dropped. Left behind, configuration_ready reads 0
+// forever for a config that no longer exists.
+func TestReconcile_NotFoundClearsConfigGauges(t *testing.T) {
+	r, _ := newOwnershipTestReconciler(t)
+
+	UpdateConfigurationReadyStatus("gone-config", "purelb", false)
+	require.Equal(t, 1, testutil.CollectAndCount(bgpConfigurationReady),
+		"precondition: the gauge series exists before the object is deleted")
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "purelb", Name: "gone-config"},
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, testutil.CollectAndCount(bgpConfigurationReady),
+		"gauge for a deleted config must not linger")
 }

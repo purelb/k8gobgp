@@ -405,6 +405,13 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	bgpConfig := &bgpv1.BGPConfiguration{}
 	if err := r.Get(ctx, req.NamespacedName, bgpConfig); err != nil {
 		if apierrors.IsNotFound(err) {
+			// The object is gone, so drop its gauges. A config ignored under the
+			// one-per-node rule never carries a finalizer, so it is deleted
+			// outright and reconcileDelete never runs for it — without this,
+			// configuration_ready sits at 0 forever for a config that no longer
+			// exists, which reads as "present and not ready". Redundant but
+			// harmless for a finalized config, whose cleanup already did this.
+			DeleteMetricsForConfig(req.Name, req.Namespace)
 			log.Info("BGPConfiguration not found, ignoring")
 			return ctrl.Result{}, nil
 		}
