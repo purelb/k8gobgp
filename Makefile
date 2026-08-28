@@ -1,5 +1,14 @@
-CONTROLLER_GEN=$(shell go env GOPATH)/bin/controller-gen
-IMG ?= ghcr.io/adamdunstan/registry/k8gobgp:latest
+# Tools are pinned via "go run <module>@<version>" so that local builds and CI
+# resolve identical versions with no install step. CONTROLLER_GEN must stay in
+# step with the version stamped into config/crd/bases/*.yaml, otherwise
+# "make manifests" produces a spurious diff.
+CONTROLLER_GEN = go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.19.0
+KUSTOMIZE = go run sigs.k8s.io/kustomize/kustomize/v4@v4.5.2
+
+IMG ?= ghcr.io/purelb/k8gobgp:latest
+
+# Endpoint used by "make run" to reach an externally-run gobgpd.
+GOBGP_ENDPOINT ?= localhost:50051
 
 .PHONY: all
 all: build
@@ -44,6 +53,25 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	docker push ${IMG}
+
+##@ Deployment
+
+.PHONY: install
+install: ## Install CRDs into the K8s cluster specified in ~/.kube/config.
+	kubectl apply -f config/crd/bases/
+
+.PHONY: deploy
+# LoadRestrictionsNone is required because config/default/kustomization.yaml
+# refers to files above its own root (../crd/bases, ../rbac, ../daemonset),
+# which kustomize forbids by default.
+deploy: ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	$(KUSTOMIZE) build --load-restrictor LoadRestrictionsNone config/default | \
+	sed -E 's|image: ghcr.io/purelb/k8gobgp:[^[:space:]]+|image: ${IMG}|g' | \
+	kubectl apply -f -
+
+.PHONY: run
+run: ## Run the controller locally against an externally-run gobgpd.
+	go run ./cmd/manager --gobgp-endpoint=$(GOBGP_ENDPOINT)
 
 ##@ Testing
 

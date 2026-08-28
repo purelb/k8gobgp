@@ -1,5 +1,12 @@
-# Build GoBGP daemon and CLI from purelb/gobgp-netlink fork
-FROM golang:1.25.13-alpine AS gobgpd_builder
+# Both builder stages pin themselves to $BUILDPLATFORM and cross-compile via
+# GOARCH=$TARGETARCH. Building them on the *target* platform instead would run
+# every Go compile under QEMU emulation for linux/arm64, which is what made the
+# multi-arch release build take ~28 minutes. Only the final stage is
+# target-native, because "apk add" has to run in the target rootfs.
+
+# Fetch the purelb/gobgp-netlink fork once. This stage is arch-independent, so
+# it is shared by both target platforms rather than cloned per-arch.
+FROM --platform=$BUILDPLATFORM golang:1.25.13-alpine AS gobgp_src
 
 RUN apk add --no-cache git
 
@@ -9,17 +16,25 @@ WORKDIR /gobgp_app
 RUN git clone --depth 1 --branch v1.1.2 https://github.com/purelb/gobgp-netlink.git .
 
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gobgpd ./cmd/gobgpd
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gobgp ./cmd/gobgp
+
+# Build GoBGP daemon and CLI
+FROM gobgp_src AS gobgpd_builder
+
+ARG TARGETARCH
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -ldflags="-s -w" -o gobgpd ./cmd/gobgpd
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -ldflags="-s -w" -o gobgp ./cmd/gobgp
 
 # Build the k8gobgp reconciler/controller
-FROM golang:1.25.13-alpine AS reconciler_builder
+FROM --platform=$BUILDPLATFORM golang:1.25.13-alpine AS reconciler_builder
+
+ARG TARGETARCH
 
 WORKDIR /k8gobgp_app
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=vendor -ldflags="-s -w" -o manager ./cmd/manager
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -mod=vendor -ldflags="-s -w" -o manager ./cmd/manager
 
 # Final runtime image
 FROM alpine:3.24
