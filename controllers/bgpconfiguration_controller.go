@@ -320,7 +320,10 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			log.Error(err, "Failed to add finalizer")
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		// Requeue explicitly: adding a finalizer is a metadata-only change, so
+		// generation does not bump and GenerationChangedPredicate filters the
+		// resulting Update event. Without this the config is never applied.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	log.Info("Reconciling BGPConfiguration")
