@@ -358,21 +358,87 @@ func hasAnyNodeSelector(neighbors []bgpv1.Neighbor) bool {
 	return false
 }
 
+// electOwningConfig returns the BGPConfiguration allowed to program gobgpd on
+// this node, or nil if there are none.
+//
+// gobgpd is a singleton per node, but every reconcile function computes its
+// desired state from a single CR and then deletes everything gobgpd holds that
+// is not in that set. Two BGPConfigurations therefore delete each other's
+// defined sets, policies, VRFs, peer groups and neighbors on every pass — and
+// a deleted neighbor is a DeletePeer, so gobgpd ends the live session with a
+// CEASE / PEER_DECONFIGURED notification. The contract is one BGPConfiguration
+// per node; this picks which one it is so the extras can be rejected loudly
+// instead of silently fighting.
+//
+// The oldest config wins, so every node's agent independently reaches the same
+// answer with no coordination, and ownership never moves to a config created
+// later. Configs being deleted stay eligible: releasing ownership before their
+// cleanup has run would let the successor add back the very peers the outgoing
+// cleanup is deleting.
+func electOwningConfig(configs []bgpv1.BGPConfiguration) *bgpv1.BGPConfiguration {
+	var owner *bgpv1.BGPConfiguration
+	for i := range configs {
+		if owner == nil || configPrecedes(&configs[i], owner) {
+			owner = &configs[i]
+		}
+	}
+	return owner
+}
+
+// configPrecedes orders BGPConfigurations by creation time, then namespace,
+// then name. Creation timestamps have one-second granularity, so the
+// namespace/name tie-break is load-bearing rather than defensive: configs
+// applied together routinely share a timestamp.
+func configPrecedes(a, b *bgpv1.BGPConfiguration) bool {
+	if !a.CreationTimestamp.Equal(&b.CreationTimestamp) {
+		return a.CreationTimestamp.Before(&b.CreationTimestamp)
+	}
+	if a.Namespace != b.Namespace {
+		return a.Namespace < b.Namespace
+	}
+	return a.Name < b.Name
+}
+
 func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	startTime := time.Now()
 	log := r.Log.WithValues("bgpconfiguration", req.NamespacedName)
 	bgpConfig := &bgpv1.BGPConfiguration{}
 	if err := r.Get(ctx, req.NamespacedName, bgpConfig); err != nil {
 		if apierrors.IsNotFound(err) {
+			// The object is gone, so drop its gauges. A config ignored under the
+			// one-per-node rule never carries a finalizer, so it is deleted
+			// outright and reconcileDelete never runs for it — without this,
+			// configuration_ready sits at 0 forever for a config that no longer
+			// exists, which reads as "present and not ready". Redundant but
+			// harmless for a finalized config, whose cleanup already did this.
+			DeleteMetricsForConfig(req.Name, req.Namespace)
 			log.Info("BGPConfiguration not found, ignoring")
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
+	// Decide whether this config owns gobgpd on this node before anything else,
+	// including deletion: reconcileDelete removes every object named in the spec
+	// unconditionally, so an ignored config must not run it either.
+	var configs bgpv1.BGPConfigurationList
+	if err := r.List(ctx, &configs); err != nil {
+		log.Error(err, "Failed to list BGPConfigurations")
+		return ctrl.Result{}, err
+	}
+	owner := electOwningConfig(configs.Items)
+	owned := owner == nil || (owner.Namespace == bgpConfig.Namespace && owner.Name == bgpConfig.Name)
+
 	// Handle deletion with finalizer
 	if !bgpConfig.DeletionTimestamp.IsZero() {
+		if !owned {
+			return r.deleteIgnoredConfig(ctx, bgpConfig, log)
+		}
 		return r.reconcileDelete(ctx, bgpConfig, log)
+	}
+
+	if !owned {
+		return r.rejectDuplicateConfig(ctx, bgpConfig, owner, log)
 	}
 
 	// Add finalizer if not present
@@ -550,6 +616,64 @@ func (r *BGPConfigurationReconciler) getEndpoint() string {
 		endpoint = defaultGoBGPEndpoint
 	}
 	return endpoint
+}
+
+// rejectDuplicateConfig reports that another BGPConfiguration already owns
+// gobgpd on this node and returns without making a single gobgpd call.
+//
+// No finalizer is added. This config never programmed gobgpd, so there is
+// nothing to clean up, and a finalizer would make its deletion run
+// reconcileDelete — which deletes unconditionally and would take the owning
+// config's neighbors down with it.
+func (r *BGPConfigurationReconciler) rejectDuplicateConfig(ctx context.Context, bgpConfig, owner *bgpv1.BGPConfiguration, log logr.Logger) (ctrl.Result, error) {
+	msg := fmt.Sprintf("BGPConfiguration %s/%s already manages gobgpd on node %s. Only one BGPConfiguration per node is supported, so this one is ignored and no BGP state is applied from it.",
+		owner.Namespace, owner.Name, r.NodeName)
+	log.Info("Ignoring BGPConfiguration: another config owns gobgpd on this node",
+		"owner", owner.Namespace+"/"+owner.Name)
+	if r.Recorder != nil {
+		r.Recorder.Event(bgpConfig, corev1.EventTypeWarning, "MultipleConfigurations", msg)
+	}
+
+	r.updateStatusCondition(ctx, bgpConfig, "Ready", metav1.ConditionFalse, "MultipleConfigurations", msg)
+	bgpConfig.Status.ObservedGeneration = bgpConfig.Generation
+	bgpConfig.Status.Message = msg
+	now := metav1.Now()
+	bgpConfig.Status.LastReconcileTime = &now
+	if err := r.Status().Update(ctx, bgpConfig); err != nil {
+		log.Error(err, "Failed to update BGPConfiguration status")
+	}
+
+	RecordReconcileResult(bgpConfig.Name, bgpConfig.Namespace, "duplicate_ignored")
+	UpdateConfigurationReadyStatus(bgpConfig.Name, bgpConfig.Namespace, false)
+
+	// Requeue: nothing enqueues this config when the owning one is deleted, so
+	// without a periodic re-check it would stay ignored after inheriting
+	// ownership. GenerationChangedPredicate filters the other config's events,
+	// and its deletion is not an event on this object at all.
+	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// deleteIgnoredConfig finishes deletion of a BGPConfiguration that never
+// programmed gobgpd, without running the cleanup path.
+//
+// reconcileDelete deletes every neighbor, peer group, VRF, policy and defined
+// set named in the spec unconditionally. Running it for an ignored config would
+// delete the owning config's objects out of gobgpd — the same corruption this
+// guard exists to prevent, just on the delete path. Reachable for a config that
+// still carries a finalizer from before one-config-per-node was enforced.
+func (r *BGPConfigurationReconciler) deleteIgnoredConfig(ctx context.Context, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) (ctrl.Result, error) {
+	// Drops the series rejectDuplicateConfig created for this config.
+	DeleteMetricsForConfig(bgpConfig.Name, bgpConfig.Namespace)
+
+	if !controllerutil.ContainsFinalizer(bgpConfig, finalizerName) {
+		return ctrl.Result{}, nil
+	}
+	log.Info("Removing finalizer from ignored BGPConfiguration without touching gobgpd")
+	controllerutil.RemoveFinalizer(bgpConfig, finalizerName)
+	if err := r.Update(ctx, bgpConfig); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
 }
 
 // reconcileDelete handles cleanup when BGPConfiguration is deleted

@@ -17,14 +17,19 @@ package controllers
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -1344,4 +1349,214 @@ func TestIsDynamicallyAcceptedPeer(t *testing.T) {
 	// With no ranges configured nothing is dynamic, so the sweep behaves as before.
 	assert.False(t, isDynamicallyAcceptedPeer(peer("10.0.0.7", ""), nil),
 		"no configured ranges means no peer is treated as dynamic")
+}
+
+// mkConfig builds a minimal BGPConfiguration for ownership tests.
+func mkConfig(namespace, name string, created time.Time) bgpv1.BGPConfiguration {
+	return bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:         namespace,
+			Name:              name,
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{ASN: 65000, RouterID: "10.0.0.1"}},
+	}
+}
+
+func TestElectOwningConfig(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	late := early.Add(time.Hour)
+
+	tests := []struct {
+		name     string
+		configs  []bgpv1.BGPConfiguration
+		expected string // "namespace/name", empty means nil
+	}{
+		{
+			name:     "no configs",
+			configs:  nil,
+			expected: "",
+		},
+		{
+			name:     "single config owns",
+			configs:  []bgpv1.BGPConfiguration{mkConfig("purelb", "only", late)},
+			expected: "purelb/only",
+		},
+		{
+			name: "oldest wins regardless of list order",
+			configs: []bgpv1.BGPConfiguration{
+				mkConfig("purelb", "newer", late),
+				mkConfig("purelb", "older", early),
+			},
+			expected: "purelb/older",
+		},
+		{
+			// Creation timestamps are second-granular, so configs applied
+			// together tie and the tie-break decides. Every node must reach
+			// the same answer, so this must not depend on list order.
+			name: "same timestamp breaks on namespace",
+			configs: []bgpv1.BGPConfiguration{
+				mkConfig("zone-b", "config", early),
+				mkConfig("zone-a", "config", early),
+			},
+			expected: "zone-a/config",
+		},
+		{
+			name: "same timestamp and namespace breaks on name",
+			configs: []bgpv1.BGPConfiguration{
+				mkConfig("purelb", "b-config", early),
+				mkConfig("purelb", "a-config", early),
+			},
+			expected: "purelb/a-config",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			owner := electOwningConfig(tt.configs)
+			if tt.expected == "" {
+				assert.Nil(t, owner)
+				return
+			}
+			require.NotNil(t, owner)
+			assert.Equal(t, tt.expected, owner.Namespace+"/"+owner.Name)
+		})
+	}
+}
+
+// newOwnershipTestReconciler wires a reconciler over the given configs with no
+// reachable gobgpd, so any test that reaches the gobgpd path is visibly wrong.
+func newOwnershipTestReconciler(t *testing.T, objs ...client.Object) (*BGPConfigurationReconciler, *record.FakeRecorder) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, bgpv1.AddToScheme(scheme))
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&bgpv1.BGPConfiguration{}).
+		Build()
+
+	recorder := record.NewFakeRecorder(10)
+	r := &BGPConfigurationReconciler{
+		Client:   fakeClient,
+		Log:      zap.New(zap.UseDevMode(true)),
+		Scheme:   scheme,
+		NodeName: "test-node",
+		Recorder: recorder,
+	}
+	r.InitNodeCache()
+	return r, recorder
+}
+
+// Two BGPConfigurations on a node used to delete each other's neighbors,
+// peer groups, VRFs and policies on every reconcile — the neighbor sweep
+// tearing down live sessions with a CEASE notification. Only the elected
+// config may touch gobgpd; the rest must report the conflict and do nothing.
+func TestReconcile_DuplicateConfigIsIgnored(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	owner := mkConfig("purelb", "owner", early)
+	duplicate := mkConfig("purelb", "duplicate", early.Add(time.Hour))
+
+	r, recorder := newOwnershipTestReconciler(t, &owner, &duplicate)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "purelb", Name: "duplicate"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, res.RequeueAfter, "ignored config must be re-checked so it can take over")
+
+	var got bgpv1.BGPConfiguration
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "purelb", Name: "duplicate"}, &got))
+
+	// No finalizer: this config never programmed gobgpd, and a finalizer would
+	// make its deletion run the unconditional cleanup against the owner's state.
+	assert.NotContains(t, got.Finalizers, finalizerName)
+
+	require.Len(t, got.Status.Conditions, 1)
+	assert.Equal(t, "Ready", got.Status.Conditions[0].Type)
+	assert.Equal(t, metav1.ConditionFalse, got.Status.Conditions[0].Status)
+	assert.Equal(t, "MultipleConfigurations", got.Status.Conditions[0].Reason)
+	assert.Contains(t, got.Status.Message, "purelb/owner")
+
+	select {
+	case event := <-recorder.Events:
+		assert.Contains(t, event, "Warning MultipleConfigurations")
+		assert.Contains(t, event, "purelb/owner")
+	default:
+		t.Fatal("expected a MultipleConfigurations warning event")
+	}
+}
+
+// The elected config must not be blocked by the guard. It gets as far as the
+// finalizer, which is where reconcile stops before any gobgpd call.
+func TestReconcile_OwningConfigProceeds(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	owner := mkConfig("purelb", "owner", early)
+	duplicate := mkConfig("purelb", "duplicate", early.Add(time.Hour))
+
+	r, _ := newOwnershipTestReconciler(t, &owner, &duplicate)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "purelb", Name: "owner"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, res.RequeueAfter, "owner should proceed to the finalizer requeue")
+
+	var got bgpv1.BGPConfiguration
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "purelb", Name: "owner"}, &got))
+	assert.Contains(t, got.Finalizers, finalizerName)
+}
+
+// Deleting an ignored config must not run reconcileDelete: that path deletes
+// every object named in the spec unconditionally, which would strip the owning
+// config's state out of gobgpd. Reachable for configs carrying a finalizer
+// from before one-config-per-node was enforced.
+func TestReconcile_DeletingIgnoredConfigSkipsCleanup(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	owner := mkConfig("purelb", "owner", early)
+
+	deleting := mkConfig("purelb", "duplicate", early.Add(time.Hour))
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	deleting.Finalizers = []string{finalizerName}
+	deleting.Spec.Neighbors = []bgpv1.Neighbor{
+		{Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.2", PeerAsn: 65001}},
+	}
+
+	r, _ := newOwnershipTestReconciler(t, &owner, &deleting)
+
+	// No gobgpd is reachable, so reaching the cleanup path would requeue for a
+	// connection retry instead of completing.
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "purelb", Name: "duplicate"},
+	})
+	require.NoError(t, err)
+	assert.Zero(t, res.RequeueAfter, "finalizer should be dropped immediately, not retried against gobgpd")
+
+	// Finalizer gone means the object is released; the fake client deletes it.
+	var got bgpv1.BGPConfiguration
+	err = r.Get(context.Background(), types.NamespacedName{Namespace: "purelb", Name: "duplicate"}, &got)
+	assert.True(t, apierrors.IsNotFound(err), "expected the ignored config to be released, got %v", err)
+}
+
+// An ignored config never carries a finalizer, so Kubernetes deletes it
+// outright and reconcileDelete never runs — the NotFound path is the only
+// place its gauges can be dropped. Left behind, configuration_ready reads 0
+// forever for a config that no longer exists.
+func TestReconcile_NotFoundClearsConfigGauges(t *testing.T) {
+	r, _ := newOwnershipTestReconciler(t)
+
+	UpdateConfigurationReadyStatus("gone-config", "purelb", false)
+	require.Equal(t, 1, testutil.CollectAndCount(bgpConfigurationReady),
+		"precondition: the gauge series exists before the object is deleted")
+
+	_, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "purelb", Name: "gone-config"},
+	})
+	require.NoError(t, err)
+
+	assert.Zero(t, testutil.CollectAndCount(bgpConfigurationReady),
+		"gauge for a deleted config must not linger")
 }

@@ -384,6 +384,21 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
 
 ### Important Notes
 
+- **One BGPConfiguration per node**: gobgpd is a singleton on each node, and each
+  reconcile deletes everything gobgpd holds that the configuration being
+  reconciled does not ask for. Two `BGPConfiguration` resources would therefore
+  delete each other's neighbors, peer groups, VRFs and policies on every pass —
+  tearing down live BGP sessions. Because every agent watches every namespace,
+  this means **one `BGPConfiguration` for the whole cluster**; use the
+  per-neighbor and per-peer-group `nodeSelector` to vary configuration between
+  nodes, not a second resource.
+
+  If more than one exists, the oldest wins (tie-broken by namespace then name)
+  and every other one is ignored: it applies no BGP state, reports
+  `Ready=False` with reason `MultipleConfigurations`, and emits a
+  `MultipleConfigurations` warning event naming the owner. Deleting an ignored
+  configuration does not disturb the one in effect. If the owning configuration
+  is deleted, the next-oldest takes over within 30 seconds.
 - **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod restart to take effect. These are immutable at runtime in GoBGP.
 - **Neighbor/Peer Group Changes**: Neighbors, peer groups, policies, and other settings can be updated dynamically without pod restart.
 - **Netlink Import/Export**: Can be enabled or disabled dynamically without pod restart. When disabled, imported routes are withdrawn from the RIB.
@@ -392,7 +407,8 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
 
 k8gobgp runs as a DaemonSet, with one instance per node. Each instance:
 
-1. Watches for `BGPConfiguration` resources in its namespace
+1. Watches for `BGPConfiguration` resources in every namespace, and applies the
+   oldest one (see [Important Notes](#important-notes) — one per cluster)
 2. Connects to the local GoBGP daemon via gRPC (TCP or Unix socket)
 3. Reconciles the desired configuration with the running BGP state
 4. Reports status back to the Kubernetes API
@@ -642,6 +658,7 @@ kubectl -n k8gobgp-system exec $POD -- gobgp neighbor <peer-ip> adj-out
 | Issue | Cause | Solution |
 |-------|-------|----------|
 | BGPConfiguration stuck in not-ready | Global config change | Delete and recreate pod to apply ASN/RouterID changes |
+| `MultipleConfigurations` status/event | More than one BGPConfiguration in the cluster | Only the oldest is applied. Delete the extras and move their neighbors into the surviving resource, using `nodeSelector` to scope them per node |
 | Neighbor not establishing | Authentication mismatch | Verify Secret exists and key matches |
 | No routes imported | Netlink config missing | Check `netlinkImport.enabled` and interface patterns |
 | ConfigurationInvalid status | Invalid community format | Communities must be `AS:VALUE` (0-65535:0-65535) |
