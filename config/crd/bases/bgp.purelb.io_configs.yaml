@@ -939,10 +939,6 @@ spec:
                   - type
                   type: object
                 type: array
-              establishedNeighbors:
-                description: EstablishedNeighbors is the count of neighbors in Established
-                  state
-                type: integer
               lastReconcileTime:
                 description: LastReconcileTime is the timestamp of the last reconciliation
                 format: date-time

@@ -13,6 +13,7 @@ linters:
     - staticcheck
     - unused
     - misspell
+    - promlinter
     - unconvert
     - bodyclose
     - noctx

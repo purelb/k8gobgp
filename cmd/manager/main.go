@@ -59,8 +59,8 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":7474", "The address the probe endpoint binds to.")
 	flag.StringVar(&gobgpEndpoint, "gobgp-endpoint", "", "The GoBGP gRPC endpoint (e.g., localhost:50051 or unix:///var/run/gobgp/gobgp.sock). Can also be set via GOBGP_ENDPOINT env var.")
 	flag.DurationVar(&metricsPollInterval, "metrics-poll-interval", 15*time.Second, "Interval for polling BGP stats from gobgpd (minimum 15s).")
-	flag.BoolVar(&enablePerNeighborMetrics, "enable-per-neighbor-metrics", false, "Enable high-cardinality per-neighbor route metrics (use with caution in large deployments).")
-	flag.IntVar(&maxNeighborsForMetrics, "max-neighbors-metrics", 200, "Maximum number of neighbors to export per-neighbor metrics for (0=unlimited).")
+	flag.BoolVar(&enablePerNeighborMetrics, "enable-per-neighbor-metrics", false, "Enable per-neighbor route metrics, which multiply by address family. Per-neighbor session state is always exported and is not affected by this flag.")
+	flag.IntVar(&maxNeighborsForMetrics, "max-neighbors-metrics", 200, "Maximum number of neighbors to export per-neighbor metrics for; 0 means unlimited. Neighbors beyond the limit are reported by k8gobgp_neighbor_metrics_truncated.")
 	opts := zap.Options{
 		Development: true,
 	}

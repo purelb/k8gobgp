@@ -46,7 +46,7 @@ spec:
 
     # Alert when many pods are using hash-based router IDs (potential IPv6-only or misconfiguration)
     - alert: K8GoBGPHashBasedRouterIDsHigh
-      expr: count(k8gobgp_router_id_source{source="hash_from_node_name"} == 1) > 5
+      expr: count(k8gobgp_router_id_source{source="hash-from-node-name"} == 1) > 5
       for: 15m
       labels:
         severity: info
@@ -56,7 +56,7 @@ spec:
 
     # Alert when BGP reconciliation is failing (general health)
     - alert: K8GoBGPReconciliationFailed
-      expr: increase(k8gobgp_reconcile_total{result="error"}[5m]) > 3
+      expr: increase(k8gobgp_reconcile_total{result!="success"}[5m]) > 3
       for: 5m
       labels:
         severity: warning
@@ -76,13 +76,13 @@ spec:
 
     # Alert when no BGP neighbors are established
     - alert: K8GoBGPNoEstablishedNeighbors
-      expr: k8gobgp_neighbors_established_total == 0 and k8gobgp_neighbors_total > 0
+      expr: k8gobgp_neighbors{state="established"} == 0 and sum without(state) (k8gobgp_neighbors) > 0
       for: 5m
       labels:
         severity: warning
       annotations:
         summary: "No BGP neighbors established"
-        description: "There are {{ $value }} configured BGP neighbors but none are in ESTABLISHED state. Check BGP configuration and network connectivity."
+        description: "No BGP neighbors are ESTABLISHED on {{ $labels.pod }}, though the node has neighbors configured. Check BGP configuration and network connectivity."
 
 ---
 # For non-Prometheus Operator deployments, use this raw format
