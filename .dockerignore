@@ -1,0 +1,9 @@
+# Keep local build artifacts out of the build context. These are all gitignored,
+# so they only exist in a developer's working tree -- but bin/manager changes on
+# every "make build" and would otherwise invalidate the "COPY . ." layer cache.
+#
+# vendor/ is deliberately NOT listed: the manager is built with -mod=vendor.
+.git
+bin/
+kubebuilder
+coverage.out
