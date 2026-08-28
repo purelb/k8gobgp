@@ -80,6 +80,18 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      # Nothing else checks that the committed CRDs and RBAC still match the Go
+      # types they are generated from, and release.yaml builds dist/crds.yaml by
+      # concatenating the committed YAML — so a change to api/v1/types.go with no
+      # "make manifests" ships a stale schema in the release artifact.
+      # Deterministic because the Makefile pins controller-gen to the version
+      # stamped into config/crd/bases/*.yaml.
+      - name: Verify generated manifests
+        run: |
+          make generate
+          make manifests
+          git diff --exit-code api/v1/zz_generated.deepcopy.go config/crd/bases config/rbac
+
   docker-build:
     name: Docker Build
     runs-on: ubuntu-latest
