@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	gobgpapi "github.com/osrg/gobgp/v4/api"
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -44,14 +45,6 @@ var (
 		prometheus.GaugeOpts{
 			Name: "k8gobgp_neighbors_configured",
 			Help: "Number of BGP neighbors configured",
-		},
-		[]string{"name", "namespace"},
-	)
-
-	bgpNeighborsEstablished = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "k8gobgp_neighbors_established",
-			Help: "Number of BGP neighbors in established state",
 		},
 		[]string{"name", "namespace"},
 	)
@@ -147,38 +140,68 @@ var (
 	// Global RIB route counts by address family
 	bgpRibRoutes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_rib_route_count",
+			Name: "k8gobgp_rib_routes",
 			Help: "Number of route prefixes in the global RIB by address family",
 		},
 		[]string{"family"}, // family: ipv4_unicast, ipv6_unicast, l2vpn_evpn
 	)
 
-	// Global neighbor state counts (from periodic polling)
-	bgpNeighborsTotal = prometheus.NewGauge(
+	// Node-level neighbor counts by BGP FSM state (from periodic polling).
+	// One series per state, always all of them, so a state with no peers reads 0
+	// rather than being absent. Replaces the former neighbors_total /
+	// neighbors_established_total / neighbors_active / neighbors_idle gauges,
+	// which between them covered only three of the seven FSM states — a peer
+	// mid-handshake was counted nowhere and the states did not sum to the total.
+	// sum without(state) gives the total.
+	bgpNeighbors = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_neighbors_total",
-			Help: "Total number of BGP neighbors (from gobgpd)",
+			Name: "k8gobgp_neighbors",
+			Help: "Number of BGP neighbors on this node by FSM session state",
 		},
+		[]string{"state"},
 	)
 
-	bgpNeighborsEstablishedTotal = prometheus.NewGauge(
+	// Per-neighbor FSM state as an info metric: exactly one series per peer,
+	// carrying its current state as a label, value always 1. Costs one series
+	// per peer rather than the seven a state-set would, which is what makes it
+	// affordable to enable by default.
+	bgpNeighborState = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_neighbors_established_total",
-			Help: "Number of BGP neighbors in ESTABLISHED FSM state",
+			Name: "k8gobgp_neighbor_state",
+			Help: "Current BGP FSM state of each neighbor (value is always 1; the state label carries the value). Subject to --max-neighbors-metrics; see k8gobgp_neighbor_metrics_truncated",
 		},
+		[]string{"neighbor", "state"},
 	)
 
-	bgpNeighborsActive = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "k8gobgp_neighbors_active",
-			Help: "Number of BGP neighbors in ACTIVE FSM state (attempting connection)",
+	// Session flap count, taken from gobgpd's own PeerState.Flops. A real
+	// counter survives pod restarts and catches flaps that complete between two
+	// polls — both of which changes() over a timestamp misses.
+	bgpNeighborSessionFlaps = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "k8gobgp_neighbor_session_flaps_total",
+			Help: "Number of times each neighbor's BGP session has flapped, as counted by gobgpd",
 		},
+		[]string{"neighbor"},
 	)
 
-	bgpNeighborsIdle = prometheus.NewGauge(
+	// Absent, not zero, while a session is down: zero is a plausible-looking
+	// timestamp and would make time() - <this> yield ~1.7e9 for every down peer,
+	// silently poisoning any session-age query.
+	bgpNeighborSessionEstablished = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_neighbors_idle",
-			Help: "Number of BGP neighbors in IDLE FSM state",
+			Name: "k8gobgp_neighbor_session_established_timestamp_seconds",
+			Help: "Unix timestamp at which each neighbor's session reached ESTABLISHED. Absent while the session is down",
+		},
+		[]string{"neighbor"},
+	)
+
+	// Without this, peers beyond the cap are a silent monitoring blind spot:
+	// the node-level counts include them but no per-neighbor series exists, so
+	// "some peer is down" alerts cannot fire for them.
+	bgpNeighborMetricsTruncated = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_neighbor_metrics_truncated",
+			Help: "Number of neighbors omitted from per-neighbor metrics because of --max-neighbors-metrics",
 		},
 	)
 
@@ -210,21 +233,21 @@ var (
 	// Aggregate route counts (low cardinality alternative)
 	bgpRoutesReceivedTotal = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_routes_received_total",
+			Name: "k8gobgp_routes_received",
 			Help: "Total routes received from all neighbors (sum across all neighbors and families)",
 		},
 	)
 
 	bgpRoutesAcceptedTotal = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_routes_accepted_total",
+			Name: "k8gobgp_routes_accepted",
 			Help: "Total routes accepted from all neighbors",
 		},
 	)
 
 	bgpRoutesAdvertisedTotal = prometheus.NewGauge(
 		prometheus.GaugeOpts{
-			Name: "k8gobgp_routes_advertised_total",
+			Name: "k8gobgp_routes_advertised",
 			Help: "Total routes advertised to all neighbors",
 		},
 	)
@@ -294,7 +317,7 @@ var (
 			Name: "k8gobgp_router_id_info",
 			Help: "Router ID information (value is always 1, labels provide details)",
 		},
-		[]string{"router_id", "source", "node", "asn"},
+		[]string{"router_id", "source", "node", "asn", "name", "namespace"},
 	)
 
 	// === BGPNodeStatus Reporter Metrics ===
@@ -336,7 +359,6 @@ func init() {
 		reconcileTotal,
 		reconcileDuration,
 		bgpNeighborsConfigured,
-		bgpNeighborsEstablished,
 		bgpPeerGroupsConfigured,
 		bgpDynamicNeighborsConfigured,
 		gobgpConnectionStatus,
@@ -349,10 +371,11 @@ func init() {
 		cleanupDuration,
 		// BGP Stats Metrics (collected by BGPMetricsController)
 		bgpRibRoutes,
-		bgpNeighborsTotal,
-		bgpNeighborsEstablishedTotal,
-		bgpNeighborsActive,
-		bgpNeighborsIdle,
+		bgpNeighbors,
+		bgpNeighborState,
+		bgpNeighborSessionFlaps,
+		bgpNeighborSessionEstablished,
+		bgpNeighborMetricsTruncated,
 		bgpNeighborRoutesReceived,
 		bgpNeighborRoutesAccepted,
 		bgpNeighborRoutesAdvertised,
@@ -386,10 +409,69 @@ func RecordReconcileDuration(name, namespace string, duration float64) {
 	reconcileDuration.WithLabelValues(name, namespace).Observe(duration)
 }
 
-// UpdateNeighborMetrics updates the neighbor count metrics
-func UpdateNeighborMetrics(name, namespace string, configured, established int) {
-	bgpNeighborsConfigured.WithLabelValues(name, namespace).Set(float64(configured))
-	bgpNeighborsEstablished.WithLabelValues(name, namespace).Set(float64(established))
+// BGP FSM state label values.
+//
+// Declared here rather than derived from peerStateToString: that function's
+// output is the BGPNodeStatus CRD's documented .status.neighbors[].state
+// contract, and wiring metric labels to it would make a CRD casing change
+// silently rewrite every metric label — breaking all alerts with no compile
+// error. TestFSMStateLabelsMatchCRDStates keeps the two sets in step by
+// failing loudly instead.
+const (
+	FSMStateIdle        = "idle"
+	FSMStateConnect     = "connect"
+	FSMStateActive      = "active"
+	FSMStateOpenSent    = "opensent"
+	FSMStateOpenConfirm = "openconfirm"
+	FSMStateEstablished = "established"
+	FSMStateUnknown     = "unknown"
+)
+
+// AllFSMStates is every value the state label can take. The node-level gauge is
+// pre-initialized across all of them so an absent state reads 0 rather than
+// disappearing — a missing series and a zero one mean very different things to
+// an alert.
+var AllFSMStates = []string{
+	FSMStateIdle, FSMStateConnect, FSMStateActive, FSMStateOpenSent,
+	FSMStateOpenConfirm, FSMStateEstablished, FSMStateUnknown,
+}
+
+// fsmStateLabel maps a gobgp session state to its metric label value.
+// SESSION_STATE_UNSPECIFIED and any state a future gobgp adds fall through to
+// "unknown" rather than vanishing — the previous switch covered only three of
+// the seven states, so a peer mid-handshake was counted nowhere at all.
+func fsmStateLabel(state gobgpapi.PeerState_SessionState) string {
+	switch state {
+	case gobgpapi.PeerState_SESSION_STATE_IDLE:
+		return FSMStateIdle
+	case gobgpapi.PeerState_SESSION_STATE_CONNECT:
+		return FSMStateConnect
+	case gobgpapi.PeerState_SESSION_STATE_ACTIVE:
+		return FSMStateActive
+	case gobgpapi.PeerState_SESSION_STATE_OPENSENT:
+		return FSMStateOpenSent
+	case gobgpapi.PeerState_SESSION_STATE_OPENCONFIRM:
+		return FSMStateOpenConfirm
+	case gobgpapi.PeerState_SESSION_STATE_ESTABLISHED:
+		return FSMStateEstablished
+	default:
+		return FSMStateUnknown
+	}
+}
+
+// UpdateNeighborsConfigured updates the count of neighbors this CR asks for on
+// this node, after nodeSelector filtering. Written by the reconciler: it
+// describes intent, so it is legitimately edge-triggered.
+func UpdateNeighborsConfigured(name, namespace string, count int) {
+	bgpNeighborsConfigured.WithLabelValues(name, namespace).Set(float64(count))
+}
+
+// SetNeighborStateCounts replaces the node-level per-state counts. Every state
+// in AllFSMStates is written, including zeros, so the series never vanish.
+func SetNeighborStateCounts(counts map[string]int) {
+	for _, state := range AllFSMStates {
+		bgpNeighbors.WithLabelValues(state).Set(float64(counts[state]))
+	}
 }
 
 // UpdatePeerGroupMetrics updates the peer group count
@@ -446,10 +528,82 @@ func RecordCleanupDuration(name, namespace string, duration float64) {
 	cleanupDuration.WithLabelValues(name, namespace).Observe(duration)
 }
 
+// NeighborSample is one peer's observation from a single collection pass.
+type NeighborSample struct {
+	Key                  string // neighborKey(): an address, or "iface:<name>"
+	State                string // one of AllFSMStates
+	Flaps                uint32 // gobgpd's PeerState.Flops
+	EstablishedTimestamp int64  // unix seconds; 0 when not established
+}
+
+// SetNeighborMetrics replaces the per-neighbor series for one collection pass,
+// then removes the series of any peer seen last time but not this time.
+//
+// Deliberately not a Reset(): the vectors are exported by default, and Reset
+// empties them for the whole duration of a collection — up to the 10s timeout.
+// A scrape landing in that window would see the metric absent, which "== 0" and
+// absent() alerts read as "the peer is gone". Deleting only what actually
+// departed leaves no gap.
+//
+// truncated is the number of peers omitted by the cardinality cap, exported so
+// the blind spot is visible rather than silent.
+func SetNeighborMetrics(samples []NeighborSample, truncated int, prev map[string]NeighborSample) map[string]NeighborSample {
+	seen := make(map[string]NeighborSample, len(samples))
+	for _, s := range samples {
+		seen[s.Key] = s
+		p, existed := prev[s.Key]
+
+		// One series per peer, so the previous state label must go before the
+		// current one is set — otherwise a peer that moves idle -> established
+		// leaves both series exported at 1 forever.
+		if existed && p.State != s.State {
+			bgpNeighborState.DeletePartialMatch(prometheus.Labels{"neighbor": s.Key})
+		}
+		bgpNeighborState.WithLabelValues(s.Key, s.State).Set(1)
+
+		// gobgpd reports Flops as an absolute count; a Prometheus counter only
+		// accepts increments. Add the delta, and if the count goes backwards
+		// (gobgpd restarted and began again from zero) adopt the new absolute
+		// value rather than going negative.
+		switch {
+		case !existed, s.Flaps < p.Flaps:
+			if s.Flaps > 0 {
+				bgpNeighborSessionFlaps.WithLabelValues(s.Key).Add(float64(s.Flaps))
+			} else {
+				// Touch the series so a peer with no flaps still reports 0
+				// rather than being absent.
+				bgpNeighborSessionFlaps.WithLabelValues(s.Key)
+			}
+		case s.Flaps > p.Flaps:
+			bgpNeighborSessionFlaps.WithLabelValues(s.Key).Add(float64(s.Flaps - p.Flaps))
+		}
+
+		if s.State == FSMStateEstablished && s.EstablishedTimestamp > 0 {
+			bgpNeighborSessionEstablished.WithLabelValues(s.Key).Set(float64(s.EstablishedTimestamp))
+		} else {
+			// Absent rather than 0 while down — see the metric's declaration.
+			bgpNeighborSessionEstablished.DeleteLabelValues(s.Key)
+		}
+	}
+
+	// Remove peers seen last pass but not this one. Only these are deleted, so
+	// there is never a window where a live peer's series is missing.
+	for key := range prev {
+		if _, still := seen[key]; still {
+			continue
+		}
+		bgpNeighborState.DeletePartialMatch(prometheus.Labels{"neighbor": key})
+		bgpNeighborSessionEstablished.DeleteLabelValues(key)
+		bgpNeighborSessionFlaps.DeleteLabelValues(key)
+	}
+
+	bgpNeighborMetricsTruncated.Set(float64(truncated))
+	return seen
+}
+
 // DeleteMetricsForConfig removes all metrics for a deleted configuration
 func DeleteMetricsForConfig(name, namespace string) {
 	bgpNeighborsConfigured.DeleteLabelValues(name, namespace)
-	bgpNeighborsEstablished.DeleteLabelValues(name, namespace)
 	bgpPeerGroupsConfigured.DeleteLabelValues(name, namespace)
 	bgpDynamicNeighborsConfigured.DeleteLabelValues(name, namespace)
 	bgpConfigurationReady.DeleteLabelValues(name, namespace)
@@ -483,9 +637,26 @@ func UpdateRouterIDSource(source string) {
 }
 
 // UpdateRouterIDInfo updates the router ID information metric
-func UpdateRouterIDInfo(routerID, source, nodeName, asn string) {
-	// Clear any previous values first (in case router ID changed)
-	routerIDInfo.Reset()
-	// Set the new value
-	routerIDInfo.WithLabelValues(sanitizeLabelValue(routerID), sanitizeLabelValue(source), sanitizeLabelValue(nodeName), sanitizeLabelValue(asn)).Set(1)
+// UpdateRouterIDInfo sets this CR's router ID series, first removing its
+// previous one if the resolved values changed.
+//
+// Deliberately not Reset(): that wiped the entire vector on every call, so with
+// two BGPConfigurations on one node the second CR's resolution erased the
+// first's series. Labels are passed as maps rather than positionally — the
+// vector carries six labels now, and a future reordering would silently
+// mismatch a positional delete against the wrong series.
+func UpdateRouterIDInfo(oldLabels, newLabels prometheus.Labels) {
+	if oldLabels != nil {
+		routerIDInfo.Delete(oldLabels)
+	}
+	routerIDInfo.With(newLabels).Set(1)
+}
+
+// DeleteRouterIDInfo removes one CR's router ID series. Required on CR
+// deletion: without Reset() there is nothing else to clear it, so the series
+// would otherwise outlive the CR indefinitely.
+func DeleteRouterIDInfo(labels prometheus.Labels) {
+	if labels != nil {
+		routerIDInfo.Delete(labels)
+	}
 }

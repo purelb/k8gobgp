@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
@@ -124,6 +125,20 @@ func neighborKeyFromCRD(cfg *bgpv1.NeighborConfig) string {
 		return "iface:" + cfg.NeighborInterface
 	}
 	return cfg.NeighborAddress
+}
+
+// routerIDInfoLabels builds the label set for one CR's router_id_info series.
+// Every call site must use this so the delete on CR removal matches exactly
+// what was set — a mismatch would silently leave the series behind.
+func routerIDInfoLabels(bgpConfig *bgpv1.BGPConfiguration, routerID, source, nodeName string) prometheus.Labels {
+	return prometheus.Labels{
+		"router_id": sanitizeLabelValue(routerID),
+		"source":    sanitizeLabelValue(source),
+		"node":      sanitizeLabelValue(nodeName),
+		"asn":       sanitizeLabelValue(fmt.Sprintf("%d", bgpConfig.Spec.Global.ASN)),
+		"name":      sanitizeLabelValue(bgpConfig.Name),
+		"namespace": sanitizeLabelValue(bgpConfig.Namespace),
+	}
 }
 
 // dynamicNeighborPrefixes parses the configured dynamic-neighbor ranges.
@@ -405,28 +420,36 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 	defer func() {
-		if err := conn.Close(); err != nil {
-			log.Error(err, "Failed to close gRPC connection")
+		if closeErr := conn.Close(); closeErr != nil {
+			log.Error(closeErr, "Failed to close gRPC connection")
 		}
 	}()
 	RecordGoBGPConnection(r.getEndpoint(), true)
 	apiClient := gobgpapi.NewGoBgpServiceClient(conn)
 
-	// Reconcile all BGP configuration components
-	var reconcileErr error
-	if err := r.reconcileGlobal(ctx, apiClient, bgpConfig, log); err != nil {
+	// Reconcile all BGP configuration components.
+	// desiredPeerGroups and desiredDynNeighbors are declared outside the chain
+	// so the post-nodeSelector-filter counts are still in scope for the metric
+	// updates below — reporting raw spec lengths there would overstate what is
+	// actually configured on this node.
+	var (
+		reconcileErr        error
+		desiredPeerGroups   map[string]*gobgpapi.PeerGroup
+		desiredDynNeighbors map[string]*gobgpapi.DynamicNeighbor
+	)
+	if err = r.reconcileGlobal(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("global: %w", err)
-	} else if err := r.reconcileDefinedSets(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if err = r.reconcileDefinedSets(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("defined sets: %w", err)
-	} else if err := r.reconcilePolicies(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if err = r.reconcilePolicies(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("policies: %w", err)
-	} else if err := r.reconcileVrfs(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if err = r.reconcileVrfs(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("vrfs: %w", err)
-	} else if desiredPeerGroups, err := r.reconcilePeerGroups(ctx, apiClient, bgpConfig, log); err != nil {
+	} else if desiredPeerGroups, err = r.reconcilePeerGroups(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("peer groups: %w", err)
-	} else if err := r.reconcileDynamicNeighbors(ctx, apiClient, bgpConfig, desiredPeerGroups, log); err != nil {
+	} else if desiredDynNeighbors, err = r.reconcileDynamicNeighbors(ctx, apiClient, bgpConfig, desiredPeerGroups, log); err != nil {
 		reconcileErr = fmt.Errorf("dynamic neighbors: %w", err)
-	} else if err := r.reconcileNeighbors(ctx, apiClient, bgpConfig, desiredPeerGroups, log); err != nil {
+	} else if err = r.reconcileNeighbors(ctx, apiClient, bgpConfig, desiredPeerGroups, log); err != nil {
 		reconcileErr = fmt.Errorf("neighbors: %w", err)
 	} else if err := r.reconcileNetlink(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("netlink: %w", err)
@@ -438,9 +461,9 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	bgpConfig.Status.LastReconcileTime = &now
 
 	// Update configuration metrics (NeighborCount is set in reconcileNeighbors with post-filter count)
-	UpdateNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, bgpConfig.Status.NeighborCount, bgpConfig.Status.EstablishedNeighbors)
-	UpdatePeerGroupMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.PeerGroups))
-	UpdateDynamicNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.DynamicNeighbors))
+	UpdateNeighborsConfigured(bgpConfig.Name, bgpConfig.Namespace, bgpConfig.Status.NeighborCount)
+	UpdatePeerGroupMetrics(bgpConfig.Name, bgpConfig.Namespace, len(desiredPeerGroups))
+	UpdateDynamicNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, len(desiredDynNeighbors))
 	UpdateVrfMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.Vrfs))
 	UpdatePolicyMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.PolicyDefinitions), len(bgpConfig.Spec.DefinedSets))
 
@@ -619,6 +642,15 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 		RecordCleanupDuration(bgpConfig.Name, bgpConfig.Namespace, time.Since(cleanupStart).Seconds())
 		// Delete all metrics for this configuration
 		DeleteMetricsForConfig(bgpConfig.Name, bgpConfig.Namespace)
+
+		// Drop this CR's router_id_info series. UpdateRouterIDInfo no longer
+		// calls Reset(), so nothing else would ever clear it and the series
+		// would outlive the CR indefinitely.
+		cacheKey := bgpConfig.Namespace + "/" + bgpConfig.Name
+		if entry, ok := r.localRouterIDCache[cacheKey]; ok {
+			DeleteRouterIDInfo(routerIDInfoLabels(bgpConfig, entry.routerID, entry.source, r.NodeName))
+			delete(r.localRouterIDCache, cacheKey)
+		}
 
 		// Remove finalizer only after successful cleanup
 		controllerutil.RemoveFinalizer(bgpConfig, finalizerName)
@@ -843,7 +875,7 @@ func (r *BGPConfigurationReconciler) resolveEffectiveRouterID(ctx context.Contex
 	// Record metrics
 	RecordRouterIDResolution("success", duration)
 	UpdateRouterIDSource(resolution.Source)
-	UpdateRouterIDInfo(resolution.RouterID, resolution.Source, resolution.NodeName, fmt.Sprintf("%d", bgpConfig.Spec.Global.ASN))
+	UpdateRouterIDInfo(nil, routerIDInfoLabels(bgpConfig, resolution.RouterID, resolution.Source, r.NodeName))
 
 	// Cache in-memory for immutability (per-config, per-pod)
 	r.localRouterIDCache[cacheKey] = &localRouterIDEntry{
@@ -884,21 +916,38 @@ func (r *BGPConfigurationReconciler) resolveEffectiveRouterID(ctx context.Contex
 }
 
 func (r *BGPConfigurationReconciler) reconcileDefinedSets(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
-	// 1. Get current defined sets
+	// 1. Get current defined sets.
+	//
+	// ListDefinedSet must be called once per DefinedType. Leaving the field
+	// unset means DEFINED_TYPE_UNSPECIFIED, which gobgpd rejects with
+	// InvalidArgument — so this listed nothing and logged an error on every
+	// reconcile, leaving currentSets empty and every defined set looking new.
+	// Only the four types crdToAPIDefinedType can produce are queried.
 	currentSets := make(map[string]*gobgpapi.DefinedSet)
-	stream, err := apiClient.ListDefinedSet(ctx, &gobgpapi.ListDefinedSetRequest{})
-	if err != nil {
-		return err
-	}
-	for {
-		res, err := stream.Recv()
+	for _, definedType := range []gobgpapi.DefinedType{
+		gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
+		gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
+		gobgpapi.DefinedType_DEFINED_TYPE_AS_PATH,
+		gobgpapi.DefinedType_DEFINED_TYPE_COMMUNITY,
+	} {
+		stream, err := apiClient.ListDefinedSet(ctx, &gobgpapi.ListDefinedSetRequest{
+			DefinedType: definedType,
+		})
 		if err != nil {
-			if err != io.EOF {
-				log.Error(err, "error listing defined sets from gobgpd")
-			}
-			break
+			return err
 		}
-		currentSets[res.DefinedSet.Name] = res.DefinedSet
+		for {
+			res, err := stream.Recv()
+			if err != nil {
+				if err != io.EOF {
+					log.Error(err, "error listing defined sets from gobgpd", "definedType", definedType)
+				}
+				break
+			}
+			if res.DefinedSet != nil {
+				currentSets[res.DefinedSet.Name] = res.DefinedSet
+			}
+		}
 	}
 
 	// 2. Get desired defined sets
@@ -1028,12 +1077,15 @@ func (r *BGPConfigurationReconciler) reconcileVrfs(ctx context.Context, apiClien
 	return nil
 }
 
-func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, desiredPeerGroups map[string]*gobgpapi.PeerGroup, log logr.Logger) error {
+// reconcileDynamicNeighbors returns the filtered set it actually applied, so
+// the caller can report a configured-count metric that matches what is on this
+// node rather than the raw spec length.
+func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, desiredPeerGroups map[string]*gobgpapi.PeerGroup, log logr.Logger) (map[string]*gobgpapi.DynamicNeighbor, error) {
 	// 1. Get current dynamic neighbors
 	currentDynNeighbors := make(map[string]*gobgpapi.DynamicNeighbor)
 	stream, err := apiClient.ListDynamicNeighbor(ctx, &gobgpapi.ListDynamicNeighborRequest{})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for {
 		res, err := stream.Recv()
@@ -1092,7 +1144,7 @@ func (r *BGPConfigurationReconciler) reconcileDynamicNeighbors(ctx context.Conte
 			}
 		}
 	}
-	return nil
+	return desiredDynNeighbors, nil
 }
 
 func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) (map[string]*gobgpapi.PeerGroup, error) {

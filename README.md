@@ -438,12 +438,11 @@ The controller exposes Prometheus metrics on `:7473/metrics`:
 |--------|------|-------------|
 | `k8gobgp_reconcile_total` | Counter | Total reconciliations by result |
 | `k8gobgp_reconcile_duration_seconds` | Histogram | Reconciliation duration |
-| `k8gobgp_neighbors_configured` | Gauge | Number of configured neighbors (from CRD) |
-| `k8gobgp_neighbors_established` | Gauge | Number of established sessions (from CRD reconcile) |
+| `k8gobgp_neighbors_configured` | Gauge | Neighbors this config asks for on this node, after nodeSelector filtering |
 | `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected) |
 | `k8gobgp_configuration_ready` | Gauge | Configuration ready status (1=ready) |
-| `k8gobgp_peer_groups_configured` | Gauge | Number of peer groups configured |
-| `k8gobgp_dynamic_neighbors_configured` | Gauge | Number of dynamic neighbors configured |
+| `k8gobgp_peer_groups_configured` | Gauge | Peer groups configured on this node, after nodeSelector filtering |
+| `k8gobgp_dynamic_neighbors_configured` | Gauge | Dynamic neighbors configured on this node, after peer-group filtering |
 | `k8gobgp_vrfs_configured` | Gauge | Number of VRFs configured |
 | `k8gobgp_policies_configured` | Gauge | Number of policies configured |
 | `k8gobgp_defined_sets_configured` | Gauge | Number of defined sets configured |
@@ -456,8 +455,8 @@ The controller exposes Prometheus metrics on `:7473/metrics`:
 |--------|------|-------------|
 | `k8gobgp_router_id_resolution_total` | Counter | Resolution attempts by result (success/failure) |
 | `k8gobgp_router_id_resolution_duration_seconds` | Histogram | Time to resolve router ID |
-| `k8gobgp_router_id_source` | Gauge | Active resolution source (explicit/template/node_ipv4/hash_from_node_name) |
-| `k8gobgp_router_id_info` | Gauge | Router ID details (labels: router_id, source, node) |
+| `k8gobgp_router_id_source` | Gauge | Active resolution source (`explicit`/`template`/`node-ipv4`/`hash-from-node-name`) |
+| `k8gobgp_router_id_info` | Gauge | Router ID details, one series per BGPConfiguration (labels: `router_id`, `source`, `node`, `asn`, `name`, `namespace`) |
 
 ### BGP Stats Metrics (from periodic polling)
 
@@ -465,24 +464,56 @@ These metrics are collected every `--metrics-poll-interval` (default 15s) direct
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `k8gobgp_neighbors_total` | Gauge | Total BGP neighbors from gobgpd |
-| `k8gobgp_neighbors_established_total` | Gauge | Neighbors in ESTABLISHED state |
-| `k8gobgp_neighbors_active` | Gauge | Neighbors in ACTIVE state (attempting connection) |
-| `k8gobgp_neighbors_idle` | Gauge | Neighbors in IDLE state |
-| `k8gobgp_rib_route_count` | Gauge | Routes in RIB by address family (labels: `family`) |
-| `k8gobgp_routes_received_total` | Gauge | Total routes received from all neighbors |
-| `k8gobgp_routes_accepted_total` | Gauge | Total routes accepted from all neighbors |
-| `k8gobgp_routes_advertised_total` | Gauge | Total routes advertised to all neighbors |
+| `k8gobgp_neighbors` | Gauge | Neighbors on this node by FSM state (label: `state`). All seven states are always present, so an empty state reads `0` rather than disappearing |
+| `k8gobgp_rib_routes` | Gauge | Routes in RIB by address family (label: `family`) |
+| `k8gobgp_routes_received` | Gauge | Total routes received from all neighbors |
+| `k8gobgp_routes_accepted` | Gauge | Total routes accepted from all neighbors |
+| `k8gobgp_routes_advertised` | Gauge | Total routes advertised to all neighbors |
 
-### Per-Neighbor Metrics (opt-in, high cardinality)
+`state` is one of `idle`, `connect`, `active`, `opensent`, `openconfirm`,
+`established`, `unknown`. The per-state counts always sum to the neighbor total:
 
-Enable with `--enable-per-neighbor-metrics`. Limited to `--max-neighbors-metrics` neighbors (default 200):
+```promql
+sum without(state) (k8gobgp_neighbors)          # total neighbors on this node
+k8gobgp_neighbors{state="established"}          # sessions that are up
+```
+
+### Per-Neighbor Metrics
+
+All per-neighbor metrics are limited to `--max-neighbors-metrics` neighbors
+(default 200; `0` means unlimited). Neighbors beyond the limit are selected
+deterministically by sorted key, and the number omitted is reported so they are
+not a silent blind spot.
+
+The `neighbor` label is the neighbor's address, or `iface:<name>` for
+unnumbered (interface-based) peers.
+
+Always exported — one series per neighbor:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `k8gobgp_neighbor_state` | Gauge | Each neighbor's current FSM state (labels: `neighbor`, `state`; value is always 1) |
+| `k8gobgp_neighbor_session_flaps_total` | Counter | Session flaps per neighbor, as counted by gobgpd |
+| `k8gobgp_neighbor_session_established_timestamp_seconds` | Gauge | When the session came up. **Absent** while the session is down |
+| `k8gobgp_neighbor_metrics_truncated` | Gauge | Neighbors omitted by the cardinality limit |
+
+Opt-in with `--enable-per-neighbor-metrics` — these multiply by address family,
+and requesting them also makes gobgpd walk the full local RIB per neighbor:
 
 | Metric | Type | Description |
 |--------|------|-------------|
 | `k8gobgp_neighbor_routes_received` | Gauge | Routes received by neighbor and family |
 | `k8gobgp_neighbor_routes_accepted` | Gauge | Routes accepted by neighbor and family |
 | `k8gobgp_neighbor_routes_advertised` | Gauge | Routes advertised by neighbor and family |
+
+Useful queries:
+
+```promql
+k8gobgp_neighbor_state{state="established"}                    # which peers are up
+k8gobgp_neighbor_state{state=~"active|connect|opensent"}       # peers stuck mid-handshake
+increase(k8gobgp_neighbor_session_flaps_total[15m]) > 2        # flapping peers
+k8gobgp_neighbor_metrics_truncated > 0                         # peers not being reported
+```
 
 ### BGPNodeStatus Reporter Metrics
 

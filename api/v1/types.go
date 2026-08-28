@@ -404,8 +404,6 @@ type BGPConfigurationStatus struct {
 	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
 	// NeighborCount is the number of configured BGP neighbors
 	NeighborCount int `json:"neighborCount,omitempty"`
-	// EstablishedNeighbors is the count of neighbors in Established state
-	EstablishedNeighbors int `json:"establishedNeighbors,omitempty"`
 	// Message provides additional information about the current state
 	Message string `json:"message,omitempty"`
 	// RouterIDSource indicates how the router ID was resolved:

@@ -47,11 +47,10 @@ func TestBGPConfigurationSpec(t *testing.T) {
 func TestBGPConfigurationStatus(t *testing.T) {
 	now := metav1.Now()
 	status := BGPConfigurationStatus{
-		ObservedGeneration:   1,
-		NeighborCount:        2,
-		EstablishedNeighbors: 1,
-		LastReconcileTime:    &now,
-		Message:              "Test message",
+		ObservedGeneration: 1,
+		NeighborCount:      2,
+		LastReconcileTime:  &now,
+		Message:            "Test message",
 		Conditions: []metav1.Condition{
 			{
 				Type:   "Ready",
@@ -63,7 +62,6 @@ func TestBGPConfigurationStatus(t *testing.T) {
 
 	assert.Equal(t, int64(1), status.ObservedGeneration)
 	assert.Equal(t, 2, status.NeighborCount)
-	assert.Equal(t, 1, status.EstablishedNeighbors)
 	assert.NotNil(t, status.LastReconcileTime)
 	assert.Equal(t, "Test message", status.Message)
 	require.Len(t, status.Conditions, 1)

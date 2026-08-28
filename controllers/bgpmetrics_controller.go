@@ -18,7 +18,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
+	"net/netip"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +58,12 @@ type BGPMetricsController struct {
 	collectMu           sync.Mutex
 	consecutiveFailures int
 	currentInterval     time.Duration
+
+	// prevNeighbors is the previous pass's per-peer observations, keyed by
+	// neighborKey. It drives two things: removing the series of peers that have
+	// gone away (instead of Reset()-ing the whole vector and leaving a scrape
+	// hole), and turning gobgpd's absolute flap count into counter increments.
+	prevNeighbors map[string]NeighborSample
 }
 
 // Start implements controller-runtime Runnable interface
@@ -200,7 +208,23 @@ func (m *BGPMetricsController) collectMetrics(ctx context.Context) error {
 	return nil
 }
 
+// peerObservation is one peer as read from a single ListPeer pass.
+type peerObservation struct {
+	key      string
+	state    string
+	flaps    uint32
+	upSince  int64
+	afiSafis []*gobgpapi.AfiSafi
+}
+
 func (m *BGPMetricsController) collectNeighborMetrics(ctx context.Context, client GoBGPStatsClient) error {
+	// EnableAdvertised makes gobgpd walk the full local RIB with export policy
+	// applied, per peer per family, and is the expensive part of this call.
+	// It stays unconditional because k8gobgp_routes_advertised is exported
+	// always: without it that gauge would read 0 in the default configuration
+	// whatever the node is really advertising, which is worse than the cost.
+	// Making advertised counts genuinely opt-in means not exporting the gauge
+	// at all when they are off — a deliberate API change, not a flag flip.
 	stream, err := client.ListPeer(ctx, &gobgpapi.ListPeerRequest{
 		EnableAdvertised: true,
 	})
@@ -208,16 +232,13 @@ func (m *BGPMetricsController) collectNeighborMetrics(ctx context.Context, clien
 		return fmt.Errorf("ListPeer failed: %w", err)
 	}
 
-	var total, established, active, idle int
 	var totalReceived, totalAccepted, totalAdvertised uint64
 	const maxNeighbors = 5000 // Safety limit
 
-	// Reset per-neighbor metrics before collecting to handle removed neighbors
-	if m.Config.EnablePerNeighborMetrics {
-		bgpNeighborRoutesReceived.Reset()
-		bgpNeighborRoutesAccepted.Reset()
-		bgpNeighborRoutesAdvertised.Reset()
-	}
+	// Accumulate the whole pass before touching any collector, so a scrape
+	// never observes a half-populated or emptied set.
+	stateCounts := make(map[string]int, len(AllFSMStates))
+	observations := make([]peerObservation, 0, 64)
 
 	for {
 		resp, err := stream.Recv()
@@ -228,70 +249,94 @@ func (m *BGPMetricsController) collectNeighborMetrics(ctx context.Context, clien
 			return fmt.Errorf("ListPeer stream error: %w", err)
 		}
 
+		// A nil State or Conf would panic here, and this runs in a
+		// manager.Runnable — controller-runtime's panic recovery covers
+		// reconcilers, not Runnables, so it would take the whole sidecar down.
 		peer := resp.Peer
-		total++
+		if peer == nil || peer.State == nil || peer.Conf == nil {
+			m.Log.V(1).Info("Skipping malformed peer in ListPeer response")
+			continue
+		}
 
-		if total > maxNeighbors {
+		if len(observations) >= maxNeighbors {
 			m.Log.Error(fmt.Errorf("too many neighbors"),
 				"Aborting metrics collection - neighbor count exceeds limit",
 				"limit", maxNeighbors)
-			return fmt.Errorf("neighbor count %d exceeds limit %d", total, maxNeighbors)
+			return fmt.Errorf("neighbor count exceeds limit %d", maxNeighbors)
 		}
 
-		// Count by session state
-		switch peer.State.SessionState {
-		case gobgpapi.PeerState_SESSION_STATE_ESTABLISHED:
-			established++
-		case gobgpapi.PeerState_SESSION_STATE_ACTIVE:
-			active++
-		case gobgpapi.PeerState_SESSION_STATE_IDLE:
-			idle++
-		}
+		state := fsmStateLabel(peer.State.SessionState)
+		stateCounts[state]++
 
-		// Per-neighbor AFI stats (only if enabled and under limit)
-		if m.Config.EnablePerNeighborMetrics {
-			maxForMetrics := m.Config.MaxNeighborsForMetrics
-			if maxForMetrics == 0 {
-				maxForMetrics = 200 // Default limit
+		obs := peerObservation{
+			key:      sanitizeNeighborKey(neighborKey(peer.Conf)),
+			state:    state,
+			flaps:    peer.State.Flops,
+			afiSafis: peer.AfiSafis,
+		}
+		if peer.Timers != nil && peer.Timers.State != nil && peer.Timers.State.Uptime != nil {
+			obs.upSince = peer.Timers.State.Uptime.AsTime().Unix()
+		}
+		observations = append(observations, obs)
+
+		for _, afiSafi := range peer.AfiSafis {
+			if afiSafi == nil || afiSafi.State == nil {
+				continue
 			}
+			totalReceived += afiSafi.State.Received
+			totalAccepted += afiSafi.State.Accepted
+			totalAdvertised += afiSafi.State.Advertised
+		}
+	}
 
-			if total <= maxForMetrics {
-				neighborAddr := sanitizeNeighborAddress(peer.State.NeighborAddress)
+	// Sort before truncating. gobgpd streams peers in Go map order, which is
+	// randomized per call — capping by arrival position would export a
+	// different arbitrary subset every poll, churning series continuously.
+	sort.Slice(observations, func(i, j int) bool { return observations[i].key < observations[j].key })
 
-				for _, afiSafi := range peer.AfiSafis {
-					family := familyToString(afiSafi.State.Family)
+	// 0 means unlimited, as --max-neighbors-metrics documents.
+	limit := m.Config.MaxNeighborsForMetrics
+	if limit < 0 {
+		limit = 0
+	}
+	exported := observations
+	truncated := 0
+	if limit > 0 && len(observations) > limit {
+		exported = observations[:limit]
+		truncated = len(observations) - limit
+		m.Log.Info("Per-neighbor metrics truncated by cardinality limit",
+			"neighbors", len(observations), "limit", limit, "omitted", truncated)
+		metricsCardinalityLimitHit.Inc()
+	}
 
-					bgpNeighborRoutesReceived.WithLabelValues(neighborAddr, family).
-						Set(float64(afiSafi.State.Received))
-					bgpNeighborRoutesAccepted.WithLabelValues(neighborAddr, family).
-						Set(float64(afiSafi.State.Accepted))
-					bgpNeighborRoutesAdvertised.WithLabelValues(neighborAddr, family).
-						Set(float64(afiSafi.State.Advertised))
+	samples := make([]NeighborSample, 0, len(exported))
+	for _, o := range exported {
+		samples = append(samples, NeighborSample{
+			Key: o.key, State: o.state, Flaps: o.flaps, EstablishedTimestamp: o.upSince,
+		})
+	}
+	m.prevNeighbors = SetNeighborMetrics(samples, truncated, m.prevNeighbors)
 
-					totalReceived += afiSafi.State.Received
-					totalAccepted += afiSafi.State.Accepted
-					totalAdvertised += afiSafi.State.Advertised
+	// Per-neighbor route counts stay opt-in: they multiply by address family,
+	// so they cost several series per peer where the state metric costs one.
+	if m.Config.EnablePerNeighborMetrics {
+		bgpNeighborRoutesReceived.Reset()
+		bgpNeighborRoutesAccepted.Reset()
+		bgpNeighborRoutesAdvertised.Reset()
+		for _, o := range exported {
+			for _, afiSafi := range o.afiSafis {
+				if afiSafi == nil || afiSafi.State == nil {
+					continue
 				}
-			} else if total == maxForMetrics+1 {
-				m.Log.Info("Per-neighbor metrics limit reached, exporting aggregates only",
-					"neighbors", total, "limit", maxForMetrics)
-				metricsCardinalityLimitHit.Inc()
-			}
-		} else {
-			// Still collect aggregate stats even if per-neighbor is disabled
-			for _, afiSafi := range peer.AfiSafis {
-				totalReceived += afiSafi.State.Received
-				totalAccepted += afiSafi.State.Accepted
-				totalAdvertised += afiSafi.State.Advertised
+				family := familyToString(afiSafi.State.Family)
+				bgpNeighborRoutesReceived.WithLabelValues(o.key, family).Set(float64(afiSafi.State.Received))
+				bgpNeighborRoutesAccepted.WithLabelValues(o.key, family).Set(float64(afiSafi.State.Accepted))
+				bgpNeighborRoutesAdvertised.WithLabelValues(o.key, family).Set(float64(afiSafi.State.Advertised))
 			}
 		}
 	}
 
-	// Update global neighbor counts
-	bgpNeighborsTotal.Set(float64(total))
-	bgpNeighborsEstablishedTotal.Set(float64(established))
-	bgpNeighborsActive.Set(float64(active))
-	bgpNeighborsIdle.Set(float64(idle))
+	SetNeighborStateCounts(stateCounts)
 
 	// Update aggregate route counts
 	bgpRoutesReceivedTotal.Set(float64(totalReceived))
@@ -398,12 +443,29 @@ func familyToString(f *gobgpapi.Family) string {
 	return fmt.Sprintf("%s_%s", afiStr, safiStr)
 }
 
-// sanitizeNeighborAddress validates and sanitizes neighbor address for use in labels
-func sanitizeNeighborAddress(addr string) string {
-	// Validate IP address format
-	if ip := net.ParseIP(addr); ip != nil {
-		return ip.String() // Use canonical form
+// ifaceNamePattern bounds the interface-name portion of a neighbor label.
+// NeighborInterface is a bare string in the CRD with no pattern or maxLength,
+// so without this anyone with write access to a BGPConfiguration could put
+// arbitrary content — newlines, quotes, megabytes — into a metric label value.
+// 15 characters matches IFNAMSIZ.
+var ifaceNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._-]{1,15}$`)
+
+// sanitizeNeighborKey validates a neighborKey() result for use as a label.
+//
+// Uses netip rather than net.ParseIP because unnumbered peers carry a *zoned*
+// link-local address (fe80::1%eth0), which net.ParseIP rejects — it would
+// return the literal "invalid" for every unnumbered peer, collapsing them all
+// onto one series so their states overwrite each other. Zones are stripped:
+// the interface is already carried by the "iface:" form where it matters.
+func sanitizeNeighborKey(key string) string {
+	if name, ok := strings.CutPrefix(key, "iface:"); ok {
+		if ifaceNamePattern.MatchString(name) {
+			return "iface:" + name
+		}
+		return "iface:invalid"
 	}
-	// Invalid IP - return safe fallback
+	if addr, err := netip.ParseAddr(key); err == nil {
+		return addr.WithZone("").String() // canonical form
+	}
 	return "invalid"
 }
