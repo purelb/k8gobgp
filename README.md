@@ -439,7 +439,8 @@ The controller exposes Prometheus metrics on `:7473/metrics`:
 | `k8gobgp_reconcile_total` | Counter | Total reconciliations by result |
 | `k8gobgp_reconcile_duration_seconds` | Histogram | Reconciliation duration |
 | `k8gobgp_neighbors_configured` | Gauge | Neighbors this config asks for on this node, after nodeSelector filtering |
-| `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected) |
+| `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected), by `endpoint` |
+| `k8gobgp_gobgpd_connection_errors_total` | Counter | Failed connection attempts to gobgpd, by `endpoint` |
 | `k8gobgp_configuration_ready` | Gauge | Configuration ready status (1=ready) |
 | `k8gobgp_peer_groups_configured` | Gauge | Peer groups configured on this node, after nodeSelector filtering |
 | `k8gobgp_dynamic_neighbors_configured` | Gauge | Dynamic neighbors configured on this node, after peer-group filtering |
@@ -460,7 +461,16 @@ The controller exposes Prometheus metrics on `:7473/metrics`:
 
 ### BGP Stats Metrics (from periodic polling)
 
-These metrics are collected every `--metrics-poll-interval` (default 15s) directly from gobgpd:
+These metrics are collected every `--metrics-poll-interval` (default 15s) directly from gobgpd.
+
+Collecting `k8gobgp_routes_advertised` requires gobgpd to evaluate export policy
+against the local RIB for each neighbor, so the cost of a poll grows with both
+RIB size and neighbor count. This happens on every poll regardless of
+`--enable-per-neighbor-metrics`, because the metric is always exported. Watch
+`k8gobgp_metrics_collection_duration_seconds` and raise `--metrics-poll-interval`
+if collection is expensive on a large RIB; the collector also logs a
+"Slow metrics collection" line when a cycle exceeds 5s, and skips a cycle
+entirely if the previous one is still running (`k8gobgp_metrics_collection_skipped_total`).
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -497,8 +507,8 @@ Always exported — one series per neighbor:
 | `k8gobgp_neighbor_session_established_timestamp_seconds` | Gauge | When the session came up. **Absent** while the session is down |
 | `k8gobgp_neighbor_metrics_truncated` | Gauge | Neighbors omitted by the cardinality limit |
 
-Opt-in with `--enable-per-neighbor-metrics` — these multiply by address family,
-and requesting them also makes gobgpd walk the full local RIB per neighbor:
+Opt-in with `--enable-per-neighbor-metrics`, because these multiply by address
+family — three metrics become three series per family per neighbor:
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -536,7 +546,7 @@ time() - k8gobgp_nodestatus_last_successful_write_timestamp > 300
 | `k8gobgp_metrics_collection_duration_seconds` | Histogram | Time to collect BGP stats |
 | `k8gobgp_metrics_collection_errors_total` | Counter | Collection errors |
 | `k8gobgp_metrics_collection_skipped_total` | Counter | Collections skipped (previous still running) |
-| `k8gobgp_metrics_cardinality_limit_hit_total` | Counter | Times per-neighbor limit was hit |
+| `k8gobgp_metrics_cardinality_limit_hit_total` | Counter | Poll cycles in which the per-neighbor limit was hit. Increments once per cycle while truncating, so it grows steadily rather than indicating severity — alert on `k8gobgp_neighbor_metrics_truncated` instead, which reports how many neighbors are actually missing |
 
 ## Development
 
