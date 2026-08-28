@@ -17,6 +17,7 @@ package controllers
 import (
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 )
@@ -55,7 +56,8 @@ func TestUpdateNeighborMetrics(t *testing.T) {
 	bgpNeighborsConfigured.Reset()
 	bgpNeighborsEstablished.Reset()
 
-	UpdateNeighborMetrics("test-config", "test-ns", 5, 3)
+	UpdateNeighborsConfigured("test-config", "test-ns", 5)
+	UpdateNeighborsEstablished("test-config", "test-ns", 3)
 
 	configured := testutil.ToFloat64(bgpNeighborsConfigured.WithLabelValues("test-config", "test-ns"))
 	established := testutil.ToFloat64(bgpNeighborsEstablished.WithLabelValues("test-config", "test-ns"))
@@ -168,7 +170,8 @@ func TestDeleteMetricsForConfig(t *testing.T) {
 	bgpNeighborsConfigured.Reset()
 	bgpConfigurationReady.Reset()
 
-	UpdateNeighborMetrics("delete-test", "test-ns", 5, 3)
+	UpdateNeighborsConfigured("delete-test", "test-ns", 5)
+	UpdateNeighborsEstablished("delete-test", "test-ns", 3)
 	UpdateConfigurationReadyStatus("delete-test", "test-ns", true)
 
 	// Verify metrics exist
@@ -230,18 +233,36 @@ func TestUpdateRouterIDSource(t *testing.T) {
 func TestUpdateRouterIDInfo(t *testing.T) {
 	routerIDInfo.Reset()
 
-	UpdateRouterIDInfo("10.0.0.5", "node-ipv4", "worker-1", "64512")
+	// First update with nil oldLabels
+	newLabels1 := prometheus.Labels{
+		"router_id": "10.0.0.5",
+		"source":    "node-ipv4",
+		"node":      "worker-1",
+		"asn":       "64512",
+		"name":      "bgp-config",
+		"namespace": "default",
+	}
+	UpdateRouterIDInfo(nil, newLabels1)
 
-	val := testutil.ToFloat64(routerIDInfo.WithLabelValues("10.0.0.5", "node-ipv4", "worker-1", "64512"))
+	val := testutil.ToFloat64(routerIDInfo.With(newLabels1))
 	assert.Equal(t, float64(1), val)
 
-	// Calling again with different values should reset the old entry
-	UpdateRouterIDInfo("10.255.0.42", "hash-from-node-name", "worker-2", "64513")
+	// Second update should delete the old entry and set the new one
+	oldLabels := newLabels1
+	newLabels2 := prometheus.Labels{
+		"router_id": "10.255.0.42",
+		"source":    "hash-from-node-name",
+		"node":      "worker-2",
+		"asn":       "64513",
+		"name":      "bgp-config",
+		"namespace": "default",
+	}
+	UpdateRouterIDInfo(oldLabels, newLabels2)
 
-	newVal := testutil.ToFloat64(routerIDInfo.WithLabelValues("10.255.0.42", "hash-from-node-name", "worker-2", "64513"))
+	newVal := testutil.ToFloat64(routerIDInfo.With(newLabels2))
 	assert.Equal(t, float64(1), newVal)
 
-	// Old labels should be gone (reset to 0 after Reset())
-	oldVal := testutil.ToFloat64(routerIDInfo.WithLabelValues("10.0.0.5", "node-ipv4", "worker-1", "64512"))
+	// Old labels should be gone
+	oldVal := testutil.ToFloat64(routerIDInfo.With(oldLabels))
 	assert.Equal(t, float64(0), oldVal)
 }

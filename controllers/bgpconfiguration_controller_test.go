@@ -877,7 +877,7 @@ func TestNeighborKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, neighborKey(tt.conf))
+			assert.Equal(t, tt.expected, NeighborKey(tt.conf))
 		})
 	}
 }

@@ -293,6 +293,44 @@ func (m *BGPMetricsController) collectNeighborMetrics(ctx context.Context, clien
 	bgpNeighborsActive.Set(float64(active))
 	bgpNeighborsIdle.Set(float64(idle))
 
+	// Update per-CR established neighbor counts (for live dashboard/alerting)
+	// Reuse the peers we just iterated through to compute per-CR counts
+	registry := GetNeighborRegistry()
+	if len(registry) > 0 {
+		// Re-fetch peers for per-CR matching (we need Conf for NeighborKey matching)
+		stream2, err2 := client.ListPeer(ctx, &gobgpapi.ListPeerRequest{EnableAdvertised: true})
+		if err2 == nil {
+			peersMap := make(map[string]*gobgpapi.Peer)
+			for {
+				resp, err := stream2.Recv()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					break // Silently skip per-CR update if we hit an error
+				}
+				peer := resp.Peer
+				key := NeighborKey(peer.Conf)
+				peersMap[key] = peer
+			}
+			// For each CR in the registry, count its ESTABLISHED neighbors
+			for crKey, neighborKeys := range registry {
+				crEstablished := 0
+				for nkey := range neighborKeys {
+					if peer, ok := peersMap[nkey]; ok && peer.State != nil &&
+						peer.State.SessionState == gobgpapi.PeerState_SESSION_STATE_ESTABLISHED {
+						crEstablished++
+					}
+				}
+				// Parse crKey to get namespace/name
+				parts := strings.Split(crKey, "/")
+				if len(parts) == 2 {
+					UpdateNeighborsEstablished(parts[1], parts[0], crEstablished)
+				}
+			}
+		}
+	}
+
 	// Update aggregate route counts
 	bgpRoutesReceivedTotal.Set(float64(totalReceived))
 	bgpRoutesAcceptedTotal.Set(float64(totalAccepted))

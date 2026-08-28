@@ -438,8 +438,8 @@ The controller exposes Prometheus metrics on `:7473/metrics`:
 |--------|------|-------------|
 | `k8gobgp_reconcile_total` | Counter | Total reconciliations by result |
 | `k8gobgp_reconcile_duration_seconds` | Histogram | Reconciliation duration |
-| `k8gobgp_neighbors_configured` | Gauge | Number of configured neighbors (from CRD) |
-| `k8gobgp_neighbors_established` | Gauge | Number of established sessions (from CRD reconcile) |
+| `k8gobgp_neighbors_configured` | Gauge | Number of neighbors configured for this node (post-nodeSelector filter) |
+| `k8gobgp_neighbors_established` | Gauge | Number of neighbors in ESTABLISHED state (updated every metrics poll, ~15s) |
 | `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected) |
 | `k8gobgp_configuration_ready` | Gauge | Configuration ready status (1=ready) |
 | `k8gobgp_peer_groups_configured` | Gauge | Number of peer groups configured |
@@ -456,8 +456,8 @@ The controller exposes Prometheus metrics on `:7473/metrics`:
 |--------|------|-------------|
 | `k8gobgp_router_id_resolution_total` | Counter | Resolution attempts by result (success/failure) |
 | `k8gobgp_router_id_resolution_duration_seconds` | Histogram | Time to resolve router ID |
-| `k8gobgp_router_id_source` | Gauge | Active resolution source (explicit/template/node_ipv4/hash_from_node_name) |
-| `k8gobgp_router_id_info` | Gauge | Router ID details (labels: router_id, source, node) |
+| `k8gobgp_router_id_source` | Gauge | Active resolution source (explicit/template/node-ipv4/hash-from-node-name) |
+| `k8gobgp_router_id_info` | Gauge | Router ID details (labels: router_id, source, node, asn, name, namespace) |
 
 ### BGP Stats Metrics (from periodic polling)
 

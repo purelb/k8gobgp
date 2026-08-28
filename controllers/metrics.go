@@ -15,9 +15,16 @@
 package controllers
 
 import (
+	"sync/atomic"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
+
+// neighborRegistry tracks which neighbors belong to which BGPConfiguration CR.
+// It's keyed by namespace/name → set of NeighborKey() strings for that CR's desired neighbors.
+// Updated atomically (copy-on-write) to avoid locks; readers get consistent snapshots.
+var neighborRegistry atomic.Pointer[map[string]map[string]struct{}]
 
 // Metrics for the BGPConfiguration controller
 var (
@@ -294,7 +301,7 @@ var (
 			Name: "k8gobgp_router_id_info",
 			Help: "Router ID information (value is always 1, labels provide details)",
 		},
-		[]string{"router_id", "source", "node", "asn"},
+		[]string{"router_id", "source", "node", "asn", "name", "namespace"},
 	)
 
 	// === BGPNodeStatus Reporter Metrics ===
@@ -387,9 +394,16 @@ func RecordReconcileDuration(name, namespace string, duration float64) {
 }
 
 // UpdateNeighborMetrics updates the neighbor count metrics
-func UpdateNeighborMetrics(name, namespace string, configured, established int) {
-	bgpNeighborsConfigured.WithLabelValues(name, namespace).Set(float64(configured))
-	bgpNeighborsEstablished.WithLabelValues(name, namespace).Set(float64(established))
+// UpdateNeighborsConfigured updates the count of neighbors configured for this CR.
+// Called from the reconciler (edge-triggered by spec/node-label changes).
+func UpdateNeighborsConfigured(name, namespace string, count int) {
+	bgpNeighborsConfigured.WithLabelValues(name, namespace).Set(float64(count))
+}
+
+// UpdateNeighborsEstablished updates the count of neighbors in ESTABLISHED state.
+// Called from the poller (live, updated every metrics poll interval).
+func UpdateNeighborsEstablished(name, namespace string, count int) {
+	bgpNeighborsEstablished.WithLabelValues(name, namespace).Set(float64(count))
 }
 
 // UpdatePeerGroupMetrics updates the peer group count
@@ -483,9 +497,69 @@ func UpdateRouterIDSource(source string) {
 }
 
 // UpdateRouterIDInfo updates the router ID information metric
-func UpdateRouterIDInfo(routerID, source, nodeName, asn string) {
-	// Clear any previous values first (in case router ID changed)
-	routerIDInfo.Reset()
-	// Set the new value
-	routerIDInfo.WithLabelValues(sanitizeLabelValue(routerID), sanitizeLabelValue(source), sanitizeLabelValue(nodeName), sanitizeLabelValue(asn)).Set(1)
+// UpdateRouterIDInfo updates the router ID information metric.
+// oldLabels can be nil; if provided, the old entry is deleted before setting the new one.
+// This prevents multiple CRs' entries from overwriting each other.
+func UpdateRouterIDInfo(oldLabels, newLabels prometheus.Labels) {
+	if oldLabels != nil {
+		routerIDInfo.Delete(oldLabels)
+	}
+	routerIDInfo.With(newLabels).Set(1)
+}
+
+// DeleteRouterIDInfo deletes a router ID info metric entry.
+func DeleteRouterIDInfo(labels prometheus.Labels) {
+	if labels != nil {
+		routerIDInfo.Delete(labels)
+	}
+}
+
+// UpdateNeighborRegistry updates the registry of neighbors for a CR.
+// neighbors is a map of NeighborKey() → struct{} for this CR's desired neighbors.
+// Uses copy-on-write to avoid locks.
+func UpdateNeighborRegistry(namespace, name string, neighbors map[string]struct{}) {
+	// Make a copy of the current registry
+	registry := neighborRegistry.Load()
+	newRegistry := make(map[string]map[string]struct{})
+	if registry != nil {
+		for k, v := range *registry {
+			newRegistry[k] = v
+		}
+	}
+
+	// Update this CR's entry
+	crKey := namespace + "/" + name
+	newRegistry[crKey] = neighbors
+
+	// Store atomically
+	neighborRegistry.Store(&newRegistry)
+}
+
+// DeleteNeighborRegistry deletes a CR's entry from the registry.
+func DeleteNeighborRegistry(namespace, name string) {
+	registry := neighborRegistry.Load()
+	if registry == nil {
+		return
+	}
+
+	// Make a copy and delete the entry
+	newRegistry := make(map[string]map[string]struct{})
+	for k, v := range *registry {
+		newRegistry[k] = v
+	}
+
+	crKey := namespace + "/" + name
+	delete(newRegistry, crKey)
+
+	// Store atomically
+	neighborRegistry.Store(&newRegistry)
+}
+
+// GetNeighborRegistry returns a snapshot of the current registry.
+func GetNeighborRegistry() map[string]map[string]struct{} {
+	registry := neighborRegistry.Load()
+	if registry == nil {
+		return make(map[string]map[string]struct{})
+	}
+	return *registry
 }
