@@ -7,9 +7,6 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "deps"
-    labels:
-      - "dependencies"
-      - "go"
     open-pull-requests-limit: 5
     groups:
       k8s:
@@ -28,9 +25,6 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "ci"
-    labels:
-      - "dependencies"
-      - "github-actions"
 
   # Docker
   - package-ecosystem: "docker"
@@ -39,6 +33,3 @@ updates:
       interval: "weekly"
     commit-message:
       prefix: "docker"
-    labels:
-      - "dependencies"
-      - "docker"
