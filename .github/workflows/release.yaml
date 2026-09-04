@@ -82,7 +82,7 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          cosign attest --yes --predicate sbom.spdx.json --type spdx ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
+          cosign attest --yes --predicate sbom.spdx.json --type spdxjson ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}
 
   create-release:
     name: Create GitHub Release
@@ -102,6 +102,7 @@ jobs:
           mkdir -p dist
           # Strip 'v' prefix from tag for docker image tag (v0.1.1 -> 0.1.1)
           VERSION=${GITHUB_REF_NAME#v}
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
           # Generate CRDs (already has --- at start)
           cat config/crd/bases/*.yaml > dist/crds.yaml
@@ -132,6 +133,19 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           generate_release_notes: true
+          body: |
+            ### Verifying this release
+
+            Container images are signed with [cosign](https://github.com/sigstore/cosign).
+            Verification requires **cosign v3.0 or later** - cosign v2 reports
+            `no signatures found`, because signatures use the Sigstore bundle format.
+
+            ```bash
+            cosign verify \
+              --certificate-identity-regexp 'https://github.com/purelb/k8gobgp/.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ghcr.io/purelb/k8gobgp:${{ env.VERSION }}
+            ```
           files: |
             dist/install.yaml
             dist/crds.yaml
