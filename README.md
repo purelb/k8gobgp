@@ -45,6 +45,20 @@ kubectl apply -f https://github.com/purelb/k8gobgp/releases/latest/download/rbac
 kubectl apply -f https://github.com/purelb/k8gobgp/releases/latest/download/daemonset.yaml
 ```
 
+### Verifying Releases
+
+Container images are signed with [cosign](https://github.com/sigstore/cosign).
+Verification requires **cosign v3.0 or later**; cosign v2 reports `no signatures
+found`, because signatures are stored in the Sigstore bundle format rather than
+the legacy `.sig` tag.
+
+```bash
+cosign verify \
+  --certificate-identity-regexp 'https://github.com/purelb/k8gobgp/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/purelb/k8gobgp:<version>
+```
+
 ### From Source
 
 ```bash
