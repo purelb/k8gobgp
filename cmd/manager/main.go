@@ -23,6 +23,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"go.uber.org/zap/zapcore"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -61,8 +62,11 @@ func main() {
 	flag.DurationVar(&metricsPollInterval, "metrics-poll-interval", 15*time.Second, "Interval for polling BGP stats from gobgpd (minimum 15s).")
 	flag.BoolVar(&enablePerNeighborMetrics, "enable-per-neighbor-metrics", false, "Enable per-neighbor route metrics, which multiply by address family. Per-neighbor session state is always exported and is not affected by this flag.")
 	flag.IntVar(&maxNeighborsForMetrics, "max-neighbors-metrics", 200, "Maximum number of neighbors to export per-neighbor metrics for; 0 means unlimited. Neighbors beyond the limit are reported by k8gobgp_neighbor_metrics_truncated.")
+	// Stack traces on every Error entry bury routine retried failures, such as
+	// controller-runtime retrying an informer while the apiserver restarts.
 	opts := zap.Options{
-		Development: true,
+		Development:     true,
+		StacktraceLevel: zapcore.PanicLevel,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
