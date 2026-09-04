@@ -59,6 +59,15 @@ cosign verify \
   ghcr.io/purelb/k8gobgp:<version>
 ```
 
+Releases also carry an SPDX SBOM attestation, which can be verified with:
+
+```bash
+cosign verify-attestation --type spdxjson \
+  --certificate-identity-regexp 'https://github.com/purelb/k8gobgp/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/purelb/k8gobgp:<version>
+```
+
 ### From Source
 
 ```bash
