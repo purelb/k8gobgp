@@ -2,9 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [main, feature/*]
+    # All branches. The previous [main, feature/*] list meant a push to any
+    # other prefix - fix/, chore/, deps/ - ran nothing at all, so the first
+    # signal arrived only when the PR was opened. Branches are cheap to run and
+    # the feedback is worth more on the branch than at review time.
+    branches: ['**']
   pull_request:
     branches: [main]
+
+# Running on every branch means rapid successive pushes queue redundant runs, so
+# supersede them. Never cancel on main: those runs gate the ruleset and a
+# cancelled one reads as a failure.
+#
+# This does not dedupe the push and pull_request runs for the same commit -
+# their github.ref differs, so they land in different groups. That duplication
+# is the price of getting a signal before the PR exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   GO_VERSION: "1.25"
