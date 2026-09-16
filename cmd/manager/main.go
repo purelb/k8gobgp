@@ -168,8 +168,18 @@ func main() {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("nodestatus-writer", nodeStatusReporter.ReadyzCheck); err != nil {
-		setupLog.Error(err, "unable to set up node status readiness check")
+	// Readiness answers one question: are both processes running? kubelet makes a
+	// single call to /readyz, which controller-runtime serves as an aggregate of
+	// every registered check, and this one reaches gobgpd over gRPC on its
+	// behalf. Nothing probes gobgpd's port directly.
+	//
+	// This replaces the "nodestatus-writer" check, which gated pod readiness on
+	// BGPNodeStatus write staleness - so a slow apiserver took a pod out of
+	// service while its BGP was perfectly healthy. Staleness is worth alerting
+	// on, not de-scheduling for; k8gobgp_nodestatus_last_successful_write_timestamp
+	// carries it.
+	if err := mgr.AddReadyzCheck("gobgpd", controllers.NewGoBGPDChecker(gobgpEndpoint).Check); err != nil {
+		setupLog.Error(err, "unable to set up gobgpd readiness check")
 		os.Exit(1)
 	}
 

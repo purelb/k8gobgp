@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/purelb/k8gobgp)](https://goreportcard.com/report/github.com/purelb/k8gobgp)
 
-A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.1.2) for enhanced Linux kernel integration.
+A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.3.0) for enhanced Linux kernel integration.
 
 ## Features
 
@@ -469,7 +469,20 @@ The manager supports the following command-line flags:
 
 ## Metrics
 
-The controller exposes Prometheus metrics on `:7473/metrics`:
+A k8gobgp pod runs two processes and each exposes its own metrics on its own
+port. They are not merged or proxied — two subsystems, two scrape targets. See
+[docs/metrics.md](docs/metrics.md) for the full reference.
+
+| Endpoint | Port | Namespace | Emitted by |
+|---|---|---|---|
+| Controller | `7473` `/metrics` | `k8gobgp_*` | the k8gobgp manager |
+| BGP daemon | `7475` `/metrics` | `bgp_*`, `fsm_loop_*` | gobgp-netlink (`gobgpd`) |
+
+Both are unauthenticated HTTP, and the pod runs with `hostNetwork: true`, so
+both are reachable at `<nodeIP>:<port>` from anything that can route to the node
+— including the BGP fabric. NetworkPolicy does not cover host-namespace ports.
+
+The controller's own metrics on `:7473/metrics`:
 
 ### Controller Metrics
 
@@ -750,5 +763,5 @@ limitations under the License.
 ## Acknowledgments
 
 - [GoBGP](https://github.com/osrg/gobgp) - The BGP implementation
-- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.1.2 - Enhanced GoBGP fork with netlink integration
+- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.3.0 - Enhanced GoBGP fork with netlink integration
 - [PureLB](https://purelb.io) - Kubernetes load balancer project

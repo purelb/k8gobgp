@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net/http"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -89,21 +88,13 @@ type BGPNodeStatusReporter struct {
 	consecutiveFailures int
 }
 
-// ReadyzCheck returns an error if the reporter has not successfully written
-// a status within 3 * heartbeatSeconds. This can be registered as a readiness
-// check so the DaemonSet's readiness probe detects reporter failures.
-func (r *BGPNodeStatusReporter) ReadyzCheck(_ *http.Request) error {
-	if r.lastWriteTime.IsZero() {
-		// Reporter hasn't written yet — give it time to start
-		return nil
-	}
-	heartbeat := time.Duration(r.heartbeatSeconds.Load()) * time.Second
-	threshold := 3 * heartbeat
-	if time.Since(r.lastWriteTime) > threshold {
-		return fmt.Errorf("BGPNodeStatus not written for %v (threshold %v)", time.Since(r.lastWriteTime).Round(time.Second), threshold)
-	}
-	return nil
-}
+// Reporter staleness is no longer a readiness check. It used to be registered as
+// one, which meant a slow apiserver took the pod out of service while its BGP was
+// healthy - conflating "this reporter is behind" with "this pod cannot do its
+// job". The signal still exists, as
+// k8gobgp_nodestatus_last_successful_write_timestamp_seconds; alert on it with
+// `time() - <metric> > 300`. Readiness now reports only whether the manager and
+// gobgpd are both running - see GoBGPDChecker.
 
 // UpdateConfig is called by the reconciler to pass configuration to the reporter.
 func (r *BGPNodeStatusReporter) UpdateConfig(enabled bool, heartbeat int32, routerID, routerIDSource string, asn uint32) {
@@ -448,10 +439,10 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 				continue
 			}
 			for _, path := range resp.Destination.Paths {
-				if path.GetIsNetlink() {
+				if path.GetNetlink().GetIsNetlink() {
 					importedAddresses = append(importedAddresses, bgpv1.ImportedAddress{
 						Address:   resp.Destination.Prefix,
-						Interface: path.GetNetlinkIfName(),
+						Interface: path.GetNetlink().GetIfName(),
 						InRIB:     true,
 					})
 				}
@@ -540,10 +531,10 @@ func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient 
 					continue
 				}
 
-				// Netlink-imported routes have IsNetlink=true, Best=false,
+				// Netlink-imported routes have Netlink.IsNetlink=true, Best=false,
 				// and NeighborIp="0.0.0.1" (GoBGP synthetic peer). Use
 				// IsNetlink as the primary classifier, not Best or NeighborIp.
-				if path.GetIsNetlink() {
+				if path.GetNetlink().GetIsNetlink() {
 					localRoutes = append(localRoutes, bgpv1.RIBRoute{
 						Prefix:  resp.Destination.Prefix,
 						NextHop: "0.0.0.0",

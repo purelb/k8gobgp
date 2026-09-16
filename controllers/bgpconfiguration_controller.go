@@ -215,10 +215,19 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if dc.NeighborInterface == "" && dc.NeighborAddress != cc.NeighborAddress {
 		return false
 	}
+	// AuthPassword is deliberately not compared. ListPeer redacts it to "" before
+	// the peer leaves the server, so the desired value can never match what comes
+	// back and asserting on it means an UpdatePeer every reconcile for every
+	// authenticated peer. A password change still reaches gobgpd: the Secret is
+	// watched, and a change there re-enters Reconcile, which sends the current
+	// value on whatever UpdatePeer the rest of this comparison produces. The gap
+	// is a password-only edit with nothing else changed - see the TODO below.
+	//
+	// TODO: track the resolved password's hash in the reconciler so a
+	// password-only change is detected without comparing the secret itself.
 	if dc.PeerAsn != cc.PeerAsn ||
 		dc.LocalAsn != cc.LocalAsn ||
 		dc.Description != cc.Description ||
-		dc.AuthPassword != cc.AuthPassword ||
 		dc.PeerGroup != cc.PeerGroup ||
 		dc.AdminDown != cc.AdminDown ||
 		dc.NeighborInterface != cc.NeighborInterface ||
@@ -1763,7 +1772,7 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 		// Handle VRF netlink import
 		if vrf.NetlinkImport != nil {
 			desiredImportEnabled := vrf.NetlinkImport.Enabled
-			currentImportEnabled := current.NetlinkImportEnabled
+			currentImportEnabled := current.GetNetlink().GetImportEnabled()
 
 			if desiredImportEnabled != currentImportEnabled {
 				if desiredImportEnabled {
@@ -1797,11 +1806,11 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 				// Check if interfaces changed. slices.Equal, not DeepEqual: see
 				// the note in reconcileNetlink - nil and empty are the same state
 				// here, and DeepEqual churns the importer if they differ.
-				if !slices.Equal(vrf.NetlinkImport.InterfaceList, current.NetlinkImportInterfaces) {
+				if !slices.Equal(vrf.NetlinkImport.InterfaceList, current.GetNetlink().GetImportInterfaces()) {
 					// Re-enable with new interfaces (disable first, then enable)
 					log.Info("Updating VRF netlink import interfaces",
 						"vrf", vrf.Name,
-						"currentInterfaces", current.NetlinkImportInterfaces,
+						"currentInterfaces", current.GetNetlink().GetImportInterfaces(),
 						"desiredInterfaces", vrf.NetlinkImport.InterfaceList)
 
 					_, err := apiClient.DisableVrfNetlinkImport(ctx, &gobgpapi.DisableVrfNetlinkImportRequest{

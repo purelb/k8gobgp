@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 	bgpv1 "github.com/purelb/k8gobgp/api/v1"
@@ -62,8 +63,20 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 		clusterID = "invalid IP"
 	}
 
+	// ListPeer redacts the TCP-MD5 password before the peer leaves the server
+	// (pkg/server/server.go, "Redact here, not in the converter"). Added in the
+	// fork after v1.1.2, so this is new as of the v1.3.0 bump: a comparator that
+	// asserts on AuthPassword is now permanently unequal for every authenticated
+	// peer. Copy the Conf so the redaction does not mutate the caller's peer.
+	// proto.CloneOf, not a struct copy: a protobuf message embeds a MessageState
+	// containing a mutex, so copying it by value trips copylocks.
+	conf := proto.CloneOf(sent.GetConf())
+	if conf != nil {
+		conf.AuthPassword = ""
+	}
+
 	echo := &gobgpapi.Peer{
-		Conf:     sent.GetConf(),
+		Conf:     conf,
 		AfiSafis: sent.GetAfiSafis(),
 
 		// Always populated, even when the caller sent nothing.
@@ -253,6 +266,19 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 			name: "unnumbered neighbor",
 			neighbor: bgpv1.Neighbor{
 				Config: bgpv1.NeighborConfig{NeighborInterface: "eth0", PeerAsn: 64513},
+			},
+		},
+		{
+			// ListPeer redacts the password, so the comparator can never see it
+			// come back. Asserting on it means an UpdatePeer every reconcile for
+			// every authenticated peer.
+			name: "MD5-authenticated neighbor",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{
+					NeighborAddress: "10.0.0.8",
+					PeerAsn:         64513,
+					AuthPassword:    "correct horse battery staple",
+				},
 			},
 		},
 	}

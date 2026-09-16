@@ -1010,14 +1010,19 @@ func TestPeerConfigEqual(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:    "different AuthPassword",
+			// Was expected: false. ListPeer redacts AuthPassword to "" before the
+			// peer leaves the server, so "the passwords differ" is indistinguishable
+			// from "gobgpd redacted it" - and treating that as a difference means an
+			// UpdatePeer every reconcile for every authenticated peer. A password
+			// change still reaches gobgpd via the Secret watch re-entering Reconcile.
+			name:    "differing AuthPassword is ignored: gobgpd redacts it",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
-				p.Conf.AuthPassword = "different"
+				p.Conf.AuthPassword = ""
 				return p
 			}(),
-			expected: false,
+			expected: true,
 		},
 		{
 			name:    "different AfiSafi count",
