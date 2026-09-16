@@ -8,7 +8,7 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/stretchr/testify v1.12.1
 	github.com/vishvananda/netlink v1.3.1
-	go.uber.org/zap v1.27.0
+	go.uber.org/zap v1.28.0
 	google.golang.org/grpc v1.83.2
 	k8s.io/api v0.33.0
 	k8s.io/apimachinery v0.33.3
