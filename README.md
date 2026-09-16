@@ -463,9 +463,9 @@ The manager supports the following command-line flags:
 | `--metrics-bind-address` | `:7473` | Address for the metrics endpoint |
 | `--health-probe-bind-address` | `:7474` | Address for health probes |
 | `--gobgp-endpoint` | (env: `GOBGP_ENDPOINT`) | GoBGP gRPC endpoint (e.g., `localhost:50051` or `unix:///var/run/gobgp/gobgp.sock`) |
-| `--metrics-poll-interval` | `15s` | Interval for polling BGP stats from gobgpd (minimum 15s) |
-| `--enable-per-neighbor-metrics` | `false` | Enable high-cardinality per-neighbor route metrics |
-| `--max-neighbors-metrics` | `200` | Maximum neighbors for per-neighbor metrics (0=unlimited) |
+| `--metrics-poll-interval` | `15s` | Interval for polling RIB size from gobgpd (minimum 15s). The DaemonSet sets `60s`: gobgpd's own collector is cached at 15s and this loop takes the same BGP lock |
+| `--enable-per-neighbor-metrics` | — | **Deprecated, ignored.** gobgp-netlink emits per-peer metrics natively |
+| `--max-neighbors-metrics` | — | **Deprecated, ignored.** Bound per-peer cardinality at scrape time; see [docs/metrics.md](docs/metrics.md) |
 
 ## Metrics
 
@@ -484,121 +484,69 @@ both are reachable at `<nodeIP>:<port>` from anything that can route to the node
 
 The controller's own metrics on `:7473/metrics`:
 
-### Controller Metrics
+### Controller metrics (`:7473`)
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_reconcile_total` | Counter | Total reconciliations by result |
-| `k8gobgp_reconcile_duration_seconds` | Histogram | Reconciliation duration |
-| `k8gobgp_neighbors_configured` | Gauge | Neighbors this config asks for on this node, after nodeSelector filtering |
-| `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected), by `endpoint` |
-| `k8gobgp_gobgpd_connection_errors_total` | Counter | Failed connection attempts to gobgpd, by `endpoint` |
-| `k8gobgp_configuration_ready` | Gauge | Configuration ready status (1=ready) |
-| `k8gobgp_peer_groups_configured` | Gauge | Peer groups configured on this node, after nodeSelector filtering |
-| `k8gobgp_dynamic_neighbors_configured` | Gauge | Dynamic neighbors configured on this node, after peer-group filtering |
-| `k8gobgp_vrfs_configured` | Gauge | Number of VRFs configured |
-| `k8gobgp_policies_configured` | Gauge | Number of policies configured |
-| `k8gobgp_defined_sets_configured` | Gauge | Number of defined sets configured |
-| `k8gobgp_cleanup_retries_total` | Counter | Cleanup retries during deletion |
-| `k8gobgp_cleanup_duration_seconds` | Histogram | Cleanup operation duration |
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `k8gobgp_reconcile_total` | Counter | `name`, `namespace`, `result` | Reconciliations. `result` is `success`, `failed`, `validation_failed`, `connection_failed` or `duplicate_ignored` — note the last is normal behaviour, not a failure |
+| `k8gobgp_reconcile_duration_seconds` | Histogram | `name`, `namespace` | Reconciliation duration |
+| `k8gobgp_configured_objects` | Gauge | `kind`, `name`, `namespace` | What the CR asks for on this node, after nodeSelector filtering. `kind` is `neighbor`, `peer_group`, `dynamic_neighbor`, `vrf`, `policy` or `defined_set` |
+| `k8gobgp_configuration_ready` | Gauge | `name`, `namespace` | 1 when the CR reconciled cleanly |
+| `k8gobgp_peer_apply_errors_total` | Counter | `key`, `op` | Failures applying a peer to gobgpd. The only signal for a peer gobgpd refused — such a peer never appears in `ListPeer`, so no `bgp_*` metric describes it |
+| `k8gobgp_gobgpd_connection_status` | Gauge | `endpoint` | 1 when gobgpd answered its last RPC. Driven by the readiness check |
+| `k8gobgp_gobgpd_connection_errors_total` | Counter | `endpoint` | Failed attempts to reach gobgpd |
+| `k8gobgp_cleanup_retries_total` | Counter | `name`, `namespace` | Retries during finalizer cleanup |
+| `k8gobgp_cleanup_duration_seconds` | Histogram | `name`, `namespace` | Cleanup duration |
+| `k8gobgp_rib_routes` | Gauge | `family` | Routes in the global RIB. **No gobgp-netlink equivalent** — its collectors are all per-peer and none calls `GetTable` |
+| `k8gobgp_metrics_collection_duration_seconds` | Histogram | — | Time to collect RIB stats |
+| `k8gobgp_metrics_collection_errors_total` | Counter | — | Collection failures |
+| `k8gobgp_router_id_resolution_total` | Counter | `result` | Router ID resolution attempts |
+| `k8gobgp_router_id_resolution_duration_seconds` | Histogram | — | Resolution duration. Buckets top out at 2.048s |
+| `k8gobgp_router_id_info` | Gauge | `router_id`, `source`, `node`, `asn`, `name`, `namespace` | Always 1; read the labels |
+| `k8gobgp_nodestatus_write_total` | Counter | `result` | BGPNodeStatus writes |
+| `k8gobgp_nodestatus_collection_duration_seconds` | Histogram | — | Time to collect node status |
+| `k8gobgp_nodestatus_last_successful_write_timestamp_seconds` | Gauge | — | Alert on staleness, do not gate readiness on it |
+| `k8gobgp_nodestatus_object_size_bytes` | Gauge | — | Approximate serialized size |
 
-### Router ID Resolution Metrics
+Also on `:7473`: controller-runtime's `controller_runtime_*`, `workqueue_*` and
+`rest_client_*`, plus Go runtime and process metrics.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_router_id_resolution_total` | Counter | Resolution attempts by result (success/failure) |
-| `k8gobgp_router_id_resolution_duration_seconds` | Histogram | Time to resolve router ID |
-| `k8gobgp_router_id_source` | Gauge | Active resolution source (`explicit`/`template`/`node-ipv4`/`hash-from-node-name`) |
-| `k8gobgp_router_id_info` | Gauge | Router ID details, one series per BGPConfiguration (labels: `router_id`, `source`, `node`, `asn`, `name`, `namespace`) |
+### BGP daemon metrics (`:7475`)
 
-### BGP Stats Metrics (from periodic polling)
+72 families covering session state, routes, BFD, kernel FIB programming and loop
+timing. See [docs/metrics.md](docs/metrics.md) for the full list, the label
+traps, ready-made queries and a scrape-time keep-list — per-peer cardinality is
+`29 + 3F` series without BFD and `33 + 3F` with, where `F` is the number of
+enabled address families, and gobgp-netlink applies no cap of its own.
 
-These metrics are collected every `--metrics-poll-interval` (default 15s) directly from gobgpd.
+### Migrating from the previous metric set
 
-Collecting `k8gobgp_routes_advertised` requires gobgpd to evaluate export policy
-against the local RIB for each neighbor, so the cost of a poll grows with both
-RIB size and neighbor count. This happens on every poll regardless of
-`--enable-per-neighbor-metrics`, because the metric is always exported. Watch
-`k8gobgp_metrics_collection_duration_seconds` and raise `--metrics-poll-interval`
-if collection is expensive on a large RIB; the collector also logs a
-"Slow metrics collection" line when a cycle exceeds 5s, and skips a cycle
-entirely if the previous one is still running (`k8gobgp_metrics_collection_skipped_total`).
+Twelve `k8gobgp_*` metrics were removed because gobgp-netlink emits the same
+data natively, from the daemon that owns it. The replacements are **not** a
+straight rename — `neighbor=` becomes `peer=`, `state=established` becomes
+`session_state=SESSION_STATE_ESTABLISHED`, and `family=ipv4_unicast` becomes
+`route_family=ipv4-unicast` with the separator flipped, which means
+`k8gobgp_rib_routes` and `bgp_routes_*` cannot be joined without relabeling.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_neighbors` | Gauge | Neighbors on this node by FSM state (label: `state`). All seven states are always present, so an empty state reads `0` rather than disappearing |
-| `k8gobgp_rib_routes` | Gauge | Routes in RIB by address family (label: `family`) |
-| `k8gobgp_routes_received` | Gauge | Total routes received from all neighbors |
-| `k8gobgp_routes_accepted` | Gauge | Total routes accepted from all neighbors |
-| `k8gobgp_routes_advertised` | Gauge | Total routes advertised to all neighbors |
+[docs/metrics.md](docs/metrics.md) carries the full mapping. The short version:
 
-`state` is one of `idle`, `connect`, `active`, `opensent`, `openconfirm`,
-`established`, `unknown`. The per-state counts always sum to the neighbor total:
+| Removed | Replacement |
+|---|---|
+| `k8gobgp_neighbors{state}` | `count by (instance, session_state) (bgp_peer_state)` |
+| `k8gobgp_neighbor_state` | `bgp_peer_state` |
+| `k8gobgp_neighbor_session_flaps_total` | `delta(bgp_peer_flop_count[15m])` — a gauge, so `delta` not `increase` |
+| `k8gobgp_neighbor_session_established_timestamp_seconds` | `bgp_peer_established_timestamp_seconds`, gated on `bgp_peer_state` |
+| `k8gobgp_neighbor_routes_*` | `bgp_routes_*{peer, route_family}` |
+| `k8gobgp_routes_*` | `sum by (instance) (bgp_routes_*)` |
+| `k8gobgp_{neighbors,peer_groups,...}_configured` | `k8gobgp_configured_objects{kind="..."}` |
+| `k8gobgp_router_id_source` | `count by (source) (k8gobgp_router_id_info)` |
 
-```promql
-sum without(state) (k8gobgp_neighbors)          # total neighbors on this node
-k8gobgp_neighbors{state="established"}          # sessions that are up
-```
+`--enable-per-neighbor-metrics` and `--max-neighbors-metrics` are accepted and
+ignored; they warn on use and will be removed. Bound per-peer cardinality at
+scrape time instead.
 
-### Per-Neighbor Metrics
-
-All per-neighbor metrics are limited to `--max-neighbors-metrics` neighbors
-(default 200; `0` means unlimited). Neighbors beyond the limit are selected
-deterministically by sorted key, and the number omitted is reported so they are
-not a silent blind spot.
-
-The `neighbor` label is the neighbor's address, or `iface:<name>` for
-unnumbered (interface-based) peers.
-
-Always exported — one series per neighbor:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_neighbor_state` | Gauge | Each neighbor's current FSM state (labels: `neighbor`, `state`; value is always 1) |
-| `k8gobgp_neighbor_session_flaps_total` | Counter | Session flaps per neighbor, as counted by gobgpd |
-| `k8gobgp_neighbor_session_established_timestamp_seconds` | Gauge | When the session came up. **Absent** while the session is down |
-| `k8gobgp_neighbor_metrics_truncated` | Gauge | Neighbors omitted by the cardinality limit |
-
-Opt-in with `--enable-per-neighbor-metrics`, because these multiply by address
-family — three metrics become three series per family per neighbor:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_neighbor_routes_received` | Gauge | Routes received by neighbor and family |
-| `k8gobgp_neighbor_routes_accepted` | Gauge | Routes accepted by neighbor and family |
-| `k8gobgp_neighbor_routes_advertised` | Gauge | Routes advertised by neighbor and family |
-
-Useful queries:
-
-```promql
-k8gobgp_neighbor_state{state="established"}                    # which peers are up
-k8gobgp_neighbor_state{state=~"active|connect|opensent"}       # peers stuck mid-handshake
-increase(k8gobgp_neighbor_session_flaps_total[15m]) > 2        # flapping peers
-k8gobgp_neighbor_metrics_truncated > 0                         # peers not being reported
-```
-
-### BGPNodeStatus Reporter Metrics
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_nodestatus_write_total` | Counter | Status write attempts by result (success/error/skipped) |
-| `k8gobgp_nodestatus_collection_duration_seconds` | Histogram | Time to collect node status from gobgpd and netlink |
-| `k8gobgp_nodestatus_last_successful_write_timestamp` | Gauge | Unix timestamp of last successful write (for staleness alerts) |
-| `k8gobgp_nodestatus_object_size_bytes` | Gauge | Approximate BGPNodeStatus object size |
-
-Example staleness alert:
-```
-time() - k8gobgp_nodestatus_last_successful_write_timestamp > 300
-```
-
-### Metrics Collection Health
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_metrics_collection_duration_seconds` | Histogram | Time to collect BGP stats |
-| `k8gobgp_metrics_collection_errors_total` | Counter | Collection errors |
-| `k8gobgp_metrics_collection_skipped_total` | Counter | Collections skipped (previous still running) |
-| `k8gobgp_metrics_cardinality_limit_hit_total` | Counter | Poll cycles in which the per-neighbor limit was hit. Increments once per cycle while truncating, so it grows steadily rather than indicating severity — alert on `k8gobgp_neighbor_metrics_truncated` instead, which reports how many neighbors are actually missing |
+Sample alert rules, including the queries above:
+[docs/alerting/k8gobgp-alerts.yaml](docs/alerting/k8gobgp-alerts.yaml).
 
 ## Development
 

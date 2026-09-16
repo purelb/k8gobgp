@@ -60,8 +60,13 @@ func main() {
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":7474", "The address the probe endpoint binds to.")
 	flag.StringVar(&gobgpEndpoint, "gobgp-endpoint", "", "The GoBGP gRPC endpoint (e.g., localhost:50051 or unix:///var/run/gobgp/gobgp.sock). Can also be set via GOBGP_ENDPOINT env var.")
 	flag.DurationVar(&metricsPollInterval, "metrics-poll-interval", 15*time.Second, "Interval for polling BGP stats from gobgpd (minimum 15s).")
-	flag.BoolVar(&enablePerNeighborMetrics, "enable-per-neighbor-metrics", false, "Enable per-neighbor route metrics, which multiply by address family. Per-neighbor session state is always exported and is not affected by this flag.")
-	flag.IntVar(&maxNeighborsForMetrics, "max-neighbors-metrics", 200, "Maximum number of neighbors to export per-neighbor metrics for; 0 means unlimited. Neighbors beyond the limit are reported by k8gobgp_neighbor_metrics_truncated.")
+	// Accepted and ignored. The per-neighbor metrics these governed are emitted
+	// by gobgp-netlink now, so there is nothing left to enable or cap here - but
+	// Go's flag package exits 2 on an unknown flag, so simply deleting them would
+	// crashloop any deployment that passes them in args:. They warn on use and
+	// are removed in a later release.
+	flag.BoolVar(&enablePerNeighborMetrics, "enable-per-neighbor-metrics", false, "Deprecated, ignored: gobgp-netlink emits per-peer metrics natively. See docs/metrics.md.")
+	flag.IntVar(&maxNeighborsForMetrics, "max-neighbors-metrics", 0, "Deprecated, ignored: bound per-peer cardinality at scrape time instead. See docs/metrics.md.")
 	// Stack traces on every Error entry bury routine retried failures, such as
 	// controller-runtime retrying an informer while the apiserver restarts.
 	opts := zap.Options{
@@ -72,6 +77,16 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Say so rather than ignoring them silently: an operator who set these is
+	// expecting an effect they will not get.
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "enable-per-neighbor-metrics", "max-neighbors-metrics":
+			setupLog.Info("flag is deprecated and ignored; gobgp-netlink emits per-peer metrics natively, bound them at scrape time instead",
+				"flag", f.Name, "value", f.Value.String())
+		}
+	})
 
 	// Enforce minimum poll interval to prevent excessive API calls to gobgpd
 	const minPollInterval = 15 * time.Second
@@ -144,9 +159,7 @@ func main() {
 		Log:           ctrl.Log.WithName("controllers").WithName("BGPMetrics"),
 		GoBGPEndpoint: gobgpEndpoint,
 		Config: controllers.MetricsConfig{
-			PollInterval:             metricsPollInterval,
-			EnablePerNeighborMetrics: enablePerNeighborMetrics,
-			MaxNeighborsForMetrics:   maxNeighborsForMetrics,
+			PollInterval: metricsPollInterval,
 		},
 	}
 	if err := mgr.Add(metricsCollector); err != nil {

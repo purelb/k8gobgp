@@ -52,10 +52,11 @@ const (
 // GoBGPNodeStatusClient extends GoBGPStatsClient with additional methods needed by the reporter.
 type GoBGPNodeStatusClient interface {
 	GoBGPStatsClient
+	// Declared here rather than inherited: the metrics poll loop no longer calls
+	// ListPeer, but the CR status still reports per-neighbor session state.
+	ListPeer(ctx context.Context, in *gobgpapi.ListPeerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPeerResponse], error)
 	ListPath(ctx context.Context, in *gobgpapi.ListPathRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPathResponse], error)
 	GetNetlink(ctx context.Context, in *gobgpapi.GetNetlinkRequest, opts ...grpc.CallOption) (*gobgpapi.GetNetlinkResponse, error)
-	GetNetlinkImportStats(ctx context.Context, in *gobgpapi.GetNetlinkImportStatsRequest, opts ...grpc.CallOption) (*gobgpapi.GetNetlinkImportStatsResponse, error)
-	GetNetlinkExportStats(ctx context.Context, in *gobgpapi.GetNetlinkExportStatsRequest, opts ...grpc.CallOption) (*gobgpapi.GetNetlinkExportStatsResponse, error)
 	ListNetlinkExportRules(ctx context.Context, in *gobgpapi.ListNetlinkExportRulesRequest, opts ...grpc.CallOption) (*gobgpapi.ListNetlinkExportRulesResponse, error)
 	ListNetlinkExport(ctx context.Context, in *gobgpapi.ListNetlinkExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListNetlinkExportResponse], error)
 	ListVrf(ctx context.Context, in *gobgpapi.ListVrfRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListVrfResponse], error)

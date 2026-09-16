@@ -652,11 +652,13 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	bgpConfig.Status.LastReconcileTime = &now
 
 	// Update configuration metrics (NeighborCount is set in reconcileNeighbors with post-filter count)
-	UpdateNeighborsConfigured(bgpConfig.Name, bgpConfig.Namespace, bgpConfig.Status.NeighborCount)
-	UpdatePeerGroupMetrics(bgpConfig.Name, bgpConfig.Namespace, len(desiredPeerGroups))
-	UpdateDynamicNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, len(desiredDynNeighbors))
-	UpdateVrfMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.Vrfs))
-	UpdatePolicyMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.PolicyDefinitions), len(bgpConfig.Spec.DefinedSets))
+	n, ns := bgpConfig.Name, bgpConfig.Namespace
+	UpdateConfiguredObjects(KindNeighbor, n, ns, bgpConfig.Status.NeighborCount)
+	UpdateConfiguredObjects(KindPeerGroup, n, ns, len(desiredPeerGroups))
+	UpdateConfiguredObjects(KindDynamicNeighbor, n, ns, len(desiredDynNeighbors))
+	UpdateConfiguredObjects(KindVrf, n, ns, len(bgpConfig.Spec.Vrfs))
+	UpdateConfiguredObjects(KindPolicy, n, ns, len(bgpConfig.Spec.PolicyDefinitions))
+	UpdateConfiguredObjects(KindDefinedSet, n, ns, len(bgpConfig.Spec.DefinedSets))
 
 	if reconcileErr != nil {
 		log.Error(reconcileErr, "Reconciliation failed")
@@ -1123,7 +1125,6 @@ func (r *BGPConfigurationReconciler) resolveEffectiveRouterID(ctx context.Contex
 
 	// Record metrics
 	RecordRouterIDResolution("success", duration)
-	UpdateRouterIDSource(resolution.Source)
 	UpdateRouterIDInfo(nil, routerIDInfoLabels(bgpConfig, resolution.RouterID, resolution.Source, r.NodeName))
 
 	// Cache in-memory for immutability (per-config, per-pod)
@@ -1453,12 +1454,18 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 			log.Info("Adding peer group", "name", name)
 			if _, err := apiClient.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{PeerGroup: desired}); err != nil {
 				log.Error(err, "Failed to add peer group", "name", name)
+				RecordPeerApplyError(name, "add_group")
+				r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerGroupApplyFailed",
+					"Failed to add peer group %s: %v", name, err)
 			}
 		} else {
 			if !peerGroupConfigEqual(desired, current) {
 				log.Info("Updating peer group", "name", name)
 				if _, err := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: desired}); err != nil {
 					log.Error(err, "Failed to update peer group", "name", name)
+					RecordPeerApplyError(name, "update_group")
+					r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerGroupApplyFailed",
+						"Failed to update peer group %s: %v", name, err)
 				}
 			}
 		}
@@ -1562,13 +1569,22 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 		if current, ok := currentNeighbors[key]; !ok {
 			log.Info("Adding neighbor", "key", key)
 			if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired}); err != nil {
+				// Counted, not just logged: gobgpd refusing a peer leaves no
+				// trace in its own metrics - the neighbor is simply absent,
+				// which looks the same as never having been configured.
 				log.Error(err, "Failed to add neighbor", "key", key)
+				RecordPeerApplyError(key, "add")
+				r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerApplyFailed",
+					"Failed to add neighbor %s: %v", key, err)
 			}
 		} else {
 			if !peerConfigEqual(desired, current) {
 				log.Info("Updating neighbor", "key", key)
 				if _, err := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: desired}); err != nil {
 					log.Error(err, "Failed to update neighbor", "key", key)
+					RecordPeerApplyError(key, "update")
+					r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerApplyFailed",
+						"Failed to update neighbor %s: %v", key, err)
 				}
 			}
 		}
