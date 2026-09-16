@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -228,7 +229,7 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if !afiSafisConfigEqual(desired.AfiSafis, current.AfiSafis) {
 		return false
 	}
-	if !reflect.DeepEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+	if !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
 		return false
 	}
 	if !timersConfigEqual(desired.Timers, current.Timers) {
@@ -237,13 +238,13 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if !transportConfigEqual(desired.Transport, current.Transport) {
 		return false
 	}
-	if !reflect.DeepEqual(desired.GracefulRestart, current.GracefulRestart) {
+	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
 		return false
 	}
-	if !reflect.DeepEqual(desired.RouteReflector, current.RouteReflector) {
+	if !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
 		return false
 	}
-	if !reflect.DeepEqual(desired.EbgpMultihop, current.EbgpMultihop) {
+	if !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
 		return false
 	}
 	return true
@@ -268,7 +269,7 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 	if !afiSafisConfigEqual(desired.AfiSafis, current.AfiSafis) {
 		return false
 	}
-	if !reflect.DeepEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+	if !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
 		return false
 	}
 	if !timersConfigEqual(desired.Timers, current.Timers) {
@@ -277,7 +278,7 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 	if !transportConfigEqual(desired.Transport, current.Transport) {
 		return false
 	}
-	if !reflect.DeepEqual(desired.GracefulRestart, current.GracefulRestart) {
+	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
 		return false
 	}
 	return true
@@ -310,29 +311,144 @@ func afiSafisConfigEqual(desired, current []*gobgpapi.AfiSafi) bool {
 	return true
 }
 
-// timersConfigEqual compares only Timers.Config, ignoring Timers.State.
+// The comparators below exist because gobgpd's ListPeer response is not the
+// request we sent it. NewPeerFromConfigStruct builds every sub-message
+// unconditionally, so a block the CR omits comes back non-nil and zero-valued;
+// several fields are resolved, defaulted or simply never populated. Comparing
+// whole messages - with reflect.DeepEqual or proto.Equal, which treat a typed
+// nil and an empty message as different - therefore returns false on every
+// reconcile and issues an UpdatePeer that changes nothing.
+//
+// Two rules keep these honest:
+//
+//  1. A nil sub-message compares equal to an empty one. The CR omitting a block
+//     and gobgpd reporting an empty one are the same state.
+//  2. Only fields that round-trip are compared. Where gobgpd resolves or derives
+//     a value the CR left unset, the CR is not expressing an opinion and we do
+//     not compare it. Each exclusion is justified at its site; none of them may
+//     be "it was easier".
+
+// timersConfigEqual compares the timer fields gobgpd echoes back.
+//
+// MinimumAdvertisementInterval is excluded: NewPeerFromConfigStruct never
+// populates it, so gobgpd reports 0 no matter what was configured. Comparing it
+// would make every reconcile issue an UpdatePeer. The cost is that changing only
+// that field is not detected as drift - it still applies on peer creation.
+// IdleHoldTimeAfterReset is excluded because gobgpd defaults it (to 30) and the
+// CRD has no field for it.
 func timersConfigEqual(desired, current *gobgpapi.Timers) bool {
-	if desired == nil && current == nil {
-		return true
-	}
-	if desired == nil || current == nil {
-		return false
-	}
-	return reflect.DeepEqual(desired.Config, current.Config)
+	d, c := desired.GetConfig(), current.GetConfig()
+	return d.GetConnectRetry() == c.GetConnectRetry() &&
+		d.GetHoldTime() == c.GetHoldTime() &&
+		d.GetKeepaliveInterval() == c.GetKeepaliveInterval()
 }
 
 // transportConfigEqual compares only the controller-managed Transport fields,
-// ignoring runtime fields like LocalPort, RemoteAddress, RemotePort, etc.
+// ignoring runtime fields like LocalPort, RemoteAddress, RemotePort, TcpMss.
+//
+// LocalAddress is compared only when the CR sets one. gobgpd reports
+// Transport.State.LocalAddress once a session is established, falling back to
+// the configured value, and renders an unset address as the string "invalid IP"
+// rather than "". An unconditional comparison is therefore unequal both before
+// establishment (""  vs "invalid IP") and after (""  vs the resolved address).
 func transportConfigEqual(desired, current *gobgpapi.Transport) bool {
-	if desired == nil && current == nil {
-		return true
-	}
-	if desired == nil || current == nil {
+	if desired.GetLocalAddress() != "" && desired.GetLocalAddress() != current.GetLocalAddress() {
 		return false
 	}
-	return desired.LocalAddress == current.LocalAddress &&
-		desired.PassiveMode == current.PassiveMode &&
-		desired.BindInterface == current.BindInterface
+	return desired.GetPassiveMode() == current.GetPassiveMode() &&
+		desired.GetBindInterface() == current.GetBindInterface()
+}
+
+// applyPolicyEqual compares the policy assignment fields that round-trip.
+//
+// Name and Direction are both excluded, and they are excluded for opposite
+// reasons: crdToAPIPolicyAssignment sets Name and never Direction, while
+// gobgpd's newApplyPolicyFromConfigStruct sets Direction and never Name. Neither
+// field can ever match, and the direction is already implied by which side of
+// the struct the assignment sits on.
+func applyPolicyEqual(desired, current *gobgpapi.ApplyPolicy) bool {
+	return policyAssignmentEqual(desired.GetImportPolicy(), current.GetImportPolicy()) &&
+		policyAssignmentEqual(desired.GetExportPolicy(), current.GetExportPolicy())
+}
+
+func policyAssignmentEqual(desired, current *gobgpapi.PolicyAssignment) bool {
+	if desired.GetDefaultAction() != current.GetDefaultAction() {
+		return false
+	}
+	dp, cp := desired.GetPolicies(), current.GetPolicies()
+	if len(dp) != len(cp) {
+		return false
+	}
+	for i := range dp {
+		if dp[i].GetName() != cp[i].GetName() {
+			return false
+		}
+	}
+	return true
+}
+
+// gracefulRestartEqual compares the three fields the CRD can express.
+//
+// gobgpd echoes nine, the rest sourced from GracefulRestart.State
+// (LocalRestarting, PeerRestartTime, PeerRestarting) or defaulted from its own
+// config (DeferralTime, NotificationEnabled, LonglivedEnabled). None of those
+// are ours to assert.
+func gracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
+	return desired.GetEnabled() == current.GetEnabled() &&
+		desired.GetRestartTime() == current.GetRestartTime() &&
+		desired.GetHelperOnly() == current.GetHelperOnly()
+}
+
+// routeReflectorEqual compares the route-reflector settings.
+//
+// RouteReflectorClusterId is compared only when the CR sets one. gobgpd reports
+// RouteReflector.State.RouteReflectorClusterId, which it derives from the router
+// ID when a client is configured without an explicit cluster ID, and which
+// renders as "invalid IP" when unset.
+func routeReflectorEqual(desired, current *gobgpapi.RouteReflector) bool {
+	if desired.GetRouteReflectorClusterId() != "" &&
+		desired.GetRouteReflectorClusterId() != current.GetRouteReflectorClusterId() {
+		return false
+	}
+	return desired.GetRouteReflectorClient() == current.GetRouteReflectorClient()
+}
+
+// ebgpMultihopEqual compares the eBGP multihop settings. Both fields round-trip
+// from gobgpd's config unchanged, so this one needs no exclusions - it exists to
+// get nil-versus-empty handling via the generated getters.
+func ebgpMultihopEqual(desired, current *gobgpapi.EbgpMultihop) bool {
+	return desired.GetEnabled() == current.GetEnabled() &&
+		desired.GetMultihopTtl() == current.GetMultihopTtl()
+}
+
+// definedSetEqual compares a defined set field by field.
+//
+// The whole-message comparison this replaces was unequal in two ways that had
+// nothing to do with the content: a CR list of [] is a non-nil empty slice where
+// gobgpd reports nil, and reflect.DeepEqual on a protobuf message also inspects
+// the unexported sizeCache and unknownFields, the latter populated whenever the
+// daemon sends a field this client does not know. Either one re-issues
+// AddDefinedSet(Replace: true) on every reconcile.
+func definedSetEqual(desired, current *gobgpapi.DefinedSet) bool {
+	if desired.GetDefinedType() != current.GetDefinedType() ||
+		desired.GetName() != current.GetName() {
+		return false
+	}
+	if !slices.Equal(desired.GetList(), current.GetList()) {
+		return false
+	}
+	dp, cp := desired.GetPrefixes(), current.GetPrefixes()
+	if len(dp) != len(cp) {
+		return false
+	}
+	for i := range dp {
+		if dp[i].GetIpPrefix() != cp[i].GetIpPrefix() ||
+			dp[i].GetMaskLengthMin() != cp[i].GetMaskLengthMin() ||
+			dp[i].GetMaskLengthMax() != cp[i].GetMaskLengthMax() {
+			return false
+		}
+	}
+	return true
 }
 
 // nodeMatchesSelector checks if this pod's node matches the given label selector.
@@ -1098,7 +1214,7 @@ func (r *BGPConfigurationReconciler) reconcileDefinedSets(ctx context.Context, a
 				log.Error(err, "Failed to add defined set", "name", name)
 			}
 		} else {
-			if !reflect.DeepEqual(desired, current) {
+			if !definedSetEqual(desired, current) {
 				log.Info("Updating defined set", "name", name)
 				if _, err := apiClient.AddDefinedSet(ctx, &gobgpapi.AddDefinedSetRequest{DefinedSet: desired, Replace: true}); err != nil {
 					log.Error(err, "Failed to update defined set", "name", name)
@@ -1475,7 +1591,17 @@ func (r *BGPConfigurationReconciler) reconcileNetlink(ctx context.Context, apiCl
 	if desiredImportEnabled != currentNetlink.ImportEnabled {
 		needsImportUpdate = true
 	}
-	if desiredImportEnabled && !reflect.DeepEqual(desiredInterfaces, currentNetlink.Interfaces) {
+	// slices.Equal, not reflect.DeepEqual: an interfaceList of [] in the CR is a
+	// non-nil empty slice while gobgpd reports nil, and DeepEqual calls those
+	// different - which disables and re-enables the importer on every reconcile.
+	if desiredImportEnabled && !slices.Equal(desiredInterfaces, currentNetlink.Interfaces) {
+		needsImportUpdate = true
+	}
+	// The VRF is part of the import configuration, and GetNetlink reports it, but
+	// it was fetched and discarded - so changing only netlinkImport.vrf in the CR
+	// was silently ignored. This is the inverse of the churn above: not an update
+	// that does nothing, but a change that never happens.
+	if desiredImportEnabled && desiredVrf != currentNetlink.Vrf {
 		needsImportUpdate = true
 	}
 
@@ -1513,6 +1639,15 @@ func (r *BGPConfigurationReconciler) reconcileNetlink(ctx context.Context, apiCl
 	}
 
 	// Check if we need to update netlink export configuration
+	//
+	// BLOCKED: dampeningInterval and routeProtocol drift cannot be detected.
+	// GetNetlinkResponse reports only ImportEnabled, ExportEnabled, Vrf,
+	// Interfaces and VrfImports, and ListNetlinkExportRules reports per-rule
+	// settings but not these two global ones - so there is nothing to compare a
+	// changed CR value against. Changing either alone is silently ignored until
+	// something else forces an update. Unblocked by adding them to
+	// GetNetlinkResponse in gobgp-netlink; comparing them before then would mean
+	// comparing against a zero value, which is a permanent update loop.
 	needsExportUpdate := false
 	if desiredExportEnabled != currentNetlink.ExportEnabled {
 		needsExportUpdate = true
@@ -1601,6 +1736,21 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 		currentVrfs[resp.Vrf.Name] = resp.Vrf
 	}
 
+	// Per-VRF export state, keyed by GoBGP VRF name. Without this the export
+	// branch below has nothing to compare against and re-issues
+	// EnableVrfNetlinkExport on every reconcile - an Info log and an RPC per VRF
+	// per cycle, forever.
+	currentVrfExports := make(map[string]*gobgpapi.ListNetlinkExportRulesResponse_VrfExportRule)
+	if rules, err := apiClient.ListNetlinkExportRules(ctx, &gobgpapi.ListNetlinkExportRulesRequest{}); err != nil {
+		// Not fatal: fall back to the previous unconditional behavior rather
+		// than failing the whole reconcile over a read-back.
+		log.V(1).Info("Failed to list netlink export rules; VRF export will be re-applied unconditionally", "error", err)
+	} else {
+		for _, vr := range rules.GetVrfRules() {
+			currentVrfExports[vr.GetGobgpVrf()] = vr
+		}
+	}
+
 	// Reconcile each VRF's netlink config
 	for _, vrf := range bgpConfig.Spec.Vrfs {
 		current := currentVrfs[vrf.Name]
@@ -1644,8 +1794,10 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 					log.Info("Disabled VRF netlink import", "vrf", vrf.Name)
 				}
 			} else if desiredImportEnabled {
-				// Check if interfaces changed
-				if !reflect.DeepEqual(vrf.NetlinkImport.InterfaceList, current.NetlinkImportInterfaces) {
+				// Check if interfaces changed. slices.Equal, not DeepEqual: see
+				// the note in reconcileNetlink - nil and empty are the same state
+				// here, and DeepEqual churns the importer if they differ.
+				if !slices.Equal(vrf.NetlinkImport.InterfaceList, current.NetlinkImportInterfaces) {
 					// Re-enable with new interfaces (disable first, then enable)
 					log.Info("Updating VRF netlink import interfaces",
 						"vrf", vrf.Name,
@@ -1674,11 +1826,12 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 			}
 		}
 
-		// Handle VRF netlink export
-		// Note: VRF struct doesn't expose NetlinkExportEnabled status currently,
-		// so we always attempt to enable if desired, or disable if not.
-		// The API calls are idempotent so this is safe.
+		// Handle VRF netlink export, against the read-back gathered above.
+		currentExport, exportPresent := currentVrfExports[vrf.Name]
 		if vrf.NetlinkExport != nil && vrf.NetlinkExport.Enabled {
+			if exportPresent && vrfNetlinkExportEqual(vrf.NetlinkExport, currentExport) {
+				continue
+			}
 			log.Info("Enabling VRF netlink export",
 				"vrf", vrf.Name,
 				"linuxVrf", vrf.NetlinkExport.LinuxVrf,
@@ -1693,7 +1846,7 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 				return err
 			}
 			log.V(1).Info("VRF netlink export enabled/updated", "vrf", vrf.Name)
-		} else if vrf.NetlinkExport != nil && !vrf.NetlinkExport.Enabled {
+		} else if vrf.NetlinkExport != nil && !vrf.NetlinkExport.Enabled && exportPresent {
 			log.Info("Disabling VRF netlink export", "vrf", vrf.Name)
 
 			_, err := apiClient.DisableVrfNetlinkExport(ctx, &gobgpapi.DisableVrfNetlinkExportRequest{
@@ -1710,6 +1863,38 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 	}
 
 	return nil
+}
+
+// vrfNetlinkExportEqual reports whether a VRF's desired export config already
+// matches what gobgpd has.
+//
+// Note the polarity flip: the request carries SkipNexthopValidation while the
+// read-back carries ValidateNexthop, and the CRD's ValidateNexthop defaults to
+// true when unset - so all three have to be normalized to the same sense before
+// they can be compared.
+//
+// LinuxVrf and LinuxTableId are compared only when the CR sets them: gobgpd
+// defaults LinuxVrf to the GoBGP VRF name and looks LinuxTableId up from the
+// Linux VRF, so an unset CR field is not an assertion that they are empty.
+func vrfNetlinkExportEqual(desired *bgpv1.VrfNetlinkExport, current *gobgpapi.ListNetlinkExportRulesResponse_VrfExportRule) bool {
+	if desired.LinuxVrf != "" && desired.LinuxVrf != current.GetLinuxVrf() {
+		return false
+	}
+	if desired.LinuxTableId != 0 && desired.LinuxTableId != current.GetLinuxTableId() {
+		return false
+	}
+	if desired.Metric != current.GetMetric() {
+		return false
+	}
+	validateNexthop := true // CRD default when unset
+	if desired.ValidateNexthop != nil {
+		validateNexthop = *desired.ValidateNexthop
+	}
+	if validateNexthop != current.GetValidateNexthop() {
+		return false
+	}
+	return slices.Equal(desired.CommunityList, current.GetCommunityList()) &&
+		slices.Equal(desired.LargeCommunityList, current.GetLargeCommunityList())
 }
 
 // crdToAPIVrfNetlinkExportConfig converts CRD VrfNetlinkExport to API VrfNetlinkExportConfig
@@ -1774,11 +1959,13 @@ func netlinkExportRulesMatch(current []*gobgpapi.ListNetlinkExportRulesResponse_
 			return false
 		}
 
-		// Compare community lists
-		if !reflect.DeepEqual(currentRule.CommunityList, desiredRule.CommunityList) {
+		// Compare community lists. slices.Equal, not DeepEqual: a rule with
+		// communityList: [] in the CR is non-nil empty where gobgpd reports nil,
+		// and DeepEqual would re-issue EnableNetlinkExport on every reconcile.
+		if !slices.Equal(currentRule.CommunityList, desiredRule.CommunityList) {
 			return false
 		}
-		if !reflect.DeepEqual(currentRule.LargeCommunityList, desiredRule.LargeCommunityList) {
+		if !slices.Equal(currentRule.LargeCommunityList, desiredRule.LargeCommunityList) {
 			return false
 		}
 

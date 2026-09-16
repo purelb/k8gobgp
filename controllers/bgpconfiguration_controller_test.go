@@ -959,9 +959,14 @@ func TestPeerConfigEqual(t *testing.T) {
 		expected bool
 	}{
 		{
-			name:     "identical configs",
+			// current is what gobgpd would actually report, not another copy of
+			// what we sent. Building both sides from basePeer() asserted a
+			// symmetry production does not have, which is why this test stayed
+			// green while UpdatePeer fired on every reconcile. See
+			// reconcile_idempotency_test.go for the full regression guard.
+			name:     "identical configs, as gobgpd reports them back",
 			desired:  basePeer(),
-			current:  basePeer(),
+			current:  gobgpdEcho(basePeer()),
 			expected: true,
 		},
 		{
@@ -1266,23 +1271,61 @@ func TestNodeCacheInvalidate(t *testing.T) {
 
 // --- transport/timer/afisafi comparison helper tests ---
 
+// Note the expectations that changed here: nil and empty used to compare
+// unequal, and that was the bug. The CRD omitting a block and gobgpd reporting
+// an empty one are the same state, and gobgpd reports one for every peer whether
+// or not we sent it - so "empty != nil" meant an UpdatePeer on every reconcile.
+
 func TestTransportConfigEqual(t *testing.T) {
 	assert.True(t, transportConfigEqual(nil, nil))
-	assert.False(t, transportConfigEqual(&gobgpapi.Transport{}, nil))
-	assert.False(t, transportConfigEqual(nil, &gobgpapi.Transport{}))
+	assert.True(t, transportConfigEqual(&gobgpapi.Transport{}, nil), "empty and nil are the same state")
+	assert.True(t, transportConfigEqual(nil, &gobgpapi.Transport{}), "empty and nil are the same state")
 	assert.True(t, transportConfigEqual(
 		&gobgpapi.Transport{LocalAddress: "0.0.0.0", PassiveMode: false},
 		&gobgpapi.Transport{LocalAddress: "0.0.0.0", PassiveMode: false, LocalPort: 179, RemotePort: 44000},
-	))
+	), "runtime-only fields are ignored")
+
+	// LocalAddress is only asserted when the CR sets one: gobgpd renders an
+	// unset address as "invalid IP" and replaces it with the resolved address
+	// once a session establishes.
+	assert.True(t, transportConfigEqual(
+		&gobgpapi.Transport{},
+		&gobgpapi.Transport{LocalAddress: "invalid IP"},
+	), "an unset localAddress must not be compared against gobgpd's rendering")
+	assert.True(t, transportConfigEqual(
+		&gobgpapi.Transport{},
+		&gobgpapi.Transport{LocalAddress: "10.0.0.5"},
+	), "an unset localAddress must not be compared against a resolved one")
+	assert.False(t, transportConfigEqual(
+		&gobgpapi.Transport{LocalAddress: "10.0.0.5"},
+		&gobgpapi.Transport{LocalAddress: "10.0.0.6"},
+	), "an explicitly set localAddress must still be compared")
+
+	assert.False(t, transportConfigEqual(
+		&gobgpapi.Transport{PassiveMode: true},
+		&gobgpapi.Transport{PassiveMode: false},
+	), "a real difference must still be detected")
 }
 
 func TestTimersConfigEqual(t *testing.T) {
 	assert.True(t, timersConfigEqual(nil, nil))
-	assert.False(t, timersConfigEqual(&gobgpapi.Timers{}, nil))
+	assert.True(t, timersConfigEqual(&gobgpapi.Timers{}, nil), "empty and nil are the same state")
 	assert.True(t, timersConfigEqual(
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}, State: &gobgpapi.TimersState{}},
-	))
+	), "Timers.State is ignored")
+
+	// gobgpd defaults IdleHoldTimeAfterReset and never echoes
+	// MinimumAdvertisementInterval; comparing either guarantees churn.
+	assert.True(t, timersConfigEqual(
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90, MinimumAdvertisementInterval: 5}},
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90, IdleHoldTimeAfterReset: 30}},
+	), "gobgpd-defaulted and never-echoed timer fields are ignored")
+
+	assert.False(t, timersConfigEqual(
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 180}},
+	), "a real difference must still be detected")
 }
 
 // --- Dynamic neighbor teardown protection -----------------------------------
