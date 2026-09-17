@@ -225,8 +225,17 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	//
 	// TODO: track the resolved password's hash in the reconciler so a
 	// password-only change is detected without comparing the secret itself.
+	// LocalAsn is compared only when the CR sets one. gobgpd defaults an unset
+	// per-peer local AS to the global ASN and echoes the defaulted value, so an
+	// unconditional comparison is 0 against the global ASN - permanently
+	// unequal for every neighbor that does not override its local AS, which is
+	// the overwhelmingly common case. Same guard, and same known gap, as
+	// transportConfigEqual's LocalAddress: clearing localAsn to return to the
+	// global default is not detected as a change.
+	if dc.LocalAsn != 0 && dc.LocalAsn != cc.LocalAsn {
+		return false
+	}
 	if dc.PeerAsn != cc.PeerAsn ||
-		dc.LocalAsn != cc.LocalAsn ||
 		dc.Description != cc.Description ||
 		dc.PeerGroup != cc.PeerGroup ||
 		dc.AdminDown != cc.AdminDown ||
@@ -362,11 +371,38 @@ func afiSafisConfigEqual(desired, current []*gobgpapi.AfiSafi) bool {
 // that field is not detected as drift - it still applies on peer creation.
 // IdleHoldTimeAfterReset is excluded because gobgpd defaults it (to 30) and the
 // CRD has no field for it.
+// timersConfigEqual compares each timer only when the CR sets one.
+//
+// gobgpd defaults every unset timer and echoes the defaulted value, so an
+// unconditional comparison is permanently unequal for any timer the CR omits.
+// Measured against a live gobgpd v1.3.0 by adding a peer with no timers block
+// and reading it back: connect_retry 120, hold_time 90, keepalive_interval 30,
+// idle_hold_time_after_reset 30.
+//
+// connect_retry is the one that bites, because no sample config sets it: a CR
+// specifying only holdTime and keepaliveInterval still compared 0 against 120
+// and fired UpdatePeer on every reconcile. That was not caught by the
+// idempotency tests, whose fake echoed timers as sent rather than as gobgpd
+// defaults them - the fake has since been corrected.
+//
+// The guard is the same one transportConfigEqual uses for LocalAddress and
+// routeReflectorEqual for the cluster ID. It carries the same known gap:
+// removing a timer from the CR to get the default back is not detected as a
+// change. That is rare, and far cheaper than churning every reconcile. It also
+// means this does not need to know what the defaults *are*, so it cannot drift
+// when the fork changes them.
 func timersConfigEqual(desired, current *gobgpapi.Timers) bool {
 	d, c := desired.GetConfig(), current.GetConfig()
-	return d.GetConnectRetry() == c.GetConnectRetry() &&
-		d.GetHoldTime() == c.GetHoldTime() &&
-		d.GetKeepaliveInterval() == c.GetKeepaliveInterval()
+	if d.GetConnectRetry() != 0 && d.GetConnectRetry() != c.GetConnectRetry() {
+		return false
+	}
+	if d.GetHoldTime() != 0 && d.GetHoldTime() != c.GetHoldTime() {
+		return false
+	}
+	if d.GetKeepaliveInterval() != 0 && d.GetKeepaliveInterval() != c.GetKeepaliveInterval() {
+		return false
+	}
+	return true
 }
 
 // transportConfigEqual compares only the controller-managed Transport fields,

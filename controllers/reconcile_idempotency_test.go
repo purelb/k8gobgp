@@ -47,6 +47,19 @@ import (
 
 // gobgpdEcho returns what gobgpd's ListPeer would report for a peer that was
 // added with the given config, per pkg/config/oc.NewPeerFromConfigStruct.
+// echoGlobalASN is the global ASN the fake gobgpd defaults an unset per-peer
+// local AS to. Arbitrary, but it must differ from anything a fixture sets as a
+// peer AS, or the defaulting would be invisible.
+const echoGlobalASN = 64512
+
+// defaultTimer mirrors gobgpd applying its default to an unset timer.
+func defaultTimer(sent, def uint64) uint64 {
+	if sent == 0 {
+		return def
+	}
+	return sent
+}
+
 func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 	// Transport.LocalAddress is State.LocalAddress when valid, else
 	// Config.LocalAddress - and it is rendered with netip.Addr.String(), which
@@ -73,6 +86,14 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 	conf := proto.CloneOf(sent.GetConf())
 	if conf != nil {
 		conf.AuthPassword = ""
+		// gobgpd defaults an unset per-peer local AS to the global ASN and
+		// echoes the defaulted value. Measured on a live v1.3.0: a CR setting
+		// only peerAsn comes back with local_asn set to global.asn. Almost no
+		// neighbor overrides its local AS, so this is the common case, and
+		// echoing it as sent is what let the churn reach production.
+		if conf.LocalAsn == 0 {
+			conf.LocalAsn = echoGlobalASN
+		}
 	}
 
 	echo := &gobgpapi.Peer{
@@ -98,14 +119,21 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 			Enabled:     sent.GetEbgpMultihop().GetEnabled(),
 			MultihopTtl: sent.GetEbgpMultihop().GetMultihopTtl(),
 		},
+		// Timers are echoed DEFAULTED, not as sent. This fake originally echoed
+		// them as sent, which is why the idempotency tests passed while
+		// production fired UpdatePeer on every reconcile for a peer that set
+		// holdTime and keepaliveInterval but not connectRetry: 0 against 120,
+		// permanently unequal.
+		//
+		// The values are measured, not remembered - `gobgp neighbor add` with no
+		// timers against a live gobgpd v1.3.0, read back with `gobgp -j
+		// neighbor`. Note MinimumAdvertisementInterval is never echoed at all, no
+		// matter what was configured.
 		Timers: &gobgpapi.Timers{
 			Config: &gobgpapi.TimersConfig{
-				ConnectRetry:      sent.GetTimers().GetConfig().GetConnectRetry(),
-				HoldTime:          sent.GetTimers().GetConfig().GetHoldTime(),
-				KeepaliveInterval: sent.GetTimers().GetConfig().GetKeepaliveInterval(),
-				// Defaulted by gobgpd; the CRD has no field for it. And note what
-				// is missing: MinimumAdvertisementInterval is never echoed, no
-				// matter what was configured.
+				ConnectRetry:           defaultTimer(sent.GetTimers().GetConfig().GetConnectRetry(), 120),
+				HoldTime:               defaultTimer(sent.GetTimers().GetConfig().GetHoldTime(), 90),
+				KeepaliveInterval:      defaultTimer(sent.GetTimers().GetConfig().GetKeepaliveInterval(), 30),
 				IdleHoldTimeAfterReset: 30,
 			},
 			State: &gobgpapi.TimersState{KeepaliveInterval: 30},
@@ -529,4 +557,75 @@ func TestBfdEqual_DefaultingIsPerObject(t *testing.T) {
 		DesiredMinimumTxInterval: 1000000, RequiredMinimumReceive: 1000000}
 	assert.False(t, bfdEqual(enabled, peerEcho, true),
 		"enabling BFD must still be detected as a change")
+}
+
+// TestPeerConfigEqual_AgainstProductionPayload pins the exact pair that churned
+// on a live cluster, captured rather than imagined.
+//
+// `desired` is built by the real converter from the BGPConfiguration that was
+// deployed; `current` is the verbatim `gobgp -j neighbor` output from the
+// gobgpd it was talking to. Every field here is transcribed from that capture.
+//
+// This exists because the synthetic fixtures above all passed while production
+// fired UpdatePeer on every reconcile. What the CR omits is what matters, and
+// this CR omits three things the fixtures happened to set: connectRetry,
+// localAsn, and any transport block. gobgpd defaults all three and echoes the
+// defaulted value, so each one was permanently unequal.
+func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
+	r := &BGPConfigurationReconciler{}
+
+	// Exactly the CR that was deployed - note what it does NOT set.
+	crd := &bgpv1.Neighbor{
+		Config: bgpv1.NeighborConfig{
+			NeighborAddress: "2001:470:b8f3:251::1",
+			PeerAsn:         64514,
+			Description:     "Gateway router on subnet-251 (IPv6)",
+		},
+		AfiSafis: []bgpv1.AfiSafi{
+			{Family: "ipv4-unicast", Enabled: true},
+			{Family: "ipv6-unicast", Enabled: true},
+		},
+		Timers: &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 90, KeepaliveInterval: 30}},
+	}
+	desired := r.crdToAPINeighborWithPassword(crd, "")
+
+	// Verbatim from `gobgp --target unix://... -j neighbor 2001:470:b8f3:251::1`
+	// against gobgpd v1.3.0 (commit 8b99965), session established.
+	current := &gobgpapi.Peer{
+		Conf: &gobgpapi.PeerConf{
+			NeighborAddress: "2001:470:b8f3:251::1",
+			PeerAsn:         64514,
+			// Defaulted from global.asn; the CR never set it.
+			LocalAsn:    64515,
+			Description: "Gateway router on subnet-251 (IPv6)",
+			Type:        gobgpapi.PeerType_PEER_TYPE_EXTERNAL,
+		},
+		// Resolved once established; the CR has no transport block at all.
+		Transport: &gobgpapi.Transport{LocalAddress: "2001:470:b8f3:251:be24:11ff:fe9b:a72b"},
+		Timers: &gobgpapi.Timers{
+			Config: &gobgpapi.TimersConfig{
+				ConnectRetry: 120, HoldTime: 90, KeepaliveInterval: 30,
+				IdleHoldTimeAfterReset: 30,
+			},
+			State: &gobgpapi.TimersState{KeepaliveInterval: 3, NegotiatedHoldTime: 9},
+		},
+		GracefulRestart: &gobgpapi.GracefulRestart{},
+		RouteReflector:  &gobgpapi.RouteReflector{RouteReflectorClusterId: "invalid IP"},
+		EbgpMultihop:    &gobgpapi.EbgpMultihop{},
+		ApplyPolicy: &gobgpapi.ApplyPolicy{
+			ImportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT},
+			ExportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT},
+		},
+		Bfd: &gobgpapi.BfdPeerConfig{
+			Port: 3784, DesiredMinimumTxInterval: 1000000,
+			RequiredMinimumReceive: 1000000, DetectionMultiplier: 3,
+		},
+		AfiSafis: []*gobgpapi.AfiSafi{
+			{Config: &gobgpapi.AfiSafiConfig{Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST}, Enabled: true}},
+			{Config: &gobgpapi.AfiSafiConfig{Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST}, Enabled: true}},
+		},
+	}
+
+	assert.True(t, peerConfigEqual(desired, current),
+		"this exact pair fired UpdatePeer on every reconcile in production")
 }

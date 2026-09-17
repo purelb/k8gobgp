@@ -90,9 +90,15 @@ type BGPNodeStatusData struct {
 	// +optional
 	BFDServer *BFDServerStatus `json:"bfdServer,omitempty"`
 
-	// Healthy is true when all neighbors are Established and no import/export failures exist.
+	// Healthy is true when all neighbors are Established, no import/export
+	// failures exist, and BFD - if any neighbor uses it - is working.
 	// Conditions are authoritative; this is a convenience summary.
-	Healthy bool `json:"healthy,omitempty"`
+	//
+	// No omitempty: it would drop the field when false, and the printcolumn
+	// then renders an unhealthy node as a BLANK cell rather than "false" -
+	// indistinguishable from "not reported yet" in `kubectl get bgpnodestatus`,
+	// which is the single place an operator looks first.
+	Healthy bool `json:"healthy"`
 	// Conditions represent the latest available observations of the node's BGP state
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }

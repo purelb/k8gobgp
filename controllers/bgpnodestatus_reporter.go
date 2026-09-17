@@ -343,11 +343,17 @@ func (r *BGPNodeStatusReporter) collectStatus(ctx context.Context, log logr.Logg
 		status.VRFs = vrfs
 	}
 
-	// BFD server state. The response carries a nil State when no peer has BFD
-	// enabled - the server was never started - which is deliberately
-	// distinguishable from a started server with zero counters. Reporting
-	// nothing in that case keeps "not listening because nobody asked" out of the
-	// CR entirely.
+	// BFD server state.
+	//
+	// Measured against gobgpd v1.3.0: a node with no BFD peers returns a
+	// non-nil State with listening=false, not the nil State that would mean
+	// "never started". The nil case is still handled, because the two are
+	// reported differently - nil is omitted from the CR entirely - but on this
+	// version the normal non-BFD node reports listening: false.
+	//
+	// Which is exactly why deriveHealth must not consume this unguarded: every
+	// node in a cluster that does not use BFD reports false here. See
+	// bfdDegraded.
 	if bfdResp, err := apiClient.GetBfdServerState(ctx, &gobgpapi.GetBfdServerStateRequest{}); err != nil {
 		log.V(1).Info("Failed to get BFD server state", "error", err)
 	} else if bfdResp.GetState() != nil {

@@ -143,8 +143,14 @@ spec:
                 type: array
               healthy:
                 description: |-
-                  Healthy is true when all neighbors are Established and no import/export failures exist.
+                  Healthy is true when all neighbors are Established, no import/export
+                  failures exist, and BFD - if any neighbor uses it - is working.
                   Conditions are authoritative; this is a convenience summary.
+
+                  No omitempty: it would drop the field when false, and the printcolumn
+                  then renders an unhealthy node as a BLANK cell rather than "false" -
+                  indistinguishable from "not reported yet" in `kubectl get bgpnodestatus`,
+                  which is the single place an operator looks first.
                 type: boolean
               heartbeatSeconds:
                 description: HeartbeatSeconds is the configured heartbeat interval,
@@ -545,6 +551,7 @@ spec:
                 maxItems: 64
                 type: array
             required:
+            - healthy
             - neighborCount
             - nodeName
             type: object
