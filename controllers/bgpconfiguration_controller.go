@@ -896,6 +896,37 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			}
 		}
 
+		// Disable netlink, if this configuration enabled it.
+		//
+		// Everything above removes BGP state, which lives and dies with the
+		// process. Netlink is the exception: import and export program the
+		// *kernel*, and routes this node installed outlive deletion of the CR
+		// that asked for them - until the pod happens to restart. Deleting the
+		// configuration has to withdraw them, so KeepRoutes is false on both.
+		//
+		// Failures here are logged but do not join cleanupErrors. A disable of
+		// something already disabled is an error from gobgpd, and treating it as
+		// a cleanup failure would retry forever and wedge the finalizer,
+		// leaving the CR undeletable - a worse outcome than a stale route.
+		if bgpConfig.Spec.NetlinkExport != nil && bgpConfig.Spec.NetlinkExport.Enabled {
+			if _, err := apiClient.DisableNetlinkExport(ctx, &gobgpapi.DisableNetlinkExportRequest{
+				KeepRoutes: false, // flush exported routes from the kernel
+			}); err != nil {
+				log.V(1).Info("DisableNetlinkExport during cleanup returned error (may not be enabled)", "error", err)
+			} else {
+				log.Info("Disabled netlink export during cleanup")
+			}
+		}
+		if bgpConfig.Spec.NetlinkImport != nil && bgpConfig.Spec.NetlinkImport.Enabled {
+			if _, err := apiClient.DisableNetlinkImport(ctx, &gobgpapi.DisableNetlinkImportRequest{
+				KeepRoutes: false, // withdraw imported routes from the RIB
+			}); err != nil {
+				log.V(1).Info("DisableNetlinkImport during cleanup returned error (may not be enabled)", "error", err)
+			} else {
+				log.Info("Disabled netlink import during cleanup")
+			}
+		}
+
 		// Note: We don't call StopBgp here because:
 		// 1. StopBgp can block indefinitely waiting for peer FSMs to complete
 		// 2. The BGP server will stop when the pod terminates
