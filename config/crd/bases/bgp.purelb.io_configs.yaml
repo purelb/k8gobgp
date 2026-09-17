@@ -50,6 +50,10 @@ spec:
                       type: string
                     prefixes:
                       items:
+                        description: |-
+                          Prefix matches either an IP prefix or a Route Target Constrain prefix -
+                          exactly one of them. gobgpd rejects a prefix with both set, so ipPrefix is
+                          optional rather than required; without that, rtcPrefix could never be used.
                         properties:
                           ipPrefix:
                             type: string
@@ -59,9 +63,15 @@ spec:
                           maskLengthMin:
                             format: int32
                             type: integer
-                        required:
-                        - ipPrefix
+                          rtcPrefix:
+                            description: RtcPrefix is a Route Target Constrain prefix,
+                              for RTC policy matching.
+                            type: string
                         type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of ipPrefix or rtcPrefix must be set
+                          rule: has(self.ipPrefix) != has(self.rtcPrefix)
+                      maxItems: 1024
                       type: array
                     type:
                       type: string
@@ -69,6 +79,7 @@ spec:
                   - name
                   - type
                   type: object
+                maxItems: 256
                 type: array
               dynamicNeighbors:
                 items:
@@ -81,6 +92,7 @@ spec:
                   - peerGroup
                   - prefix
                   type: object
+                maxItems: 256
                 type: array
               global:
                 properties:
@@ -205,6 +217,16 @@ spec:
                 type: object
               neighbors:
                 items:
+                  description: |-
+                    Neighbor is one BGP peer.
+
+                    The BFD/link-local rule below catches a failure with no other symptom: BFD
+                    control packets to a link-local address need the scope zone to pick an
+                    egress interface, and without one transmit still succeeds on some arbitrary
+                    interface. BGP establishes, everything reads healthy, and the BFD session
+                    never leaves Down - so the failure detector the operator just enabled is not
+                    running. Use `fe80::1%eth0`, or `neighborInterface`, which resolves the zone
+                    itself.
                   properties:
                     afiSafis:
                       items:
@@ -262,6 +284,62 @@ spec:
                               type: array
                           type: object
                       type: object
+                    bfd:
+                      description: |-
+                        BFD, if set, overrides whatever the peer group specifies. Omit it to
+                        inherit. See the BFD type for why the override is whole-block.
+                      properties:
+                        desiredMinimumTxInterval:
+                          default: 1000000
+                          description: |-
+                            DesiredMinimumTxInterval is the minimum interval, in MICROSECONDS,
+                            between transmitted control packets. 300000 is 300ms; 300 is 300
+                            microseconds.
+                          format: int32
+                          maximum: 30000000
+                          minimum: 300000
+                          type: integer
+                        detectionMultiplier:
+                          default: 3
+                          description: |-
+                            DetectionMultiplier is how many intervals may be missed before the
+                            session is declared down. Detection time is
+                            requiredMinimumReceive x detectionMultiplier.
+                          format: int32
+                          maximum: 255
+                          minimum: 3
+                          type: integer
+                        enabled:
+                          description: |-
+                            Enabled activates BFD for this session.
+
+                            A pointer so that `enabled: false` survives serialization: as a plain
+                            bool with omitempty it would be indistinguishable from an absent block,
+                            and an absent block means "inherit from the peer group".
+                          type: boolean
+                        port:
+                          default: 3784
+                          description: |-
+                            Port is the destination UDP port for control packets sent to this peer.
+
+                            The local listener is always 3784 regardless of this value, so setting
+                            anything else means transmitting to a port the peer is probably not
+                            listening on. RFC 5881 mandates 3784; there is rarely a reason to change
+                            it.
+                          format: int32
+                          maximum: 65535
+                          minimum: 1024
+                          type: integer
+                        requiredMinimumReceive:
+                          default: 1000000
+                          description: |-
+                            RequiredMinimumReceive is the minimum interval, in MICROSECONDS, between
+                            received control packets.
+                          format: int32
+                          maximum: 30000000
+                          minimum: 300000
+                          type: integer
+                      type: object
                     config:
                       properties:
                         adminDown:
@@ -302,6 +380,16 @@ spec:
                           format: int32
                           type: integer
                         neighborAddress:
+                          description: |-
+                            NeighborAddress is the peer's IP address. For a link-local IPv6 peer,
+                            include the scope zone: fe80::1%eth0.
+
+                            The length bound is not cosmetic. CEL rules are costed statically against
+                            the declared maxLength, so an unbounded string here makes the BFD
+                            link-local rule on Neighbor exceed the apiserver's per-rule cost budget
+                            by ~64x and the CRD is rejected outright. 64 = 45 (the longest textual
+                            IPv6 form, ::ffff:255.255.255.255) + '%' + 15 (IFNAMSIZ-1), rounded up.
+                          maxLength: 64
                           type: string
                         neighborInterface:
                           type: string
@@ -418,6 +506,16 @@ spec:
                       properties:
                         bindInterface:
                           type: string
+                        ipTos:
+                          description: |-
+                            IpTos sets IP_TOS / IPV6_TCLASS on the BGP session.
+
+                            Bounded at 255 because it is a single IP header byte and gobgpd casts it
+                            to uint8 with no range check - an unbounded value would be silently
+                            truncated rather than rejected.
+                          format: int32
+                          maximum: 255
+                          type: integer
                         localAddress:
                           type: string
                         passiveMode:
@@ -426,6 +524,14 @@ spec:
                   required:
                   - config
                   type: object
+                  x-kubernetes-validations:
+                  - message: a link-local neighborAddress needs its scope zone when
+                      BFD is enabled (fe80::1%eth0, not fe80::1); or use neighborInterface
+                      instead
+                    rule: '!has(self.bfd) || (has(self.bfd.enabled) && !self.bfd.enabled)
+                      || !has(self.config.neighborAddress) || !self.config.neighborAddress.lowerAscii().startsWith(''fe80'')
+                      || self.config.neighborAddress.contains(''%'')'
+                maxItems: 1024
                 type: array
               netlinkExport:
                 description: NetlinkExport configures global netlink export for exporting
@@ -570,8 +676,74 @@ spec:
                               type: array
                           type: object
                       type: object
+                    bfd:
+                      description: BFD applies to every member that does not specify
+                        its own.
+                      properties:
+                        desiredMinimumTxInterval:
+                          default: 1000000
+                          description: |-
+                            DesiredMinimumTxInterval is the minimum interval, in MICROSECONDS,
+                            between transmitted control packets. 300000 is 300ms; 300 is 300
+                            microseconds.
+                          format: int32
+                          maximum: 30000000
+                          minimum: 300000
+                          type: integer
+                        detectionMultiplier:
+                          default: 3
+                          description: |-
+                            DetectionMultiplier is how many intervals may be missed before the
+                            session is declared down. Detection time is
+                            requiredMinimumReceive x detectionMultiplier.
+                          format: int32
+                          maximum: 255
+                          minimum: 3
+                          type: integer
+                        enabled:
+                          description: |-
+                            Enabled activates BFD for this session.
+
+                            A pointer so that `enabled: false` survives serialization: as a plain
+                            bool with omitempty it would be indistinguishable from an absent block,
+                            and an absent block means "inherit from the peer group".
+                          type: boolean
+                        port:
+                          default: 3784
+                          description: |-
+                            Port is the destination UDP port for control packets sent to this peer.
+
+                            The local listener is always 3784 regardless of this value, so setting
+                            anything else means transmitting to a port the peer is probably not
+                            listening on. RFC 5881 mandates 3784; there is rarely a reason to change
+                            it.
+                          format: int32
+                          maximum: 65535
+                          minimum: 1024
+                          type: integer
+                        requiredMinimumReceive:
+                          default: 1000000
+                          description: |-
+                            RequiredMinimumReceive is the minimum interval, in MICROSECONDS, between
+                            received control packets.
+                          format: int32
+                          maximum: 30000000
+                          minimum: 300000
+                          type: integer
+                      type: object
                     config:
                       properties:
+                        allowAspathLoopLocal:
+                          description: AllowAspathLoopLocal permits our own ASN in
+                            locally originated paths.
+                          type: boolean
+                        allowOwnAsn:
+                          description: |-
+                            AllowOwnAsn permits this many occurrences of our own ASN in a received
+                            AS path. Bounded at 255 because gobgpd rejects anything larger.
+                          format: int32
+                          maximum: 255
+                          type: integer
                         authPassword:
                           description: 'AuthPassword is the BGP authentication password
                             (DEPRECATED: use AuthPasswordSecretRef instead)'
@@ -611,6 +783,10 @@ spec:
                           type: integer
                         peerGroupName:
                           type: string
+                        replacePeerAsn:
+                          description: ReplacePeerAsn replaces the peer's ASN in the
+                            AS path with our own.
+                          type: boolean
                       required:
                       - peerGroupName
                       type: object
@@ -687,6 +863,16 @@ spec:
                       properties:
                         bindInterface:
                           type: string
+                        ipTos:
+                          description: |-
+                            IpTos sets IP_TOS / IPV6_TCLASS on the BGP session.
+
+                            Bounded at 255 because it is a single IP header byte and gobgpd casts it
+                            to uint8 with no range check - an unbounded value would be silently
+                            truncated rather than rejected.
+                          format: int32
+                          maximum: 255
+                          type: integer
                         localAddress:
                           type: string
                         passiveMode:
@@ -695,6 +881,7 @@ spec:
                   required:
                   - config
                   type: object
+                maxItems: 256
                 type: array
               policyDefinitions:
                 items:
@@ -801,6 +988,7 @@ spec:
                   - name
                   - statements
                   type: object
+                maxItems: 256
                 type: array
               vrfs:
                 items:
@@ -875,6 +1063,7 @@ spec:
                   required:
                   - name
                   type: object
+                maxItems: 256
                 type: array
             required:
             - global

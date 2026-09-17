@@ -83,55 +83,6 @@ func TestFamilyToString(t *testing.T) {
 	}
 }
 
-func TestSanitizeNeighborKey(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{"valid ipv4", "192.168.1.1", "192.168.1.1"},
-		{"valid ipv6", "2001:db8::1", "2001:db8::1"},
-		{"valid ipv6 full", "2001:0db8:0000:0000:0000:0000:0000:0001", "2001:db8::1"},
-		{"invalid", "not-an-ip", "invalid"},
-		{"injection attempt", `192.168.1.1",family="bad`, "invalid"},
-		{"empty", "", "invalid"},
-		{"partial ip", "192.168.1", "invalid"},
-		{"localhost ipv4", "127.0.0.1", "127.0.0.1"},
-		{"localhost ipv6", "::1", "::1"},
-
-		// Unnumbered peers. net.ParseIP rejects a zoned address, which is why
-		// the previous sanitiser returned "invalid" for every one of them —
-		// collapsing all unnumbered peers onto a single colliding series.
-		{"zoned link-local keeps the address", "fe80::1%eth0", "fe80::1"},
-		{"interface key", "iface:eth0", "iface:eth0"},
-		{"interface key with dots and dashes", "iface:bond0.100", "iface:bond0.100"},
-
-		// NeighborInterface is an unvalidated string in the CRD, so anyone with
-		// write access could otherwise inject arbitrary label content.
-		{"interface name too long", "iface:" + strings.Repeat("e", 16), "iface:invalid"},
-		{"interface name with quote", `iface:eth0",x="`, "iface:invalid"},
-		{"interface name with newline", "iface:eth0\nx", "iface:invalid"},
-		{"empty interface name", "iface:", "iface:invalid"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := sanitizeNeighborKey(tt.input)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
-}
-
-// Two distinct unnumbered peers must not collide on one series — the failure
-// the old address-based labeling produced.
-func TestSanitizeNeighborKey_UnnumberedPeersStayDistinct(t *testing.T) {
-	a := sanitizeNeighborKey(neighborKey(&gobgpapi.PeerConf{NeighborInterface: "eth0"}))
-	b := sanitizeNeighborKey(neighborKey(&gobgpapi.PeerConf{NeighborInterface: "eth1"}))
-	assert.NotEqual(t, a, b)
-	assert.Equal(t, "iface:eth0", a)
-	assert.Equal(t, "iface:eth1", b)
-}
-
 func TestDefaultFamilies(t *testing.T) {
 	families := defaultFamilies()
 
@@ -245,10 +196,8 @@ func TestSanitizeFamilyString(t *testing.T) {
 func TestMetricsConfig_Defaults(t *testing.T) {
 	config := MetricsConfig{}
 
-	// Zero values should be handled by the controller
-	assert.Equal(t, 0, config.MaxNeighborsForMetrics)
-	assert.False(t, config.EnablePerNeighborMetrics)
-	assert.Equal(t, 0*0, int(config.PollInterval.Seconds()))
+	// A zero PollInterval means "use the default"; Start applies it.
+	assert.Equal(t, 0, int(config.PollInterval.Seconds()))
 }
 
 func TestValidateCommunity(t *testing.T) {

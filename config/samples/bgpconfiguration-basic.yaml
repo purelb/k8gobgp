@@ -24,6 +24,14 @@ spec:
         config:
           holdTime: 90
           keepaliveInterval: 30
+      # Recommended in production. Without it, a pod restart sends
+      # CEASE/PEER_DECONFIGURED on shutdown and the upstream router purges this
+      # node's routes immediately - so a rolling update blackholes each node for
+      # as long as it takes the replacement pod to re-establish. With it the
+      # router holds the routes for restartTime seconds instead.
+      gracefulRestart:
+        enabled: true
+        restartTime: 120
 
     # IPv4 peer targeted to a specific subnet using nodeSelector
     - config:
@@ -48,6 +56,28 @@ spec:
       afiSafis:
         - family: "ipv6-unicast"
           enabled: true
+
+    # BFD. Timers are MICROSECONDS: 1000000 is one second, and detection time is
+    # requiredMinimumReceive x detectionMultiplier, so this is 3s.
+    #
+    # Two things to know before enabling it:
+    #   - A BFD state transition is a HARD BGP reset, not a graceful one, and
+    #     changing any BFD field tears the session down and rebuilds it. Apply
+    #     BFD changes in a maintenance window.
+    #   - Sub-second profiles are not viable under this DaemonSet's default CPU
+    #     limit. See README.md; the 300ms floor needs requests.cpu == limits.cpu.
+    - config:
+        neighborAddress: "172.30.252.1"
+        peerAsn: 64513
+        description: "Router on subnet-252, with BFD"
+      afiSafis:
+        - family: "ipv4-unicast"
+          enabled: true
+      bfd:
+        enabled: true
+        desiredMinimumTxInterval: 1000000
+        requiredMinimumReceive: 1000000
+        detectionMultiplier: 3
 
     # IPv6 unnumbered peer (interface-based, no neighborAddress needed)
     # RFC 5549 Extended Next-Hop capability is negotiated automatically

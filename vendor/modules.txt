@@ -15,8 +15,8 @@ github.com/emicklei/go-restful/v3/log
 ## explicit; go 1.18
 github.com/evanphx/json-patch/v5
 github.com/evanphx/json-patch/v5/internal/json
-# github.com/fsnotify/fsnotify v1.9.0
-## explicit; go 1.17
+# github.com/fsnotify/fsnotify v1.10.1
+## explicit; go 1.23
 github.com/fsnotify/fsnotify
 github.com/fsnotify/fsnotify/internal
 # github.com/fxamacker/cbor/v2 v2.7.0
@@ -86,8 +86,8 @@ github.com/modern-go/reflect2
 # github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822
 ## explicit
 github.com/munnerz/goautoneg
-# github.com/osrg/gobgp/v4 v4.0.0 => github.com/purelb/gobgp-netlink/v4 v4.0.1-0.20251222165807-108e09f79f16
-## explicit; go 1.24.5
+# github.com/osrg/gobgp/v4 v4.0.0 => github.com/purelb/gobgp-netlink/v4 v4.0.1-0.20260916121850-8b9996553aa0
+## explicit; go 1.25.13
 github.com/osrg/gobgp/v4/api
 # github.com/pkg/errors v0.9.1
 ## explicit
@@ -116,7 +116,7 @@ github.com/prometheus/common/model
 github.com/prometheus/procfs
 github.com/prometheus/procfs/internal/fs
 github.com/prometheus/procfs/internal/util
-# github.com/spf13/pflag v1.0.6
+# github.com/spf13/pflag v1.0.10
 ## explicit; go 1.12
 github.com/spf13/pflag
 # github.com/stretchr/testify v1.12.1
@@ -184,8 +184,8 @@ golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
-# golang.org/x/time v0.12.0
-## explicit; go 1.23.0
+# golang.org/x/time v0.15.0
+## explicit; go 1.25.0
 golang.org/x/time/rate
 # gomodules.xyz/jsonpatch/v2 v2.4.0
 ## explicit; go 1.20
@@ -259,7 +259,7 @@ google.golang.org/grpc/serviceconfig
 google.golang.org/grpc/stats
 google.golang.org/grpc/status
 google.golang.org/grpc/tap
-# google.golang.org/protobuf v1.36.11
+# google.golang.org/protobuf v1.36.12
 ## explicit; go 1.23
 google.golang.org/protobuf/encoding/protodelim
 google.golang.org/protobuf/encoding/protojson
@@ -806,4 +806,4 @@ sigs.k8s.io/structured-merge-diff/v4/value
 ## explicit; go 1.12
 sigs.k8s.io/yaml
 sigs.k8s.io/yaml/goyaml.v2
-# github.com/osrg/gobgp/v4 => github.com/purelb/gobgp-netlink/v4 v4.0.1-0.20251222165807-108e09f79f16
+# github.com/osrg/gobgp/v4 => github.com/purelb/gobgp-netlink/v4 v4.0.1-0.20260916121850-8b9996553aa0

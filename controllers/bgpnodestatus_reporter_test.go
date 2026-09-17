@@ -16,6 +16,8 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -242,6 +244,16 @@ func TestRibRoutesEqual_DifferentOrder(t *testing.T) {
 	assert.True(t, ribRoutesEqual(a, b))
 }
 
+// advertisedTo is capped, so two polls can agree on the capped sample while the
+// true count moves. Without the count in the comparator, statusEqual suppresses
+// that write and the CR reports a stale count indefinitely.
+func TestRibRoutesEqual_AdvertisedToCountChanges(t *testing.T) {
+	sample := []string{"10.0.0.1", "10.0.0.2"}
+	a := []bgpv1.RIBRoute{{Prefix: "10.100.0.0/24", AdvertisedTo: sample, AdvertisedToCount: 20}}
+	b := []bgpv1.RIBRoute{{Prefix: "10.100.0.0/24", AdvertisedTo: sample, AdvertisedToCount: 21}}
+	assert.False(t, ribRoutesEqual(a, b))
+}
+
 func TestStringSlicesEqual_NilVsEmpty(t *testing.T) {
 	assert.True(t, stringSlicesEqual(nil, nil))
 	assert.True(t, stringSlicesEqual(nil, []string{}))
@@ -320,6 +332,188 @@ func TestDeriveHealth_NoNeighbors(t *testing.T) {
 	r := &BGPNodeStatusReporter{}
 	status := &bgpv1.BGPNodeStatusData{}
 	assert.True(t, r.deriveHealth(status))
+}
+
+// --- BFD health gating ---
+//
+// The whole point of the gate. A local-address-mode deployment runs gobgpd with
+// no peering at all and never binds the BFD socket; a plain BGP deployment peers
+// without BFD and also never binds it. Neither is unhealthy, and an ungated
+// `&& listening` would mark both permanently unhealthy forever.
+
+func TestDeriveHealth_NoBFDConfigured_ServerNotListening(t *testing.T) {
+	r := &BGPNodeStatusReporter{}
+
+	// Local-address mode: no neighbors, no BFD, nothing bound.
+	assert.True(t, r.deriveHealth(&bgpv1.BGPNodeStatusData{}))
+
+	// Peering without BFD. BFDServer is nil because GetBfdServerState
+	// returned a nil State.
+	status := &bgpv1.BGPNodeStatusData{
+		Neighbors: []bgpv1.NeighborStatus{{Address: "10.0.0.1", State: "Established"}},
+	}
+	assert.True(t, r.deriveHealth(status))
+
+	// And unhealthy even when the server reports itself explicitly not bound.
+	status.BFDServer = &bgpv1.BFDServerStatus{Listening: false}
+	assert.True(t, r.deriveHealth(status), "a node with no BFD peers must not be unhealthy for not listening")
+
+	// No BFD condition is reported at all, rather than a permanent False one.
+	r.setReadyCondition(status)
+	assert.Nil(t, findCondition(status, "BFDDegraded"))
+}
+
+func TestDeriveHealth_BFDConfiguredButNotListening(t *testing.T) {
+	r := &BGPNodeStatusReporter{}
+	status := &bgpv1.BGPNodeStatusData{
+		Neighbors: []bgpv1.NeighborStatus{
+			{Address: "10.0.0.1", State: "Established", BFD: &bgpv1.BFDStatus{SessionState: "Up"}},
+		},
+		BFDServer: &bgpv1.BFDServerStatus{Listening: false},
+	}
+	assert.False(t, r.deriveHealth(status))
+
+	status.Healthy = r.deriveHealth(status)
+	r.setReadyCondition(status)
+	cond := findCondition(status, "BFDDegraded")
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "ServerNotListening", cond.Reason)
+}
+
+func TestDeriveHealth_BFDSessionDown(t *testing.T) {
+	r := &BGPNodeStatusReporter{}
+	// BGP Established while BFD never leaves Down: the link-local-without-%zone
+	// trap. BGP looks perfect, so nothing else in deriveHealth catches it.
+	status := &bgpv1.BGPNodeStatusData{
+		Neighbors: []bgpv1.NeighborStatus{
+			{Address: "fe80::1", State: "Established", BFD: &bgpv1.BFDStatus{SessionState: "Down"}},
+			{Address: "10.0.0.2", State: "Established", BFD: &bgpv1.BFDStatus{SessionState: "Up"}},
+		},
+		BFDServer: &bgpv1.BFDServerStatus{Listening: true},
+	}
+	assert.False(t, r.deriveHealth(status))
+
+	r.setReadyCondition(status)
+	cond := findCondition(status, "BFDDegraded")
+	require.NotNil(t, cond)
+	assert.Equal(t, "SessionsDown", cond.Reason)
+	assert.Contains(t, cond.Message, "1 of 2")
+}
+
+func TestDeriveHealth_BFDHealthy(t *testing.T) {
+	r := &BGPNodeStatusReporter{}
+	status := &bgpv1.BGPNodeStatusData{
+		Neighbors: []bgpv1.NeighborStatus{
+			{Address: "10.0.0.1", State: "Established", BFD: &bgpv1.BFDStatus{SessionState: "Up"}},
+		},
+		BFDServer: &bgpv1.BFDServerStatus{Listening: true},
+	}
+	assert.True(t, r.deriveHealth(status))
+
+	status.Healthy = true
+	r.setReadyCondition(status)
+	cond := findCondition(status, "BFDDegraded")
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionFalse, cond.Status)
+}
+
+// --- etcd size budget ---
+
+// TestStatusCapsFitEtcdBudget is where the max* constants come from.
+//
+// etcd's default value limit is 1.5 MiB and the apiserver rejects before that,
+// so every list in the status has a cap. This builds the worst case those caps
+// allow - every list full, every string an IPv6 address at full width - and
+// marshals it with the same json.Marshal that feeds
+// k8gobgp_nodestatus_object_size_bytes.
+//
+// The dominant term is not the route count: advertisedTo is one entry per
+// established neighbor per local route, so before maxAdvertisedTo existed,
+// 500 routes x 200 neighbors was ~2.7 MB on its own - past the limit, from
+// caps that each looked reasonable in isolation.
+//
+// If you raise a cap, run this. If it fails, the cap is wrong, not the budget.
+func TestStatusCapsFitEtcdBudget(t *testing.T) {
+	const budget = 1 << 20 // 1 MiB, leaving headroom under etcd's 1.5 MiB
+
+	now := metav1.NewTime(time.Now())
+	addr := func(i int) string { return fmt.Sprintf("2001:db8:1234:5678::%x", i) }
+
+	status := &bgpv1.BGPNodeStatusData{
+		NodeName: "worker-node-with-a-fairly-long-hostname-01.example.com",
+		RouterID: "203.0.113.255", RouterIDSource: "hash-from-node-name",
+		ASN: 4200000000, LastUpdated: &now, NeighborCount: maxNeighbors,
+		RIB: &bgpv1.RIBStatus{}, NetlinkImport: &bgpv1.NetlinkImportStatus{},
+		NetlinkExport: &bgpv1.NetlinkExportStatus{},
+		BFDServer:     &bgpv1.BFDServerStatus{Listening: true},
+	}
+
+	for i := 0; i < maxNeighbors; i++ {
+		status.Neighbors = append(status.Neighbors, bgpv1.NeighborStatus{
+			Address: addr(i), PeerASN: 4200000001, LocalASN: 4200000002,
+			State: "Established", SessionUpSince: &now,
+			PrefixesSent: 999999, PrefixesReceived: 999999,
+			Description: "tor-switch-rack-42-uplink-b",
+			LastError:   "CEASE / ADMINISTRATIVE_RESET",
+			BFD: &bgpv1.BFDStatus{
+				SessionState: "Up", RemoteSessionState: "Up",
+				LocalDiagnosticCode:  "NeighborSignaledSessionDown",
+				RemoteDiagnosticCode: "NeighborSignaledSessionDown",
+				FailureTransitions:   999999,
+			},
+		})
+	}
+	for i := 0; i < maxVRFs; i++ {
+		status.VRFs = append(status.VRFs, bgpv1.VRFStatus{
+			Name: fmt.Sprintf("vrf-tenant-%03d", i), RD: "4200000000:4294967295",
+			ImportedRouteCount: 999999, ExportedRouteCount: 999999,
+		})
+	}
+	for i := 0; i < maxLocalRoutes; i++ {
+		route := bgpv1.RIBRoute{
+			Prefix: fmt.Sprintf("2001:db8:abcd:%04x::/64", i), NextHop: addr(0),
+			Communities:       []string{"65000:100", "65000:200", "65000:300"},
+			AdvertisedToCount: maxNeighbors,
+		}
+		for j := 0; j < maxAdvertisedTo; j++ {
+			route.AdvertisedTo = append(route.AdvertisedTo, addr(j))
+		}
+		status.RIB.LocalRoutes = append(status.RIB.LocalRoutes, route)
+	}
+	for i := 0; i < maxReceivedRoutes; i++ {
+		status.RIB.ReceivedRoutes = append(status.RIB.ReceivedRoutes, bgpv1.RIBRoute{
+			Prefix: fmt.Sprintf("2001:db8:cdef:%04x::/64", i), NextHop: addr(0),
+			FromPeer:    addr(0),
+			Communities: []string{"65000:100", "65000:200", "65000:300"},
+		})
+	}
+	for i := 0; i < maxExportedRoutes; i++ {
+		status.NetlinkExport.ExportedRoutes = append(status.NetlinkExport.ExportedRoutes, bgpv1.ExportedRoute{
+			Prefix: fmt.Sprintf("2001:db8:abcd:%04x::/64", i), Table: "main",
+			Metric: 4294967295, Reason: "nexthop unreachable",
+		})
+	}
+	for i := 0; i < maxImportedAddresses; i++ {
+		status.NetlinkImport.ImportedAddresses = append(status.NetlinkImport.ImportedAddresses, bgpv1.ImportedAddress{
+			Address: fmt.Sprintf("2001:db8:abcd:%04x::1/128", i), Interface: "kube-lb0", InRIB: true,
+		})
+	}
+
+	data, err := json.Marshal(status)
+	require.NoError(t, err)
+	t.Logf("worst-case BGPNodeStatus: %d bytes (%.0f%% of a %d byte budget)",
+		len(data), float64(len(data))/budget*100, budget)
+	assert.Less(t, len(data), budget)
+}
+
+func findCondition(status *bgpv1.BGPNodeStatusData, condType string) *metav1.Condition {
+	for i := range status.Conditions {
+		if status.Conditions[i].Type == condType {
+			return &status.Conditions[i]
+		}
+	}
+	return nil
 }
 
 // --- setCondition ---

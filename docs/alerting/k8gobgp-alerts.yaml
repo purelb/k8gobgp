@@ -1,0 +1,269 @@
+# Prometheus alert rules for k8gobgp and gobgp-netlink.
+#
+# Sample rules — import into your own Prometheus/AlertManager setup.
+#
+#   Prometheus Operator:  kubectl apply -f k8gobgp-alerts.yaml
+#   Manual Prometheus:    add to the rule_files section of prometheus.yml
+#
+# Two things to adjust before these fire correctly:
+#
+#   1. `job` must match whatever your scrape config produces. The placeholder
+#      below assumes two jobs, one per endpoint - k8gobgp on :7473 and gobgpd on
+#      :7475. Without a job matcher the bgp_* rules will also match any other
+#      gobgp or FRR exporter in the cluster.
+#   2. `pod`/`instance` labels come from the scrape, not from the metrics. The
+#      annotations here use {{ $labels.instance }}, which every scrape provides;
+#      swap in {{ $labels.pod }} if your service discovery sets it.
+#
+# See docs/metrics.md for the full metric reference.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k8gobgp-alerts
+  namespace: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+    prometheus: k8s
+    role: alert-rules
+spec:
+  groups:
+
+  # ---------------------------------------------------------------- controller
+  - name: k8gobgp-controller
+    rules:
+
+    - alert: K8GoBGPDaemonDisconnected
+      # Driven by the gobgpd readiness check's GetBgp. This was previously set
+      # from grpc.NewClient, which is lazy and never dials, so the gauge read 1
+      # whether or not gobgpd was alive and this alert had never fired.
+      expr: k8gobgp_gobgpd_connection_status{job="k8gobgp"} == 0
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "gobgpd not answering on {{ $labels.instance }}"
+        description: "The k8gobgp controller cannot reach the local gobgpd daemon. BGP configuration changes are not being applied."
+
+    - alert: K8GoBGPPeerApplyFailing
+      # A peer gobgpd refuses never enters ListPeer, so no bgp_* metric
+      # describes it - it is simply absent. This counter is the only signal.
+      expr: rate(k8gobgp_peer_apply_errors_total{job="k8gobgp"}[10m]) > 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Failing to apply {{ $labels.key }} to gobgpd on {{ $labels.instance }}"
+        description: "Operation {{ $labels.op }} for {{ $labels.key }} is being rejected by gobgpd. The peer may not exist at all — check `gobgp neighbor`."
+
+    - alert: K8GoBGPConfiguredPeerMissing
+      # The CR asks for more neighbors than gobgpd holds. Catches the refused
+      # peer above even when the error rate has fallen back to zero.
+      expr: |
+        sum by (instance) (k8gobgp_configured_objects{job="k8gobgp",kind="neighbor"})
+          > count by (instance) (bgp_peer_state{job="gobgpd"})
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "gobgpd is missing configured neighbors on {{ $labels.instance }}"
+        description: "The BGPConfiguration asks for more neighbors than gobgpd has. A peer was probably refused at apply time."
+
+    - alert: K8GoBGPReconciliationFailed
+      # Scoped to the three genuine failures. result!="success" also matches
+      # duplicate_ignored, which is normal behaviour when a second
+      # BGPConfiguration exists in the namespace - that made this fire forever.
+      expr: increase(k8gobgp_reconcile_total{job="k8gobgp",result=~"failed|validation_failed|connection_failed"}[5m]) > 3
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BGP reconciliation failing on {{ $labels.instance }}"
+        description: "{{ $value }} reconciliation failures in the last 5 minutes for {{ $labels.namespace }}/{{ $labels.name }}."
+
+    - alert: K8GoBGPNodeStatusStale
+      # The staleness signal that used to be a readiness check. It is worth
+      # alerting on; it is not worth de-scheduling a pod whose BGP is healthy.
+      expr: time() - k8gobgp_nodestatus_last_successful_write_timestamp_seconds{job="k8gobgp"} > 300
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BGPNodeStatus not written for 5m on {{ $labels.instance }}"
+        description: "The node status reporter has not completed a write. The CR is stale; BGP itself is unaffected."
+
+  # ------------------------------------------------------------------ router ID
+  - name: k8gobgp-router-id
+    rules:
+
+    - alert: K8GoBGPRouterIDResolutionFailed
+      expr: increase(k8gobgp_router_id_resolution_total{job="k8gobgp",result="failure"}[5m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Router ID resolution failures on {{ $labels.instance }}"
+        description: "Check pod logs for details."
+        runbook_url: "https://github.com/purelb/k8gobgp#troubleshooting"
+
+    - alert: K8GoBGPRouterIDResolutionSlow
+      # Threshold 2, not 5. The buckets are ExponentialBuckets(0.001, 2, 12),
+      # so the highest finite bound is 2.048s; histogram_quantile returns that
+      # bound when the quantile lands in +Inf, and the old `> 5` was therefore
+      # unreachable no matter how slow resolution got.
+      expr: histogram_quantile(0.99, rate(k8gobgp_router_id_resolution_duration_seconds_bucket{job="k8gobgp"}[5m])) > 2
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Slow router ID resolution on {{ $labels.instance }}"
+        description: "p99 latency is at the top of the histogram range. Usually Kubernetes API slowness."
+
+    - alert: K8GoBGPHashBasedRouterIDsHigh
+      # Rewritten against router_id_info, which carries the same source label.
+      # k8gobgp_router_id_source was removed as derivable from it.
+      expr: count(k8gobgp_router_id_info{job="k8gobgp",source="hash-from-node-name"} == 1) > 5
+      for: 15m
+      labels:
+        severity: info
+      annotations:
+        summary: "Multiple nodes using hash-based router IDs"
+        description: "{{ $value }} nodes derived a router ID from their node name. Normal for IPv6-only nodes; otherwise it may indicate misconfiguration."
+
+  # ----------------------------------------------------------------- BGP / BFD
+  - name: gobgp-sessions
+    rules:
+
+    - alert: GoBGPNoEstablishedNeighbors
+      # `unless`, not `== 0`. bgp_peer_state is an info metric: one series per
+      # peer carrying its state as a label, with no zero series for states the
+      # peer is not in. count() over a non-matching selector returns an empty
+      # vector, so the obvious `count(...{session_state="..."}) == 0` can never
+      # produce a sample. Scoped by instance so one node blackholing traffic
+      # still alerts while the rest of the fleet is healthy.
+      expr: |
+        count by (instance) (bgp_peer_state{job="gobgpd"}) > 0
+          unless
+        count by (instance) (bgp_peer_state{job="gobgpd",session_state="SESSION_STATE_ESTABLISHED"}) > 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "No established BGP neighbors on {{ $labels.instance }}"
+        description: "The node has neighbors configured but none are established. It is not advertising."
+
+    - alert: GoBGPPeerFlapping
+      # delta, not increase: bgp_peer_flop_count is a gauge in v1.3.0.
+      expr: delta(bgp_peer_flop_count{job="gobgpd"}[15m]) > 2
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BGP session to {{ $labels.peer }} flapping on {{ $labels.instance }}"
+
+    - alert: GoBGPBuildSkew
+      # Fires for the duration of any rollout by construction, hence the long
+      # `for:`. Scope this to one cluster if your Prometheus federates several.
+      expr: count(count by (version, commit, base) (bgp_build_info{job="gobgpd"})) > 1
+      for: 30m
+      labels:
+        severity: info
+      annotations:
+        summary: "More than one gobgpd build running in the fleet"
+
+  - name: gobgp-bfd
+    rules:
+
+    - alert: GoBGPBFDServerNotListening
+      # Second-order check. It does NOT catch a BFD bind failure at peer-add
+      # time: that refuses the neighbor outright, so it never enters ListPeer
+      # and bgp_peer_bfd_enabled is never emitted for it. Use
+      # K8GoBGPPeerApplyFailing for that case.
+      expr: |
+        bgp_bfd_server_up{job="gobgpd"} == 0
+          and on(instance) (max by (instance) (bgp_peer_bfd_enabled{job="gobgpd"}) == 1)
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "BFD configured but not listening on {{ $labels.instance }}"
+        description: "Peers have BFD enabled and the BFD socket is not bound. No failure detection is happening; BGP will look healthy regardless."
+
+    - alert: GoBGPBFDUnknownPeer
+      # Typically a link-local neighbor configured without its %zone: transmit
+      # works, BGP comes up, BFD never leaves DOWN. This counter has no peer
+      # label, so diagnosis needs gobgpd debug logs.
+      expr: rate(bgp_bfd_unknown_peer_total{job="gobgpd"}[10m]) > 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BFD packets from an unconfigured address on {{ $labels.instance }}"
+        description: "Check for a link-local neighbor configured without its zone (fe80::1 rather than fe80::1%eth0)."
+
+    - alert: GoBGPBFDReceiveQueueDropping
+      # The queue is one packet deep, so any advance means a peer's event loop
+      # stalled longer than a transmit interval.
+      expr: rate(bgp_bfd_received_drop_total{job="gobgpd"}[5m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BFD receive queue overflowing on {{ $labels.instance }}"
+        description: "An event loop is stalling. This can manufacture a session-down on an otherwise healthy peer."
+
+    - alert: GoBGPBFDWrongHopLimit
+      expr: rate(bgp_bfd_wrong_hop_limit_total{job="gobgpd"}[5m]) > 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "BFD packets discarded for TTL/hop limit on {{ $labels.instance }}"
+        description: "RFC 5881 section 5 requires 255 for single-hop sessions. An off-path sender, or a multihop misconfiguration."
+
+    - alert: GoBGPBFDSessionFlapping
+      # Each transition is a HARD BGP reset, so this is more serious than a
+      # BFD-only signal suggests.
+      expr: delta(bgp_peer_bfd_failure_transitions_total{job="gobgpd"}[15m]) > 2
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "BFD session to {{ $labels.peer }} flapping on {{ $labels.instance }}"
+        description: "Each transition hard-resets the BGP session. Check for CPU throttling if timers are aggressive."
+
+  # -------------------------------------------------------------------- netlink
+  - name: gobgp-netlink
+    rules:
+
+    - alert: GoBGPNetlinkImportStopped
+      # loop_ticks, NOT import_addr_events. The latter counts kernel address
+      # changes and is legitimately flat for hours on a quiet cluster, so
+      # alerting on it flat fires everywhere, forever, and gets silenced.
+      expr: |
+        rate(bgp_netlink_import_loop_ticks_total{job="gobgpd"}[10m]) == 0
+          and bgp_netlink_import_enabled{job="gobgpd"} == 1
+      for: 10m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Netlink import loop has stopped on {{ $labels.instance }}"
+        description: "Import is enabled but the scan loop is no longer running. Kernel routes are not reaching the BGP RIB."
+
+    - alert: GoBGPNetlinkExportErrors
+      expr: rate(bgp_netlink_export_errors_total{job="gobgpd"}[5m]) > 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Failing to program the kernel FIB on {{ $labels.instance }}"
+        description: "BGP routes are not reaching the kernel routing table."
+
+    - alert: GoBGPNetlinkNexthopValidationFailing
+      expr: rate(bgp_netlink_nexthop_failed_total{job="gobgpd"}[5m]) > 0
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Nexthop validation failing on {{ $labels.instance }}"
+        description: "Routes are being suppressed because their nexthop is unreachable."
