@@ -1040,15 +1040,58 @@ func TestPeerConfigEqual(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:    "current has auto-populated Type and SendCommunity (should be ignored)",
+			// Type is still auto-populated by gobgpd and still ignored.
+			// SendCommunity is NOT in here any more: as of gobgp-netlink v1.3.1
+			// it has explicit presence and is nil when unconfigured, so gobgpd
+			// no longer fabricates a value and a difference is a real one.
+			name:    "current has auto-populated Type (should be ignored)",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
 				p.Conf.Type = 1
-				p.Conf.SendCommunity = 3
 				return p
 			}(),
 			expected: true,
+		},
+		{
+			// Both unconfigured. This is the case that would churn if the
+			// comparator used GetSendCommunity(), which dereferences to 0.
+			name:    "sendCommunity unset on both sides",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = nil
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			// nil vs "standard" (0). Under implicit presence these were the
+			// same value on the wire; the whole point of the v1.3.1 proto change
+			// is that they are now distinguishable, and this is the assertion
+			// that proves we read the distinction.
+			name: "sendCommunity unset vs explicitly standard",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = ptrU32(0)
+				return p
+			}(),
+			current:  basePeer(),
+			expected: false,
+		},
+		{
+			name: "sendCommunity differs",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = ptrU32(2) // both
+				return p
+			}(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = ptrU32(3) // none
+				return p
+			}(),
+			expected: false,
 		},
 		{
 			name:    "current has extra Transport runtime fields (should be ignored)",
@@ -1707,4 +1750,27 @@ func TestCrdToAPIGlobalSubMessages(t *testing.T) {
 	assert.True(t, cf.GetEnabled())
 	assert.Equal(t, uint32(65000), cf.GetIdentifier())
 	assert.Equal(t, []uint32{65001, 65002}, cf.GetMemberAsList())
+}
+
+func ptrU32(v uint32) *uint32 { return &v }
+
+// TestSendCommunityOrdinals pins the CRD names to oc.CommunityTypeToIntMap,
+// read from gobgp-netlink at the pinned commit rather than inferred.
+//
+// 0 is STANDARD, not none. A previous revision of this code guessed a bitmask
+// (standard 1, extended 2, both 3) which was wrong in every position and would
+// have mapped "both" onto none - silently disabling community advertisement on
+// every peer configured that way.
+func TestSendCommunityOrdinals(t *testing.T) {
+	assert.Equal(t, map[string]uint32{
+		"standard": 0, "extended": 1, "both": 2, "none": 3,
+	}, sendCommunityOrdinals)
+
+	// Unknown or empty means "not configured", which must be nil - never a
+	// pointer to 0, which would mean "standard".
+	assert.Nil(t, crdToAPISendCommunity(""))
+	assert.Nil(t, crdToAPISendCommunity("large"))
+	require.NotNil(t, crdToAPISendCommunity("standard"))
+	assert.Equal(t, uint32(0), *crdToAPISendCommunity("standard"))
+	assert.Equal(t, uint32(3), *crdToAPISendCommunity("none"))
 }

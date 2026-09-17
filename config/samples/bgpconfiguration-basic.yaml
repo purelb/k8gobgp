@@ -32,6 +32,14 @@ spec:
       gracefulRestart:
         enabled: true
         restartTime: 120
+      # Filter which communities are advertised to this peer, applied AFTER the
+      # export policy. Omit to leave gobgpd alone.
+      #
+      # "none" is not literal: large communities, LLGR markers, and every family
+      # except IPv4/IPv6 unicast survive it. And note "none"/"extended" strip
+      # NO_EXPORT and NO_ADVERTISE, so the far side loses the do-not-re-export
+      # signal - a route-leak vector. See README.md.
+      sendCommunity: "both"
 
     # IPv4 peer targeted to a specific subnet using nodeSelector
     - config:

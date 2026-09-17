@@ -489,6 +489,30 @@ spec:
                           description: RouteFlapDamping enables RFC 2439 damping for
                             this peer.
                           type: boolean
+                        sendCommunity:
+                          description: |-
+                            SendCommunity filters which community attributes are advertised to this
+                            peer, applied AFTER the export policy - so a policy that adds a community
+                            cannot walk past it.
+
+                            Dead in every gobgp release before gobgp-netlink v1.3.1: accepted by the
+                            config loader, dropped by the gRPC converters, read by nothing. Omit it to
+                            leave gobgpd's behavior alone.
+
+                            "none" is not literal. Large communities, LLGR_STALE/NO_LLGR, and every
+                            family except IPv4/IPv6 unicast and labeled unicast survive every
+                            setting, and it is ignored entirely for route-server clients. See the BGP
+                            section of README.md.
+
+                            Note "none" and "extended" strip NO_EXPORT, NO_ADVERTISE and
+                            NO_EXPORT_SUBCONFED, so the receiving AS loses the signal not to
+                            re-export. That is a route-leak vector, not just a filter.
+                          enum:
+                          - standard
+                          - extended
+                          - both
+                          - none
+                          type: string
                         sendSoftwareVersion:
                           description: SendSoftwareVersion advertises the software-version
                             capability (RFC 9384).
@@ -915,6 +939,30 @@ spec:
                           description: RouteFlapDamping enables RFC 2439 damping for
                             members of this group.
                           type: boolean
+                        sendCommunity:
+                          description: |-
+                            SendCommunity filters which community attributes are advertised to this
+                            peer, applied AFTER the export policy - so a policy that adds a community
+                            cannot walk past it.
+
+                            Dead in every gobgp release before gobgp-netlink v1.3.1: accepted by the
+                            config loader, dropped by the gRPC converters, read by nothing. Omit it to
+                            leave gobgpd's behavior alone.
+
+                            "none" is not literal. Large communities, LLGR_STALE/NO_LLGR, and every
+                            family except IPv4/IPv6 unicast and labeled unicast survive every
+                            setting, and it is ignored entirely for route-server clients. See the BGP
+                            section of README.md.
+
+                            Note "none" and "extended" strip NO_EXPORT, NO_ADVERTISE and
+                            NO_EXPORT_SUBCONFED, so the receiving AS loses the signal not to
+                            re-export. That is a route-leak vector, not just a filter.
+                          enum:
+                          - standard
+                          - extended
+                          - both
+                          - none
+                          type: string
                         sendSoftwareVersion:
                           description: SendSoftwareVersion advertises the software-version
                             capability (RFC 9384).

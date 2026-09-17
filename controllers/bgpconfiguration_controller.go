@@ -254,6 +254,15 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
 		return false
 	}
+	// Compared as of v1.3.1, where it round-trips. In v1.3.0 ListPeer returned
+	// 0 for it whatever was sent, so comparing it would have churned forever.
+	// The struct field, NOT GetSendCommunity(): for a field with explicit
+	// presence the generated getter dereferences and returns 0 when absent,
+	// which is "standard" - collapsing exactly the distinction this field
+	// gained presence in order to express.
+	if !sendCommunityEqual(dc.SendCommunity, cc.SendCommunity) {
+		return false
+	}
 
 	if !afiSafisConfigEqual(desired.AfiSafis, current.AfiSafis) {
 		return false
@@ -305,6 +314,15 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 		dc.RemovePrivate != cc.RemovePrivate ||
 		dc.RouteFlapDamping != cc.RouteFlapDamping ||
 		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
+		return false
+	}
+	// Compared as of v1.3.1, where it round-trips. In v1.3.0 ListPeer returned
+	// 0 for it whatever was sent, so comparing it would have churned forever.
+	// The struct field, NOT GetSendCommunity(): for a field with explicit
+	// presence the generated getter dereferences and returns 0 when absent,
+	// which is "standard" - collapsing exactly the distinction this field
+	// gained presence in order to express.
+	if !sendCommunityEqual(dc.SendCommunity, cc.SendCommunity) {
 		return false
 	}
 
@@ -2385,6 +2403,7 @@ func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.Pe
 			RemovePrivate:        crdToAPIRemovePrivate(crd.Config.RemovePrivate),
 			RouteFlapDamping:     crd.Config.RouteFlapDamping,
 			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
+			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
 		AfiSafis:    crdToAPIAfiSafis(crd.AfiSafis),
 		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
@@ -2415,6 +2434,7 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 			RemovePrivate:        crdToAPIRemovePrivate(crd.Config.RemovePrivate),
 			RouteFlapDamping:     crd.Config.RouteFlapDamping,
 			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
+			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
 		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
 		ApplyPolicy:     crdToAPIApplyPolicy(crd.ApplyPolicy),
@@ -2811,27 +2831,51 @@ func crdToAPIAddPaths(crd *bgpv1.AddPaths) *gobgpapi.AddPaths {
 	}
 }
 
-// send_community is NOT exposed, because gobgpd cannot receive it over gRPC.
+// sendCommunityOrdinals maps the CRD's names to oc.CommunityTypeToIntMap.
 //
-// Read from the fork's source at the pinned commit (8b99965), not inferred:
-// newNeighborFromAPIStruct and newPeerGroupFromAPIStruct in
-// pkg/server/grpc_server.go copy every other PeerConf field into oc.Neighbor -
-// routeFlapDamping, sendSoftwareVersion, removePrivate, allowOwnAsn,
-// replacePeerAsn, allowAspathLoopLocal - and simply do not copy SendCommunity.
-// The field exists in the proto, exists as oc.CommunityType in the internal
-// config, and is even exported as a metric, but the API value is dropped on the
-// floor. It is reachable only through gobgpd's config file, which k8gobgp never
-// uses. That is why ListPeer always echoes 0 for it.
+// Read from the fork at the pinned commit, pkg/config/oc/bgp_configs.go - not
+// guessed. Note 0 is STANDARD, not none, which is exactly why the proto needed
+// explicit presence: under implicit presence an unset field and "standard" were
+// the same value on the wire.
+var sendCommunityOrdinals = map[string]uint32{
+	"standard": 0,
+	"extended": 1,
+	"both":     2,
+	"none":     3,
+}
+
+// crdToAPISendCommunity converts the CRD name to the optional proto field.
 //
-// So a CRD field here would be inert by construction - the same shape as the
-// TCP-AO keychain RPCs, which exist with nothing to bind them to a session.
+// nil means "not configured", which gobgpd's SendCommunityFromAPI turns into
+// the empty CommunityType and leaves its behavior alone. That distinction is
+// the whole point of the field being *uint32 as of gobgp-netlink v1.3.1: a bare
+// 0 would mean "standard" and would silently start filtering communities on
+// every peer that never asked for it.
+// Returning nil for an unrecognized name is also what keeps the comparator
+// honest. Verified against a live v1.3.1: sending an out-of-range value (99)
+// comes back as nil, because SendCommunityFromAPI maps anything outside the
+// enum to the empty CommunityType and SendCommunityToAPI renders that as
+// absent. Sending one would therefore compare unequal forever. The CRD enum
+// makes that unreachable; this fallback is the second line of defense.
+func crdToAPISendCommunity(s string) *uint32 {
+	v, ok := sendCommunityOrdinals[s]
+	if !ok {
+		return nil
+	}
+	return &v
+}
+
+// sendCommunityEqual compares the optional field.
 //
-// Also worth recording, since it is what a reader will reach for: the encoding
-// is NOT a bitmask. oc.CommunityTypeToIntMap is standard=0, extended=1, both=2,
-// none=3. Note 0 means STANDARD, not none, and there is no "large" or "all".
-//
-// BLOCKED on gobgp-netlink copying a.Conf.SendCommunity in those two
-// converters. That is two lines there; this is a handful here.
+// Unlike v1.3.0, this round-trips: SendCommunityToAPI returns nil for an unset
+// CommunityType rather than a fabricated 0, so ListPeer reports genuine absence
+// and nil-vs-nil compares equal instead of churning.
+func sendCommunityEqual(desired, current *uint32) bool {
+	if desired == nil || current == nil {
+		return desired == current
+	}
+	return *desired == *current
+}
 
 func crdToAPIRemovePrivate(s string) gobgpapi.RemovePrivate {
 	switch s {

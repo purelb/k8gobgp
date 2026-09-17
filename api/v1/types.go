@@ -295,6 +295,25 @@ type NeighborConfig struct {
 	// AllowAspathLoopLocal permits a local AS-path loop.
 	// +optional
 	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
+	// SendCommunity filters which community attributes are advertised to this
+	// peer, applied AFTER the export policy - so a policy that adds a community
+	// cannot walk past it.
+	//
+	// Dead in every gobgp release before gobgp-netlink v1.3.1: accepted by the
+	// config loader, dropped by the gRPC converters, read by nothing. Omit it to
+	// leave gobgpd's behavior alone.
+	//
+	// "none" is not literal. Large communities, LLGR_STALE/NO_LLGR, and every
+	// family except IPv4/IPv6 unicast and labeled unicast survive every
+	// setting, and it is ignored entirely for route-server clients. See the BGP
+	// section of README.md.
+	//
+	// Note "none" and "extended" strip NO_EXPORT, NO_ADVERTISE and
+	// NO_EXPORT_SUBCONFED, so the receiving AS loses the signal not to
+	// re-export. That is a route-leak vector, not just a filter.
+	// +kubebuilder:validation:Enum=standard;extended;both;none
+	// +optional
+	SendCommunity string `json:"sendCommunity,omitempty"`
 	// RemovePrivate strips private ASNs from advertised AS paths:
 	// "all" removes them, "replace" substitutes our own ASN.
 	// +kubebuilder:validation:Enum=all;replace
@@ -332,6 +351,25 @@ type PeerGroupConfig struct {
 	// AllowAspathLoopLocal permits our own ASN in locally originated paths.
 	// +optional
 	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
+	// SendCommunity filters which community attributes are advertised to this
+	// peer, applied AFTER the export policy - so a policy that adds a community
+	// cannot walk past it.
+	//
+	// Dead in every gobgp release before gobgp-netlink v1.3.1: accepted by the
+	// config loader, dropped by the gRPC converters, read by nothing. Omit it to
+	// leave gobgpd's behavior alone.
+	//
+	// "none" is not literal. Large communities, LLGR_STALE/NO_LLGR, and every
+	// family except IPv4/IPv6 unicast and labeled unicast survive every
+	// setting, and it is ignored entirely for route-server clients. See the BGP
+	// section of README.md.
+	//
+	// Note "none" and "extended" strip NO_EXPORT, NO_ADVERTISE and
+	// NO_EXPORT_SUBCONFED, so the receiving AS loses the signal not to
+	// re-export. That is a route-leak vector, not just a filter.
+	// +kubebuilder:validation:Enum=standard;extended;both;none
+	// +optional
+	SendCommunity string `json:"sendCommunity,omitempty"`
 	// RemovePrivate strips private ASNs from advertised AS paths:
 	// "all" removes them, "replace" substitutes our own ASN.
 	// +kubebuilder:validation:Enum=all;replace

@@ -86,6 +86,11 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 	conf := proto.CloneOf(sent.GetConf())
 	if conf != nil {
 		conf.AuthPassword = ""
+		// gobgpd round-trips SendCommunity as of v1.3.1: SendCommunityToAPI
+		// returns nil for an unset CommunityType rather than a fabricated 0, so
+		// absence survives rather than coming back as "standard". Cloning Conf
+		// already reproduces that; this comment records why nothing special is
+		// needed here, unlike the fields above.
 		// gobgpd defaults an unset per-peer local AS to the global ASN and
 		// echoes the defaulted value. Measured on a live v1.3.0: a CR setting
 		// only peerAsn comes back with local_asn set to global.asn. Almost no
@@ -414,6 +419,18 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 					RemovePrivate:        "replace",
 					RouteFlapDamping:     true,
 					SendSoftwareVersion:  true,
+					SendCommunity:        "both",
+				},
+			},
+		},
+		{
+			// "standard" is ordinal 0. Under the pre-v1.3.1 proto this was
+			// indistinguishable from unset and could not be expressed at all.
+			name: "sendCommunity standard, the zero ordinal",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{
+					NeighborAddress: "10.0.0.22", PeerAsn: 64513,
+					SendCommunity: "standard",
 				},
 			},
 		},

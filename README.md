@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/purelb/k8gobgp)](https://goreportcard.com/report/github.com/purelb/k8gobgp)
 
-A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.3.0) for enhanced Linux kernel integration.
+A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.3.1) for enhanced Linux kernel integration.
 
 ## Features
 
@@ -13,6 +13,7 @@ A Kubernetes controller for managing GoBGP configurations using Custom Resource 
 - **Neighbor Management**: Configure BGP peers with full support for timers, authentication, and AFI/SAFI
 - **Peer Groups**: Define reusable peer group templates for consistent neighbor configuration
 - **BFD**: Sub-second forwarding-path failure detection, opt-in per neighbor or peer group
+- **Community control**: Per-peer `sendCommunity` filtering of advertised community attributes
 - **Dynamic Neighbors**: Support for dynamic BGP peering with prefix-based matching
 - **VRF Support**: Configure Virtual Routing and Forwarding instances
 - **Route Policies**: Define import/export policies with prefix lists, community matching, and AS path manipulation
@@ -346,6 +347,59 @@ spec:
         peerGroup: "upstream-peers"
         description: "Secondary upstream"
 ```
+
+### Send community
+
+`sendCommunity` filters which community attributes are advertised to a peer. It is applied
+**after** the export policy, so a policy that adds a community cannot walk past it.
+
+```yaml
+  neighbors:
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerAsn: 64513
+        sendCommunity: "both"     # standard | extended | both | none
+```
+
+Omit it to leave gobgpd's behaviour alone. It is available on peer groups too, and a neighbor's
+own setting overrides the group's.
+
+Requires gobgp-netlink **v1.3.1 or later**. In every earlier release the field was declared but
+dead — accepted by the config loader, dropped by the gRPC converters, and read by nothing — so
+setting it changed nothing that was advertised.
+
+#### `none` does not mean "no communities"
+
+Three things survive every setting:
+
+- **Large communities.** The OpenConfig enum has no value meaning "send large", so stripping them
+  would make them unsendable rather than optional.
+- **`LLGR_STALE` and `NO_LLGR`.** gobgpd stamps `LLGR_STALE` itself when re-advertising a stale
+  route. Removing the marker while honouring the capability the peer negotiated would leave that
+  peer treating stale routes as fresh.
+- **Every family except IPv4/IPv6 unicast and labelled unicast.** In VPN, EVPN, FlowSpec, MUP and
+  VPLS, communities are protocol payload rather than decoration — the Route Target that selects a
+  VRF, and every FlowSpec traffic action, are extended communities. Stripping them would not
+  filter a route, it would destroy it: a FlowSpec `discard` rule would arrive as a bare `accept`.
+  There is no per-family form of this setting in the OpenConfig model, so it is ignored there.
+
+It is also ignored entirely for route-server clients, which get no egress attribute
+transformation at all (RFC 7947). gobgpd warns at startup when the setting is inert for a peer.
+
+#### Two things to weigh before setting it
+
+- **`none` and `extended` strip `NO_EXPORT`, `NO_ADVERTISE` and `NO_EXPORT_SUBCONFED`.** The
+  receiving AS loses the signal not to re-export the route. This matches how the setting behaves
+  on other vendors, but it is a route-leak vector — not merely a narrower advertisement.
+- **Within unicast, `color` and `encap` extended communities are stripped along with the rest.**
+
+Unlike most neighbor configuration, changing `sendCommunity` on a live peer does **not** reset
+the session: gobgpd applies it in place and soft-resets outbound. Every other field in this
+section still tears the session down.
+
+`bgp_peer_send_community` on the `:7475` endpoint reports the configured value, and is absent for
+peers that do not set it. It reports configuration, not effect — see
+[docs/metrics.md](docs/metrics.md).
 
 ### BFD (Bidirectional Forwarding Detection)
 
@@ -839,5 +893,5 @@ limitations under the License.
 ## Acknowledgments
 
 - [GoBGP](https://github.com/osrg/gobgp) - The BGP implementation
-- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.3.0 - Enhanced GoBGP fork with netlink integration
+- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.3.1 - Enhanced GoBGP fork with netlink integration
 - [PureLB](https://purelb.io) - Kubernetes load balancer project

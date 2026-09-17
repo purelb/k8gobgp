@@ -15,7 +15,7 @@
 # Declared before the first FROM so every stage can re-declare it. ARG scope
 # ends at FROM: without the re-declaration in gobgpd_builder the ldflag below
 # expands to empty and bgp_build_info ships with no commit label.
-ARG GOBGP_COMMIT=8b9996553aa09e029c0c057568e0c816a8dcb9d9
+ARG GOBGP_COMMIT=994cf2fcd580a9a7699af5d7407d016dc528fed9
 
 # Fetch the purelb/gobgp-netlink fork once. This stage is arch-independent, so
 # it is shared by both target platforms rather than cloned per-arch.
