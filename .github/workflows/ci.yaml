@@ -148,6 +148,34 @@ jobs:
           docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --metrics-host
           docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --pprof-disable
 
+      # Round-trip the converters against the real daemon.
+      #
+      # This is the check that catches the bug class nothing else does: a field
+      # the CR omits, that gobgpd defaults or normalises and echoes back
+      # differently, so the comparator says "changed" on every reconcile and
+      # UpdatePeer fires forever. Two of those reached production (connectRetry,
+      # localAsn) with the unit suite green, because the fake it compares
+      # against encodes what its author believed the daemon does.
+      #
+      # It needs a real gobgpd, which is why it lives in this job rather than
+      # `test` - the image is already built and loaded here.
+      - name: Round-trip the converters against a real gobgpd
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}"
+          docker run -d --name gobgpd-rt -p 50051:50051 --entrypoint gobgpd "$IMG" \
+            --api-hosts 0.0.0.0:50051 --pprof-disable
+          for i in $(seq 1 30); do
+            docker exec gobgpd-rt gobgp -u 127.0.0.1 global 2>/dev/null && break || sleep 1
+          done
+          go test -tags=gobgpd -count=1 -v ./controllers/ -run TestRoundTrip
+        env:
+          GOBGPD_ADDR: 127.0.0.1:50051
+
+      - name: gobgpd logs on failure
+        if: failure()
+        run: docker logs gobgpd-rt 2>&1 | tail -50
+
   # Static analysis of our own source. Deterministic for a pinned gosec version,
   # so this is a genuine property of the diff and stays a required check.
   # Dependency vulnerability scanning lives in vulnerability-scan.yaml: it runs

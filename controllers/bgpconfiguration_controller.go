@@ -249,11 +249,24 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 		dc.AllowOwnAsn != cc.AllowOwnAsn ||
 		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
 		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal ||
-		dc.RemovePrivate != cc.RemovePrivate ||
 		dc.RouteFlapDamping != cc.RouteFlapDamping ||
 		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
 		return false
 	}
+	// RemovePrivate is NOT compared here, although it IS for peers.
+	//
+	// The asymmetry is the daemon's. newPeerGroupFromAPIStruct stores it, so the
+	// value takes effect, but NewPeerGroupFromConfigStruct builds the
+	// api.PeerGroupConf without it, so ListPeerGroup never reports it back - it
+	// is write-only for peer groups. Comparing it means UpdatePeerGroup on every
+	// reconcile, and that loops updateNeighbor over every member of the group.
+	// Found by TestRoundTripPeerGroup, not by inspection.
+	//
+	// BLOCKED on gobgp-netlink adding RemovePrivate to
+	// NewPeerGroupFromConfigStruct - one line, and it would make this symmetric
+	// with the peer path. Until then a change to a group's removePrivate reaches
+	// gobgpd only when some other field changes alongside it.
+
 	// Compared as of v1.3.1, where it round-trips. In v1.3.0 ListPeer returned
 	// 0 for it whatever was sent, so comparing it would have churned forever.
 	// The struct field, NOT GetSendCommunity(): for a field with explicit
@@ -311,11 +324,24 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 		dc.AllowOwnAsn != cc.AllowOwnAsn ||
 		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
 		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal ||
-		dc.RemovePrivate != cc.RemovePrivate ||
 		dc.RouteFlapDamping != cc.RouteFlapDamping ||
 		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
 		return false
 	}
+	// RemovePrivate is NOT compared here, although it IS for peers.
+	//
+	// The asymmetry is the daemon's. newPeerGroupFromAPIStruct stores it, so the
+	// value takes effect, but NewPeerGroupFromConfigStruct builds the
+	// api.PeerGroupConf without it, so ListPeerGroup never reports it back - it
+	// is write-only for peer groups. Comparing it means UpdatePeerGroup on every
+	// reconcile, and that loops updateNeighbor over every member of the group.
+	// Found by TestRoundTripPeerGroup, not by inspection.
+	//
+	// BLOCKED on gobgp-netlink adding RemovePrivate to
+	// NewPeerGroupFromConfigStruct - one line, and it would make this symmetric
+	// with the peer path. Until then a change to a group's removePrivate reaches
+	// gobgpd only when some other field changes alongside it.
+
 	// Compared as of v1.3.1, where it round-trips. In v1.3.0 ListPeer returned
 	// 0 for it whatever was sent, so comparing it would have churned forever.
 	// The struct field, NOT GetSendCommunity(): for a field with explicit
@@ -352,7 +378,26 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 }
 
 // afiSafisConfigEqual compares AFI/SAFI config only (ignoring State).
+// afiSafisConfigEqual compares the afi-safi list, and only when the CR sets one.
+//
+// A neighbor that omits afiSafis sends nil, and gobgpd answers with its default
+// family set - populated entries for whatever global.families says, or
+// ipv4-unicast when it says nothing. Comparing lengths then gives 0 against 1+
+// and UpdatePeer fires on every reconcile for every neighbor that does not spell
+// its families out.
+//
+// Found by TestRoundTripNeighbor against a real daemon. The cluster used to
+// check for churn happened to set afiSafis on every neighbor, so it never
+// exercised this - which is exactly the gap a round-trip harness closes and a
+// single production config cannot.
+//
+// Same guard, and the same known gap, as the other "compare only what the CR
+// sets" cases: removing the afiSafis block to fall back to the default set is
+// not detected as a change.
 func afiSafisConfigEqual(desired, current []*gobgpapi.AfiSafi) bool {
+	if len(desired) == 0 {
+		return true
+	}
 	if len(desired) != len(current) {
 		return false
 	}
@@ -524,12 +569,43 @@ func ebgpMultihopEqual(desired, current *gobgpapi.EbgpMultihop) bool {
 // the unexported sizeCache and unknownFields, the latter populated whenever the
 // daemon sends a field this client does not know. Either one re-issues
 // AddDefinedSet(Replace: true) on every reconcile.
+// definedSetListEqual compares community and as-path lists ignoring the regex
+// anchors gobgpd adds.
+//
+// ParseCommunityRegexp turns a plain "65000:100" into "^65000:100$" before
+// storing it, so ListDefinedSet hands back an anchored form that never matches
+// what the CR said and reconcileDefinedSets rewrites the set on every reconcile.
+// Found by TestRoundTripDefinedSet; it is cheaper than the peer cases - a
+// redundant AddDefinedSet touches no session - but it is still an RPC and a log
+// line every pass.
+//
+// Anchors are stripped from both sides rather than replicating gobgpd's parser.
+// That parser has four branches - bare integer decomposed to "^hi:lo$", AS:VALUE
+// anchored, well-known names mapped to numbers, anything else compiled as-is -
+// and duplicating it here would be a second copy to keep in step with the fork.
+//
+// KNOWN GAP: a community written as a bare integer ("4259840") still churns,
+// because gobgpd rewrites it to "^65000:0$" and no amount of anchor-stripping
+// recovers that. Write communities as AS:VALUE, which is the documented form and
+// what every sample uses.
+func definedSetListEqual(desired, current []string) bool {
+	if len(desired) != len(current) {
+		return false
+	}
+	for i := range desired {
+		if strings.Trim(desired[i], "^$") != strings.Trim(current[i], "^$") {
+			return false
+		}
+	}
+	return true
+}
+
 func definedSetEqual(desired, current *gobgpapi.DefinedSet) bool {
 	if desired.GetDefinedType() != current.GetDefinedType() ||
 		desired.GetName() != current.GetName() {
 		return false
 	}
-	if !slices.Equal(desired.GetList(), current.GetList()) {
+	if !definedSetListEqual(desired.GetList(), current.GetList()) {
 		return false
 	}
 	dp, cp := desired.GetPrefixes(), current.GetPrefixes()
