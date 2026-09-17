@@ -240,7 +240,18 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 		dc.PeerGroup != cc.PeerGroup ||
 		dc.AdminDown != cc.AdminDown ||
 		dc.NeighborInterface != cc.NeighborInterface ||
-		dc.Vrf != cc.Vrf {
+		dc.Vrf != cc.Vrf ||
+		// Verified round-trippable against a live gobgpd v1.3.0: ListPeer
+		// echoes each of these back as sent. send_community is absent from this
+		// list because it does NOT echo - it always returns 0 - so comparing it
+		// would churn every reconcile; it is not sent either. See the note above
+		// crdToAPIRemovePrivate.
+		dc.AllowOwnAsn != cc.AllowOwnAsn ||
+		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
+		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal ||
+		dc.RemovePrivate != cc.RemovePrivate ||
+		dc.RouteFlapDamping != cc.RouteFlapDamping ||
+		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
 		return false
 	}
 
@@ -290,7 +301,10 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 		dc.Description != cc.Description ||
 		dc.AllowOwnAsn != cc.AllowOwnAsn ||
 		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
-		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal {
+		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal ||
+		dc.RemovePrivate != cc.RemovePrivate ||
+		dc.RouteFlapDamping != cc.RouteFlapDamping ||
+		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
 		return false
 	}
 
@@ -1123,12 +1137,27 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		return fmt.Errorf("failed to resolve router ID: %w", err)
 	}
 
-	// Create desired config with resolved router ID
+	// Create desired config with resolved router ID.
+	//
+	// Everything below the first four fields used to be accepted by the CRD and
+	// silently dropped here - a user could set global.gracefulRestart or
+	// global.confederation and nothing whatsoever happened.
+	families, err := crdToAPIGlobalFamilies(bgpConfig.Spec.Global.Families)
+	if err != nil {
+		return fmt.Errorf("global.families: %w", err)
+	}
 	desired := &gobgpapi.Global{
-		Asn:             bgpConfig.Spec.Global.ASN,
-		RouterId:        effectiveRouterID,
-		ListenPort:      bgpConfig.Spec.Global.ListenPort,
-		ListenAddresses: bgpConfig.Spec.Global.ListenAddresses,
+		Asn:                   bgpConfig.Spec.Global.ASN,
+		RouterId:              effectiveRouterID,
+		ListenPort:            bgpConfig.Spec.Global.ListenPort,
+		ListenAddresses:       bgpConfig.Spec.Global.ListenAddresses,
+		Families:              families,
+		UseMultiplePaths:      bgpConfig.Spec.Global.UseMultiplePaths,
+		RouteSelectionOptions: crdToAPIRouteSelectionOptions(bgpConfig.Spec.Global.RouteSelectionOptions),
+		DefaultRouteDistance:  crdToAPIDefaultRouteDistance(bgpConfig.Spec.Global.DefaultRouteDistance),
+		Confederation:         crdToAPIConfederation(bgpConfig.Spec.Global.Confederation),
+		GracefulRestart:       crdToAPIGracefulRestart(bgpConfig.Spec.Global.GracefulRestart),
+		BindToDevice:          bgpConfig.Spec.Global.BindToDevice,
 	}
 
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
@@ -1146,18 +1175,47 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		return startErr
 	}
 
-	// BGP server already running with config - check if immutable fields (ASN, RouterID) match
-	// We only compare ASN and RouterID because other fields (ListenPort, ListenAddresses)
-	// are set by gobgp with defaults and would cause false positives with reflect.DeepEqual
+	// BGP server already running - check whether the immutable fields still match.
+	//
+	// Only ASN, RouterID and UseMultiplePaths are compared, because those are
+	// the only fields GetBgp echoes back. Measured against gobgpd v1.3.0 by
+	// sending a fully-populated Global and reading it back: families,
+	// routeSelectionOptions, defaultRouteDistance, confederation,
+	// gracefulRestart and bindToDevice are ACCEPTED and APPLIED but never
+	// reported. ListenPort and ListenAddresses are echoed but gobgpd defaults
+	// them ("0.0.0.0", "::"), so comparing those churns.
+	//
+	// So drift in the write-only fields is undetectable here - the same
+	// limitation as netlink's dampeningInterval. Changing one takes effect on
+	// the next pod restart, silently. Unblocking that needs GetBgp to report
+	// them; see docs. Do NOT "fix" this by comparing them against the CR, which
+	// would compare a set value against a permanent zero and loop forever.
+	// ASN and RouterID are the identity of the BGP speaker. gobgpd cannot change
+	// them on a running server, and continuing would reconcile neighbors against
+	// a speaker that is not the one the CR describes, so this stops.
 	if current.Global.Asn != desired.Asn || current.Global.RouterId != desired.RouterId {
-		// Global config (ASN, RouterID) cannot be changed dynamically in gobgp.
-		// A pod restart is required to apply changes to global configuration.
-		log.Info("Global config changed - pod restart required to apply changes",
-			"currentASN", current.Global.Asn,
-			"desiredASN", desired.Asn,
-			"currentRouterID", current.Global.RouterId,
-			"desiredRouterID", desired.RouterId)
-		return fmt.Errorf("global configuration change detected (ASN or RouterID); pod restart required to apply")
+		log.Info("Global identity changed - pod restart required to apply",
+			"currentASN", current.Global.Asn, "desiredASN", desired.Asn,
+			"currentRouterID", current.Global.RouterId, "desiredRouterID", desired.RouterId)
+		return fmt.Errorf("global identity change detected (ASN or RouterID); pod restart required to apply")
+	}
+
+	// Everything else in Global also needs a restart to take effect, but it does
+	// NOT stop the reconcile. Returning an error here would abort before
+	// neighbors, peer groups and policies are reconciled, so one change to a
+	// secondary global setting would freeze all other configuration on the node
+	// until the pod happened to restart - which is how the first version of this
+	// behaved and is strictly worse than applying what can be applied.
+	//
+	// Only UseMultiplePaths is checked because it is the only one of them GetBgp
+	// echoes back; see the comment on the desired Global above.
+	if current.Global.UseMultiplePaths != desired.UseMultiplePaths {
+		log.Info("Global setting changed - takes effect on next pod restart",
+			"setting", "useMultiplePaths",
+			"current", current.Global.UseMultiplePaths,
+			"desired", desired.UseMultiplePaths)
+		r.Recorder.Event(bgpConfig, corev1.EventTypeWarning, "GlobalRestartRequired",
+			"global.useMultiplePaths changed; restart the k8gobgp pod on this node for it to take effect")
 	}
 	return nil
 }
@@ -1361,6 +1419,55 @@ func (r *BGPConfigurationReconciler) reconcilePolicies(ctx context.Context, apiC
 		log.Info("Adding/Updating policy", "name", name)
 		if _, err := apiClient.AddPolicy(ctx, &gobgpapi.AddPolicyRequest{Policy: desired}); err != nil {
 			log.Error(err, "Failed to add/update policy", "name", name)
+		}
+	}
+
+	// 5. Global policy assignment.
+	//
+	// global.applyPolicy was accepted by the CRD and never applied. Unlike the
+	// other global fields it is not part of the Global message at all - there is
+	// no apply_policy on it - so it cannot ride along with StartBgp. Global
+	// policy is its own RPC, and nothing in this controller called it.
+	//
+	// The assignment name is "global", which is what gobgpd keys the
+	// global-scope policy off; a neighbor's own applyPolicy still travels on the
+	// Peer message and is unaffected by this.
+	if err := r.reconcileGlobalPolicyAssignment(ctx, apiClient, bgpConfig, log); err != nil {
+		return err
+	}
+	return nil
+}
+
+// reconcileGlobalPolicyAssignment applies spec.global.applyPolicy.
+//
+// Set unconditionally rather than compared first, matching how policies
+// themselves are reconciled just above: SetPolicyAssignment is idempotent, and
+// there is no read-back that distinguishes "assigned" from "assigned with the
+// same contents" cheaply enough to be worth a comparison here.
+func (r *BGPConfigurationReconciler) reconcileGlobalPolicyAssignment(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
+	ap := bgpConfig.Spec.Global.ApplyPolicy
+	if ap == nil {
+		return nil
+	}
+	for _, a := range []struct {
+		crd       *bgpv1.PolicyAssignment
+		direction gobgpapi.PolicyDirection
+		label     string
+	}{
+		{ap.ImportPolicy, gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT, "import"},
+		{ap.ExportPolicy, gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT, "export"},
+	} {
+		if a.crd == nil {
+			continue
+		}
+		assignment := crdToAPIPolicyAssignment(a.crd)
+		assignment.Name = "global"
+		assignment.Direction = a.direction
+		log.Info("Setting global policy assignment", "direction", a.label, "policies", a.crd.Policies)
+		if _, err := apiClient.SetPolicyAssignment(ctx, &gobgpapi.SetPolicyAssignmentRequest{
+			Assignment: assignment,
+		}); err != nil {
+			return fmt.Errorf("set global %s policy assignment: %w", a.label, err)
 		}
 	}
 	return nil
@@ -2219,23 +2326,48 @@ func crdToAPIStatement(crd *bgpv1.Statement) *gobgpapi.Statement {
 }
 
 func crdToAPIConditions(crd *bgpv1.Conditions) *gobgpapi.Conditions {
-	return &gobgpapi.Conditions{
-		PrefixSet:    crdToAPIMatchSet(crd.PrefixSet),
-		NeighborSet:  crdToAPIMatchSet(crd.NeighborSet),
-		AsPathSet:    crdToAPIMatchSet(crd.AsPathSet),
-		CommunitySet: crdToAPIMatchSet(crd.CommunitySet),
-		RpkiResult:   crdToAPIRpkiValidationResult(crd.RpkiResult),
+	out := &gobgpapi.Conditions{
+		PrefixSet:         crdToAPIMatchSet(crd.PrefixSet),
+		NeighborSet:       crdToAPIMatchSet(crd.NeighborSet),
+		AsPathSet:         crdToAPIMatchSet(crd.AsPathSet),
+		CommunitySet:      crdToAPIMatchSet(crd.CommunitySet),
+		ExtCommunitySet:   crdToAPIMatchSet(crd.ExtCommunitySet),
+		LargeCommunitySet: crdToAPIMatchSet(crd.LargeCommunitySet),
+		RpkiResult:        crdToAPIRpkiValidationResult(crd.RpkiResult),
+		AsPathLength:      crdToAPIAsPathLength(crd.AsPathLength),
+		CommunityCount:    crdToAPICommunityCount(crd.CommunityCount),
+		RouteType:         crdToAPIRouteType(crd.RouteType),
+		Origin:            crdToAPIOriginType(crd.Origin),
+		NextHopInList:     crd.NextHopInList,
+		AfiSafiIn:         crdToAPIFamilies(crd.AfiSafiIn),
 	}
+	// Pointers in the CRD because 0 is a legitimate value for both, and the
+	// proto wraps each in a message whose presence is the "match on this at
+	// all" signal.
+	if crd.LocalPrefEq != nil {
+		out.LocalPrefEq = &gobgpapi.LocalPrefEq{Value: *crd.LocalPrefEq}
+	}
+	if crd.MedEq != nil {
+		out.MedEq = &gobgpapi.MedEq{Value: *crd.MedEq}
+	}
+	return out
 }
 
 func crdToAPIActions(crd *bgpv1.Actions) *gobgpapi.Actions {
-	return &gobgpapi.Actions{
-		RouteAction: crdToAPIRouteAction(crd.RouteAction),
-		Community:   crdToAPICommunityAction(crd.Community),
-		Med:         crdToAPIMedAction(crd.Med),
-		AsPrepend:   crdToAPIAsPrependAction(crd.AsPrepend),
-		LocalPref:   &gobgpapi.LocalPrefAction{Value: crd.LocalPref},
+	out := &gobgpapi.Actions{
+		RouteAction:    crdToAPIRouteAction(crd.RouteAction),
+		Community:      crdToAPICommunityAction(crd.Community),
+		ExtCommunity:   crdToAPICommunityAction(crd.ExtCommunity),
+		LargeCommunity: crdToAPICommunityAction(crd.LargeCommunity),
+		Med:            crdToAPIMedAction(crd.Med),
+		AsPrepend:      crdToAPIAsPrependAction(crd.AsPrepend),
+		Nexthop:        crdToAPINexthopAction(crd.Nexthop),
+		LocalPref:      &gobgpapi.LocalPrefAction{Value: crd.LocalPref},
 	}
+	if crd.Origin != "" {
+		out.OriginAction = &gobgpapi.OriginAction{Origin: crdToAPIOriginType(crd.Origin)}
+	}
+	return out
 }
 
 // crdToAPIPeerGroupWithPassword converts a CRD PeerGroup to API PeerGroup with resolved password
@@ -2250,6 +2382,9 @@ func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.Pe
 			AllowOwnAsn:          crd.Config.AllowOwnAsn,
 			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
 			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
+			RemovePrivate:        crdToAPIRemovePrivate(crd.Config.RemovePrivate),
+			RouteFlapDamping:     crd.Config.RouteFlapDamping,
+			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 		},
 		AfiSafis:    crdToAPIAfiSafis(crd.AfiSafis),
 		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
@@ -2272,6 +2407,14 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 			AdminDown:         crd.Config.AdminDown,
 			NeighborInterface: crd.Config.NeighborInterface,
 			Vrf:               crd.Config.Vrf,
+			// Previously unexposed: PeerConf carried these all along and the
+			// CRD had no way to set them.
+			AllowOwnAsn:          crd.Config.AllowOwnAsn,
+			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
+			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
+			RemovePrivate:        crdToAPIRemovePrivate(crd.Config.RemovePrivate),
+			RouteFlapDamping:     crd.Config.RouteFlapDamping,
+			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 		},
 		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
 		ApplyPolicy:     crdToAPIApplyPolicy(crd.ApplyPolicy),
@@ -2403,7 +2546,11 @@ func crdToAPIAfiSafis(crds []bgpv1.AfiSafi) []*gobgpapi.AfiSafi {
 				Family:  crdToAPIFamily(crd.Family),
 				Enabled: crd.Enabled,
 			},
-			// AddPaths, PrefixLimit, etc. would be converted here
+			// PrefixLimit carries its own Family, and gobgpd matches the limit
+			// to the afi-safi by it, so it has to be the same family as the
+			// entry it sits on rather than left nil.
+			PrefixLimits: crdToAPIPrefixLimit(crd.PrefixLimit, crd.Family),
+			AddPaths:     crdToAPIAddPaths(crd.AddPaths),
 		})
 	}
 	return apiAfiSafis
@@ -2460,6 +2607,107 @@ func crdToAPITransport(crd *bgpv1.Transport) *gobgpapi.Transport {
 	}
 }
 
+// bgpFamily is one address family as this CRD names it, with both encodings
+// gobgpd needs for it.
+//
+// One table, because there are two completely different encodings and three
+// call sites, and keeping them in separate lists is how they drift:
+//
+//   - afiSafi carries the Afi/Safi pair used by Peer.AfiSafis, PrefixLimit and
+//     policy conditions.
+//   - globalOrdinal is the bare index Global.Families expects. It is NOT
+//     afi<<16|safi: sending 65537 for ipv4-unicast does not error, it enables
+//     no families at all and the node carries no routes. Measured against a
+//     live gobgpd v1.3.0 by starting one daemon per candidate value and asking
+//     GetTable which families existed. TestGlobalFamilyOrdinals pins it.
+//
+// hasGlobalOrdinal is false for families that Global.Families cannot express,
+// so they are rejected there rather than silently mapped to the wrong index.
+type bgpFamily struct {
+	afi              gobgpapi.Family_Afi
+	safi             gobgpapi.Family_Safi
+	globalOrdinal    uint32
+	hasGlobalOrdinal bool
+}
+
+// bgpFamilies is the canonical set. The CRD enums on global.families,
+// afiSafis[].family and conditions.afiSafiIn are generated from these names and
+// must stay in step with them.
+var bgpFamilies = map[string]bgpFamily{
+	"ipv4-unicast": {gobgpapi.Family_AFI_IP, gobgpapi.Family_SAFI_UNICAST, 0, true},
+	"ipv6-unicast": {gobgpapi.Family_AFI_IP6, gobgpapi.Family_SAFI_UNICAST, 1, true},
+	"ipv4-labeled": {gobgpapi.Family_AFI_IP, gobgpapi.Family_SAFI_MPLS_LABEL, 2, true},
+	"ipv6-labeled": {gobgpapi.Family_AFI_IP6, gobgpapi.Family_SAFI_MPLS_LABEL, 3, true},
+	"ipv4-vpn":     {gobgpapi.Family_AFI_IP, gobgpapi.Family_SAFI_MPLS_VPN, 4, true},
+	"ipv6-vpn":     {gobgpapi.Family_AFI_IP6, gobgpapi.Family_SAFI_MPLS_VPN, 5, true},
+	"l2vpn-vpls":   {gobgpapi.Family_AFI_L2VPN, gobgpapi.Family_SAFI_VPLS, 8, true},
+	"l2vpn-evpn":   {gobgpapi.Family_AFI_L2VPN, gobgpapi.Family_SAFI_EVPN, 9, true},
+	// Expressible per-neighbor but not in Global.Families.
+	"ipv4-flowspec": {gobgpapi.Family_AFI_IP, gobgpapi.Family_SAFI_FLOW_SPEC_UNICAST, 0, false},
+	"ipv6-flowspec": {gobgpapi.Family_AFI_IP6, gobgpapi.Family_SAFI_FLOW_SPEC_UNICAST, 0, false},
+	"rtc":           {gobgpapi.Family_AFI_IP, gobgpapi.Family_SAFI_ROUTE_TARGET_CONSTRAINTS, 0, false},
+}
+
+// crdToAPIGlobalFamilies converts CRD family names to Global.Families.
+//
+// An empty list returns nil, which leaves gobgpd's default of ipv4-unicast and
+// ipv6-unicast. An unknown or non-global family is an error rather than a
+// skipped entry: the zero ordinal is ipv4-unicast, so silently dropping or
+// defaulting one would hand back a family the operator did not ask for.
+func crdToAPIGlobalFamilies(names []string) ([]uint32, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	out := make([]uint32, 0, len(names))
+	for _, n := range names {
+		f, ok := bgpFamilies[strings.ToLower(n)]
+		if !ok {
+			return nil, fmt.Errorf("unknown address family %q", n)
+		}
+		if !f.hasGlobalOrdinal {
+			return nil, fmt.Errorf("address family %q cannot be set in global.families; enable it per-neighbor with afiSafis", n)
+		}
+		out = append(out, f.globalOrdinal)
+	}
+	return out, nil
+}
+
+func crdToAPIRouteSelectionOptions(crd *bgpv1.RouteSelectionOptions) *gobgpapi.RouteSelectionOptionsConfig {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.RouteSelectionOptionsConfig{
+		AlwaysCompareMed:         crd.AlwaysCompareMed,
+		IgnoreAsPathLength:       crd.IgnoreAsPathLength,
+		ExternalCompareRouterId:  crd.ExternalCompareRouterID,
+		AdvertiseInactiveRoutes:  crd.AdvertiseInactiveRoutes,
+		EnableAigp:               crd.EnableAigp,
+		IgnoreNextHopIgpMetric:   crd.IgnoreNextHopIgpMetric,
+		DisableBestPathSelection: crd.DisableBestPathSelection,
+	}
+}
+
+func crdToAPIDefaultRouteDistance(crd *bgpv1.DefaultRouteDistance) *gobgpapi.DefaultRouteDistance {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.DefaultRouteDistance{
+		ExternalRouteDistance: crd.ExternalRouteDistance,
+		InternalRouteDistance: crd.InternalRouteDistance,
+	}
+}
+
+func crdToAPIConfederation(crd *bgpv1.Confederation) *gobgpapi.Confederation {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.Confederation{
+		Enabled:      crd.Enabled,
+		Identifier:   crd.Identifier,
+		MemberAsList: crd.MemberAsList,
+	}
+}
+
 func crdToAPIGracefulRestart(crd *bgpv1.GracefulRestart) *gobgpapi.GracefulRestart {
 	if crd == nil {
 		return nil
@@ -2512,7 +2760,79 @@ func crdToAPIMatchSet(crd *bgpv1.MatchSet) *gobgpapi.MatchSet {
 	}
 	return &gobgpapi.MatchSet{
 		Name: crd.Name,
-		// Type conversion needed
+		Type: crdToAPIMatchSetType(crd.Match),
+	}
+}
+
+// crdToAPIMatchSetType maps the CRD's match strings to the proto enum.
+//
+// The zero value is TYPE_UNSPECIFIED, and this used to return it for every
+// input because the conversion was never written - so a policy saying
+// match: "all" was sent as unspecified and matched as though it said "any".
+// An empty string keeps that default deliberately; the CRD enum rejects
+// anything that is not one of these three.
+func crdToAPIMatchSetType(s string) gobgpapi.MatchSet_Type {
+	switch s {
+	case "all":
+		return gobgpapi.MatchSet_TYPE_ALL
+	case "invert":
+		return gobgpapi.MatchSet_TYPE_INVERT
+	case "any":
+		return gobgpapi.MatchSet_TYPE_ANY
+	default:
+		return gobgpapi.MatchSet_TYPE_ANY
+	}
+}
+
+// crdToAPIPrefixLimit converts a per-afi-safi prefix limit.
+//
+// family is the afi-safi the limit belongs to: the proto carries it inside the
+// limit as well as on the entry, and gobgpd keys the limit off the inner one.
+func crdToAPIPrefixLimit(crd *bgpv1.PrefixLimit, family string) *gobgpapi.PrefixLimit {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.PrefixLimit{
+		Family:               crdToAPIFamily(family),
+		MaxPrefixes:          crd.MaxPrefixes,
+		ShutdownThresholdPct: crd.ShutdownThresholdPct,
+	}
+}
+
+func crdToAPIAddPaths(crd *bgpv1.AddPaths) *gobgpapi.AddPaths {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.AddPaths{
+		Config: &gobgpapi.AddPathsConfig{
+			Receive: crd.Receive,
+			SendMax: crd.SendMax,
+		},
+	}
+}
+
+// send_community is deliberately NOT exposed.
+//
+// PeerConf.SendCommunity is a uint32 bitmask with no enum and no comment in the
+// proto, and - measured against a live gobgpd v1.3.0 - no echo: ListPeer
+// returns 0 for it whatever was sent. So the mapping from
+// "standard"/"extended"/"large" to bit values cannot be confirmed from the API,
+// and a wrong guess would silently advertise the wrong community attributes
+// rather than failing. A draft of this change shipped a guessed mapping with a
+// comment claiming it was measured; it was not.
+//
+// BLOCKED on a gobgp-netlink change: either echo send_community in ListPeer, or
+// replace the bitmask with a proper enum. Either makes this a few lines here.
+// Until then gobgpd's own default applies.
+
+func crdToAPIRemovePrivate(s string) gobgpapi.RemovePrivate {
+	switch s {
+	case "all":
+		return gobgpapi.RemovePrivate_REMOVE_PRIVATE_ALL
+	case "replace":
+		return gobgpapi.RemovePrivate_REMOVE_PRIVATE_REPLACE
+	default:
+		return gobgpapi.RemovePrivate_REMOVE_PRIVATE_UNSPECIFIED
 	}
 }
 
@@ -2540,13 +2860,124 @@ func crdToAPIRouteAction(s string) gobgpapi.RouteAction {
 	}
 }
 
+// crdToAPICommunityActionType maps the CRD's action type to the proto enum.
+//
+// This was never written: the converter set only Communities, so every
+// community action - add, remove, replace alike - went to gobgpd as
+// TYPE_UNSPECIFIED. A policy written to strip a community was not stripping it.
+//
+// "add" is the fallback rather than UNSPECIFIED because the CRD marks type as
+// required and the enum below rejects anything else, so the default is
+// unreachable from a valid CR; it exists so the zero value is at least the
+// least destructive action.
+func crdToAPICommunityActionType(s string) gobgpapi.CommunityAction_Type {
+	switch s {
+	case "remove":
+		return gobgpapi.CommunityAction_TYPE_REMOVE
+	case "replace":
+		return gobgpapi.CommunityAction_TYPE_REPLACE
+	default:
+		return gobgpapi.CommunityAction_TYPE_ADD
+	}
+}
+
+// crdToAPIMedActionType maps "mod"/"replace". Same omission as the community
+// action above: the type never reached gobgpd at all.
+//
+// The distinction matters - "mod" adjusts the MED relative to its current
+// value, "replace" overwrites it - so sending neither is not a smaller version
+// of either.
+func crdToAPIMedActionType(s string) gobgpapi.MedAction_Type {
+	switch s {
+	case "replace":
+		return gobgpapi.MedAction_TYPE_REPLACE
+	default:
+		return gobgpapi.MedAction_TYPE_MOD
+	}
+}
+
+// crdToAPIComparison maps eq/ge/le for the length and count conditions.
+func crdToAPIComparison(s string) gobgpapi.Comparison {
+	switch s {
+	case "ge":
+		return gobgpapi.Comparison_COMPARISON_GE
+	case "le":
+		return gobgpapi.Comparison_COMPARISON_LE
+	default:
+		return gobgpapi.Comparison_COMPARISON_EQ
+	}
+}
+
+func crdToAPIOriginType(s string) gobgpapi.OriginType {
+	switch s {
+	case "igp":
+		return gobgpapi.OriginType_ORIGIN_TYPE_IGP
+	case "egp":
+		return gobgpapi.OriginType_ORIGIN_TYPE_EGP
+	case "incomplete":
+		return gobgpapi.OriginType_ORIGIN_TYPE_INCOMPLETE
+	default:
+		return gobgpapi.OriginType_ORIGIN_TYPE_UNSPECIFIED
+	}
+}
+
+func crdToAPIRouteType(s string) gobgpapi.Conditions_RouteType {
+	switch s {
+	case "internal":
+		return gobgpapi.Conditions_ROUTE_TYPE_INTERNAL
+	case "external":
+		return gobgpapi.Conditions_ROUTE_TYPE_EXTERNAL
+	case "local":
+		return gobgpapi.Conditions_ROUTE_TYPE_LOCAL
+	default:
+		return gobgpapi.Conditions_ROUTE_TYPE_UNSPECIFIED
+	}
+}
+
+func crdToAPIAsPathLength(crd *bgpv1.AsPathLengthCondition) *gobgpapi.AsPathLength {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.AsPathLength{Type: crdToAPIComparison(crd.Operator), Length: crd.Length}
+}
+
+func crdToAPICommunityCount(crd *bgpv1.CommunityCountCondition) *gobgpapi.CommunityCount {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.CommunityCount{Type: crdToAPIComparison(crd.Operator), Count: crd.Count}
+}
+
+func crdToAPINexthopAction(crd *bgpv1.NexthopAction) *gobgpapi.NexthopAction {
+	if crd == nil {
+		return nil
+	}
+	return &gobgpapi.NexthopAction{
+		Address:     crd.Address,
+		Self:        crd.Self,
+		Unchanged:   crd.Unchanged,
+		PeerAddress: crd.PeerAddress,
+	}
+}
+
+func crdToAPIFamilies(names []string) []*gobgpapi.Family {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]*gobgpapi.Family, 0, len(names))
+	for _, n := range names {
+		out = append(out, crdToAPIFamily(n))
+	}
+	return out
+}
+
 func crdToAPICommunityAction(crd *bgpv1.CommunityAction) *gobgpapi.CommunityAction {
 	if crd == nil {
 		return nil
 	}
 	return &gobgpapi.CommunityAction{
 		Communities: crd.Communities,
-		// Type conversion needed
+		Type:        crdToAPICommunityActionType(crd.Type),
 	}
 }
 
@@ -2556,7 +2987,7 @@ func crdToAPIMedAction(crd *bgpv1.MedAction) *gobgpapi.MedAction {
 	}
 	return &gobgpapi.MedAction{
 		Value: crd.Value,
-		// Type conversion needed
+		Type:  crdToAPIMedActionType(crd.Type),
 	}
 }
 
@@ -2570,18 +3001,19 @@ func crdToAPIAsPrependAction(crd *bgpv1.AsPrependAction) *gobgpapi.AsPrependActi
 	}
 }
 
+// crdToAPIFamily converts one family name.
+//
+// It used to know three families and return AFI_UNSPECIFIED/SAFI_UNSPECIFIED
+// for everything else, so afiSafis[].family: "ipv4-vpn" was accepted by the CRD
+// and sent to gobgpd as no family at all. Unknown names still fall back rather
+// than erroring, because the CRD enum now rejects them before they get here,
+// but the fallback is logged-by-construction: an unspecified family is visibly
+// wrong in `gobgp neighbor`, where a silently substituted one would not be.
 func crdToAPIFamily(s string) *gobgpapi.Family {
-	// This is a simplified mapping. A real implementation would be more robust.
-	switch strings.ToLower(s) {
-	case "ipv4-unicast":
-		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST}
-	case "ipv6-unicast":
-		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST}
-	case "l2vpn-evpn":
-		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_L2VPN, Safi: gobgpapi.Family_SAFI_EVPN}
-	default:
-		return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_UNSPECIFIED, Safi: gobgpapi.Family_SAFI_UNSPECIFIED}
+	if f, ok := bgpFamilies[strings.ToLower(s)]; ok {
+		return &gobgpapi.Family{Afi: f.afi, Safi: f.safi}
 	}
+	return &gobgpapi.Family{Afi: gobgpapi.Family_AFI_UNSPECIFIED, Safi: gobgpapi.Family_SAFI_UNSPECIFIED}
 }
 
 func (r *BGPConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {

@@ -151,8 +151,25 @@ spec:
                         type: integer
                     type: object
                   families:
+                    description: |-
+                      Families is the global address-family set. Omit it to keep gobgpd's
+                      default of ipv4-unicast and ipv6-unicast.
+
+                      The enum is enforced because the wire encoding is a bare ordinal: an
+                      unrecognized name cannot be passed through, and a wrong value does not
+                      error - it enables no families at all. See globalFamilyOrdinals.
                     items:
+                      enum:
+                      - ipv4-unicast
+                      - ipv6-unicast
+                      - ipv4-labeled
+                      - ipv6-labeled
+                      - ipv4-vpn
+                      - ipv6-vpn
+                      - l2vpn-vpls
+                      - l2vpn-evpn
                       type: string
+                    maxItems: 16
                     type: array
                   gracefulRestart:
                     properties:
@@ -189,8 +206,31 @@ spec:
                   routeSelectionOptions:
                     properties:
                       advertiseInactiveRoutes:
+                        description: AdvertiseInactiveRoutes advertises routes not
+                          installed in the FIB.
                         type: boolean
                       alwaysCompareMed:
+                        description: AlwaysCompareMed compares MED across paths from
+                          different ASes.
+                        type: boolean
+                      disableBestPathSelection:
+                        description: DisableBestPathSelection turns off best-path
+                          selection entirely.
+                        type: boolean
+                      enableAigp:
+                        description: EnableAigp enables AIGP metric comparison.
+                        type: boolean
+                      externalCompareRouterID:
+                        description: ExternalCompareRouterID compares router IDs for
+                          external paths.
+                        type: boolean
+                      ignoreAsPathLength:
+                        description: IgnoreAsPathLength skips AS-path length in best-path
+                          selection.
+                        type: boolean
+                      ignoreNextHopIgpMetric:
+                        description: IgnoreNextHopIgpMetric skips the next-hop IGP
+                          metric.
                         type: boolean
                     type: object
                   routerID:
@@ -242,6 +282,25 @@ spec:
                           enabled:
                             type: boolean
                           family:
+                            description: |-
+                              Family is the address family, e.g. ipv4-unicast.
+
+                              Enforced as an enum because the converter previously recognized only
+                              three names and sent AFI_UNSPECIFIED for anything else - so a typo, or a
+                              perfectly valid family it did not know, was accepted by the CRD and
+                              silently produced a peer with no usable family.
+                            enum:
+                            - ipv4-unicast
+                            - ipv6-unicast
+                            - ipv4-labeled
+                            - ipv6-labeled
+                            - ipv4-vpn
+                            - ipv6-vpn
+                            - l2vpn-vpls
+                            - l2vpn-evpn
+                            - ipv4-flowspec
+                            - ipv6-flowspec
+                            - rtc
                             type: string
                           prefixLimit:
                             properties:
@@ -344,6 +403,17 @@ spec:
                       properties:
                         adminDown:
                           type: boolean
+                        allowAspathLoopLocal:
+                          description: AllowAspathLoopLocal permits a local AS-path
+                            loop.
+                          type: boolean
+                        allowOwnAsn:
+                          description: |-
+                            AllowOwnAsn permits our own ASN to appear this many times in a received
+                            AS path. gobgpd errors above MaxUint8.
+                          format: int32
+                          maximum: 255
+                          type: integer
                         authPassword:
                           description: 'AuthPassword is the BGP authentication password
                             (DEPRECATED: use AuthPasswordSecretRef instead)'
@@ -398,6 +468,26 @@ spec:
                           type: integer
                         peerGroup:
                           type: string
+                        removePrivate:
+                          description: |-
+                            RemovePrivate strips private ASNs from advertised AS paths:
+                            "all" removes them, "replace" substitutes our own ASN.
+                          enum:
+                          - all
+                          - replace
+                          type: string
+                        replacePeerAsn:
+                          description: ReplacePeerAsn rewrites the peer's ASN with
+                            ours in advertised AS paths.
+                          type: boolean
+                        routeFlapDamping:
+                          description: RouteFlapDamping enables RFC 2439 damping for
+                            this peer.
+                          type: boolean
+                        sendSoftwareVersion:
+                          description: SendSoftwareVersion advertises the software-version
+                            capability (RFC 9384).
+                          type: boolean
                         vrf:
                           type: string
                       required:
@@ -564,6 +654,7 @@ spec:
                           items:
                             pattern: ^\d{1,5}:\d{1,5}$
                             type: string
+                          maxItems: 128
                           type: array
                         largeCommunityList:
                           description: 'LargeCommunityList filters routes by large
@@ -571,6 +662,7 @@ spec:
                           items:
                             pattern: ^\d+:\d+:\d+$
                             type: string
+                          maxItems: 128
                           type: array
                         metric:
                           description: 'Metric is the route metric/priority in Linux
@@ -634,6 +726,25 @@ spec:
                           enabled:
                             type: boolean
                           family:
+                            description: |-
+                              Family is the address family, e.g. ipv4-unicast.
+
+                              Enforced as an enum because the converter previously recognized only
+                              three names and sent AFI_UNSPECIFIED for anything else - so a typo, or a
+                              perfectly valid family it did not know, was accepted by the CRD and
+                              silently produced a peer with no usable family.
+                            enum:
+                            - ipv4-unicast
+                            - ipv6-unicast
+                            - ipv4-labeled
+                            - ipv6-labeled
+                            - ipv4-vpn
+                            - ipv6-vpn
+                            - l2vpn-vpls
+                            - l2vpn-evpn
+                            - ipv4-flowspec
+                            - ipv6-flowspec
+                            - rtc
                             type: string
                           prefixLimit:
                             properties:
@@ -783,9 +894,25 @@ spec:
                           type: integer
                         peerGroupName:
                           type: string
+                        removePrivate:
+                          description: |-
+                            RemovePrivate strips private ASNs from advertised AS paths:
+                            "all" removes them, "replace" substitutes our own ASN.
+                          enum:
+                          - all
+                          - replace
+                          type: string
                         replacePeerAsn:
                           description: ReplacePeerAsn replaces the peer's ASN in the
                             AS path with our own.
+                          type: boolean
+                        routeFlapDamping:
+                          description: RouteFlapDamping enables RFC 2439 damping for
+                            members of this group.
+                          type: boolean
+                        sendSoftwareVersion:
+                          description: SendSoftwareVersion advertises the software-version
+                            capability (RFC 9384).
                           type: boolean
                       required:
                       - peerGroupName
@@ -889,6 +1016,12 @@ spec:
                     name:
                       type: string
                     statements:
+                      description: |-
+                        Statements are evaluated in order.
+
+                        Bounded because CEL rules nested below here are costed statically
+                        against this bound; unbounded, the estimator assumes the maximum and
+                        pushed the whole CRD over the apiserver budget, rejecting it outright.
                       items:
                         properties:
                           actions:
@@ -907,10 +1040,60 @@ spec:
                               community:
                                 properties:
                                   communities:
+                                    description: Communities are the values to act
+                                      on.
                                     items:
                                       type: string
+                                    maxItems: 64
                                     type: array
                                   type:
+                                    description: Type is "add", "remove" or "replace".
+                                    enum:
+                                    - add
+                                    - remove
+                                    - replace
+                                    type: string
+                                required:
+                                - communities
+                                - type
+                                type: object
+                              extCommunity:
+                                description: ExtCommunity manipulates extended communities.
+                                properties:
+                                  communities:
+                                    description: Communities are the values to act
+                                      on.
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    type: array
+                                  type:
+                                    description: Type is "add", "remove" or "replace".
+                                    enum:
+                                    - add
+                                    - remove
+                                    - replace
+                                    type: string
+                                required:
+                                - communities
+                                - type
+                                type: object
+                              largeCommunity:
+                                description: LargeCommunity manipulates large communities.
+                                properties:
+                                  communities:
+                                    description: Communities are the values to act
+                                      on.
+                                    items:
+                                      type: string
+                                    maxItems: 64
+                                    type: array
+                                  type:
+                                    description: Type is "add", "remove" or "replace".
+                                    enum:
+                                    - add
+                                    - remove
+                                    - replace
                                     type: string
                                 required:
                                 - communities
@@ -922,14 +1105,54 @@ spec:
                               med:
                                 properties:
                                   type:
+                                    description: Type is "mod" (adjust relative to
+                                      the current MED) or "replace".
+                                    enum:
+                                    - mod
+                                    - replace
                                     type: string
                                   value:
+                                    description: Value is the amount to add, or the
+                                      value to set.
                                     format: int64
                                     type: integer
                                 required:
                                 - type
                                 - value
                                 type: object
+                              nexthop:
+                                description: Nexthop rewrites the route's next hop.
+                                properties:
+                                  address:
+                                    description: Address sets an explicit next hop.
+                                    maxLength: 64
+                                    type: string
+                                  peerAddress:
+                                    description: PeerAddress rewrites the next hop
+                                      to the peer's address.
+                                    type: boolean
+                                  self:
+                                    description: Self rewrites the next hop to this
+                                      speaker's address.
+                                    type: boolean
+                                  unchanged:
+                                    description: Unchanged preserves the received
+                                      next hop.
+                                    type: boolean
+                                type: object
+                                x-kubernetes-validations:
+                                - message: set at most one of address, self, unchanged,
+                                    peerAddress
+                                  rule: '[has(self.address), has(self.self) && self.self,
+                                    has(self.unchanged) && self.unchanged, has(self.peerAddress)
+                                    && self.peerAddress].filter(x, x).size() <= 1'
+                              origin:
+                                description: Origin sets the ORIGIN attribute.
+                                enum:
+                                - igp
+                                - egp
+                                - incomplete
+                                type: string
                               routeAction:
                                 type: string
                             required:
@@ -937,42 +1160,226 @@ spec:
                             type: object
                           conditions:
                             properties:
+                              afiSafiIn:
+                                description: AfiSafiIn matches when the route belongs
+                                  to one of these families.
+                                items:
+                                  enum:
+                                  - ipv4-unicast
+                                  - ipv6-unicast
+                                  - ipv4-labeled
+                                  - ipv6-labeled
+                                  - ipv4-vpn
+                                  - ipv6-vpn
+                                  - l2vpn-vpls
+                                  - l2vpn-evpn
+                                  - ipv4-flowspec
+                                  - ipv6-flowspec
+                                  - rtc
+                                  type: string
+                                maxItems: 16
+                                type: array
+                              asPathLength:
+                                description: AsPathLength matches on the number of
+                                  ASes in the AS path.
+                                properties:
+                                  length:
+                                    description: Length is the number of ASes to compare
+                                      against.
+                                    format: int32
+                                    type: integer
+                                  operator:
+                                    description: Operator is "eq", "ge" or "le".
+                                    enum:
+                                    - eq
+                                    - ge
+                                    - le
+                                    type: string
+                                required:
+                                - length
+                                - operator
+                                type: object
                               asPathSet:
+                                description: |-
+                                  MatchSet references a DefinedSet and says how its members must match.
+
+                                  match was previously accepted and dropped: crdToAPIMatchSet set only Name, so
+                                  "all" and "invert" were both sent as TYPE_UNSPECIFIED and the policy matched
+                                  differently than it read. That is a silent change of routing policy, not an
+                                  inert no-op, which is why the values are now an enforced enum.
                                 properties:
                                   match:
+                                    description: Match is "any" (default), "all",
+                                      or "invert".
+                                    enum:
+                                    - any
+                                    - all
+                                    - invert
                                     type: string
                                   name:
+                                    description: Name of the DefinedSet to match against.
                                     type: string
                                 required:
                                 - name
+                                type: object
+                              communityCount:
+                                description: CommunityCount matches on how many communities
+                                  a route carries.
+                                properties:
+                                  count:
+                                    description: Count is the number of communities
+                                      to compare against.
+                                    format: int32
+                                    type: integer
+                                  operator:
+                                    description: Operator is "eq", "ge" or "le".
+                                    enum:
+                                    - eq
+                                    - ge
+                                    - le
+                                    type: string
+                                required:
+                                - count
+                                - operator
                                 type: object
                               communitySet:
+                                description: |-
+                                  MatchSet references a DefinedSet and says how its members must match.
+
+                                  match was previously accepted and dropped: crdToAPIMatchSet set only Name, so
+                                  "all" and "invert" were both sent as TYPE_UNSPECIFIED and the policy matched
+                                  differently than it read. That is a silent change of routing policy, not an
+                                  inert no-op, which is why the values are now an enforced enum.
                                 properties:
                                   match:
+                                    description: Match is "any" (default), "all",
+                                      or "invert".
+                                    enum:
+                                    - any
+                                    - all
+                                    - invert
                                     type: string
                                   name:
+                                    description: Name of the DefinedSet to match against.
                                     type: string
                                 required:
                                 - name
                                 type: object
+                              extCommunitySet:
+                                description: ExtCommunitySet matches extended communities.
+                                properties:
+                                  match:
+                                    description: Match is "any" (default), "all",
+                                      or "invert".
+                                    enum:
+                                    - any
+                                    - all
+                                    - invert
+                                    type: string
+                                  name:
+                                    description: Name of the DefinedSet to match against.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              largeCommunitySet:
+                                description: |-
+                                  LargeCommunitySet matches large communities. Note NetlinkExportRule
+                                  already supported large communities; BGP policy did not.
+                                properties:
+                                  match:
+                                    description: Match is "any" (default), "all",
+                                      or "invert".
+                                    enum:
+                                    - any
+                                    - all
+                                    - invert
+                                    type: string
+                                  name:
+                                    description: Name of the DefinedSet to match against.
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              localPrefEq:
+                                description: |-
+                                  LocalPrefEq matches an exact LOCAL_PREF. A pointer because 0 is a valid
+                                  local preference and must be distinguishable from "not matching on it".
+                                format: int32
+                                type: integer
+                              medEq:
+                                description: MedEq matches an exact MED. A pointer
+                                  for the same reason as LocalPrefEq.
+                                format: int32
+                                type: integer
                               neighborSet:
+                                description: |-
+                                  MatchSet references a DefinedSet and says how its members must match.
+
+                                  match was previously accepted and dropped: crdToAPIMatchSet set only Name, so
+                                  "all" and "invert" were both sent as TYPE_UNSPECIFIED and the policy matched
+                                  differently than it read. That is a silent change of routing policy, not an
+                                  inert no-op, which is why the values are now an enforced enum.
                                 properties:
                                   match:
+                                    description: Match is "any" (default), "all",
+                                      or "invert".
+                                    enum:
+                                    - any
+                                    - all
+                                    - invert
                                     type: string
                                   name:
+                                    description: Name of the DefinedSet to match against.
                                     type: string
                                 required:
                                 - name
                                 type: object
+                              nextHopInList:
+                                description: NextHopInList matches when the next hop
+                                  is one of these addresses.
+                                items:
+                                  type: string
+                                maxItems: 64
+                                type: array
+                              origin:
+                                description: Origin matches the ORIGIN attribute.
+                                enum:
+                                - igp
+                                - egp
+                                - incomplete
+                                type: string
                               prefixSet:
+                                description: |-
+                                  MatchSet references a DefinedSet and says how its members must match.
+
+                                  match was previously accepted and dropped: crdToAPIMatchSet set only Name, so
+                                  "all" and "invert" were both sent as TYPE_UNSPECIFIED and the policy matched
+                                  differently than it read. That is a silent change of routing policy, not an
+                                  inert no-op, which is why the values are now an enforced enum.
                                 properties:
                                   match:
+                                    description: Match is "any" (default), "all",
+                                      or "invert".
+                                    enum:
+                                    - any
+                                    - all
+                                    - invert
                                     type: string
                                   name:
+                                    description: Name of the DefinedSet to match against.
                                     type: string
                                 required:
                                 - name
                                 type: object
+                              routeType:
+                                description: RouteType matches the route's origin
+                                  relative to this speaker.
+                                enum:
+                                - internal
+                                - external
+                                - local
+                                type: string
                               rpkiResult:
                                 type: string
                             type: object
@@ -983,6 +1390,7 @@ spec:
                         - conditions
                         - name
                         type: object
+                      maxItems: 128
                       type: array
                   required:
                   - name
@@ -1014,6 +1422,7 @@ spec:
                           items:
                             pattern: ^\d{1,5}:\d{1,5}$
                             type: string
+                          maxItems: 128
                           type: array
                         enabled:
                           description: Enabled activates VRF-to-VRF export
@@ -1024,6 +1433,7 @@ spec:
                           items:
                             pattern: ^\d+:\d+:\d+$
                             type: string
+                          maxItems: 128
                           type: array
                         linuxTableId:
                           description: LinuxTableId is the target Linux routing table

@@ -398,6 +398,35 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 			},
 		},
 		{
+			// The PeerConf fields that had no CRD surface until they were wired.
+			// Each is compared, so each is a fresh chance to churn - measured
+			// against a live gobgpd v1.3.0, ListPeer echoes all six back as
+			// sent. send_community is deliberately absent: it does NOT echo
+			// (always 0), which is why it is neither sent nor compared.
+			name: "every previously-unexposed PeerConf field set",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{
+					NeighborAddress:      "10.0.0.20",
+					PeerAsn:              64513,
+					AllowOwnAsn:          3,
+					ReplacePeerAsn:       true,
+					AllowAspathLoopLocal: true,
+					RemovePrivate:        "replace",
+					RouteFlapDamping:     true,
+					SendSoftwareVersion:  true,
+				},
+			},
+		},
+		{
+			// The same fields left at their zero values. gobgpd echoes zero for
+			// each, so this is the case that would break if any of them were
+			// defaulted server-side the way connectRetry and localAsn are.
+			name: "previously-unexposed PeerConf fields all omitted",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.21", PeerAsn: 64513},
+			},
+		},
+		{
 			// ListPeer redacts the password, so the comparator can never see it
 			// come back. Asserting on it means an UpdatePeer every reconcile for
 			// every authenticated peer.

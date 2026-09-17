@@ -1608,3 +1608,103 @@ func TestReconcile_NotFoundClearsConfigGauges(t *testing.T) {
 	assert.Zero(t, testutil.CollectAndCount(bgpConfigurationReady),
 		"gauge for a deleted config must not linger")
 }
+
+// --- global configuration -----------------------------------------------------
+
+// TestGlobalFamilyOrdinals pins the Global.Families wire encoding.
+//
+// These are measured values, not derived ones. Global.Families is []uint32 and
+// the obvious reading - gobgp's own bgp.RouteFamily constant, afi<<16|safi,
+// making ipv4-unicast 65537 - is wrong. Verified against a live gobgpd v1.3.0
+// by starting one daemon per candidate value and asking GetTable which families
+// existed:
+//
+//	65537 -> no families at all (does NOT error)
+//	    0 -> ipv4-unicast        5 -> ipv6-vpn
+//	    1 -> ipv6-unicast        7 -> StartBgp rejects it
+//	    2 -> ipv4-labeled       8 -> l2vpn-vpls
+//	    3 -> ipv6-labeled       9 -> l2vpn-evpn
+//	    4 -> ipv4-vpn
+//
+// This matters more than a normal constant, because a wrong value here does not
+// fail - it brings the node up carrying no routes. If a fork bump reorders the
+// family list these ordinals all shift meaning silently, and this test is the
+// only thing standing between that and a fleet-wide outage. Re-run the probe
+// when bumping, do not "fix" this by editing the numbers.
+func TestGlobalFamilyOrdinals(t *testing.T) {
+	want := map[string]uint32{
+		"ipv4-unicast": 0, "ipv6-unicast": 1,
+		"ipv4-labeled": 2, "ipv6-labeled": 3,
+		"ipv4-vpn": 4, "ipv6-vpn": 5,
+		"l2vpn-vpls": 8, "l2vpn-evpn": 9,
+	}
+	got := map[string]uint32{}
+	for name, f := range bgpFamilies {
+		if f.hasGlobalOrdinal {
+			got[name] = f.globalOrdinal
+		}
+	}
+	assert.Equal(t, want, got)
+
+	// 65537 is the value a reasonable person would reach for - gobgp's own
+	// RouteFamily constant for ipv4-unicast. It must not appear anywhere.
+	for name, ord := range got {
+		assert.Less(t, ord, uint32(16), "%s: ordinals are small; %d looks like a packed afi/safi", name, ord)
+	}
+
+	// Every family must convert to a real afi/safi pair, or afiSafis[].family
+	// silently produces a peer with no usable family.
+	for name := range bgpFamilies {
+		f := crdToAPIFamily(name)
+		assert.NotEqual(t, gobgpapi.Family_AFI_UNSPECIFIED, f.GetAfi(), "family %q has no afi", name)
+		assert.NotEqual(t, gobgpapi.Family_SAFI_UNSPECIFIED, f.GetSafi(), "family %q has no safi", name)
+	}
+}
+
+func TestCrdToAPIGlobalFamilies(t *testing.T) {
+	// Omitted means "keep gobgpd's default", which is nil, not an empty slice.
+	got, err := crdToAPIGlobalFamilies(nil)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+
+	got, err = crdToAPIGlobalFamilies([]string{"ipv6-unicast", "l2vpn-evpn"})
+	require.NoError(t, err)
+	assert.Equal(t, []uint32{1, 9}, got)
+
+	// An unknown name must be an error, never a silent zero: zero is
+	// ipv4-unicast, so falling back would quietly substitute the wrong family.
+	_, err = crdToAPIGlobalFamilies([]string{"ipv4-unicast", "not-a-family"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not-a-family")
+
+	// A family that is valid per-neighbor but has no Global.Families ordinal
+	// must be rejected rather than mapped to ordinal 0 (= ipv4-unicast).
+	_, err = crdToAPIGlobalFamilies([]string{"ipv4-flowspec"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "afiSafis")
+}
+
+// The global sub-messages were accepted by the CRD and dropped on the floor.
+func TestCrdToAPIGlobalSubMessages(t *testing.T) {
+	assert.Nil(t, crdToAPIRouteSelectionOptions(nil))
+	assert.Nil(t, crdToAPIDefaultRouteDistance(nil))
+	assert.Nil(t, crdToAPIConfederation(nil))
+
+	rso := crdToAPIRouteSelectionOptions(&bgpv1.RouteSelectionOptions{
+		AlwaysCompareMed: true, IgnoreAsPathLength: true, ExternalCompareRouterID: true,
+		AdvertiseInactiveRoutes: true, EnableAigp: true, IgnoreNextHopIgpMetric: true,
+		DisableBestPathSelection: true,
+	})
+	assert.True(t, rso.GetAlwaysCompareMed() && rso.GetIgnoreAsPathLength() &&
+		rso.GetExternalCompareRouterId() && rso.GetAdvertiseInactiveRoutes() &&
+		rso.GetEnableAigp() && rso.GetIgnoreNextHopIgpMetric() && rso.GetDisableBestPathSelection())
+
+	drd := crdToAPIDefaultRouteDistance(&bgpv1.DefaultRouteDistance{ExternalRouteDistance: 20, InternalRouteDistance: 200})
+	assert.Equal(t, uint32(20), drd.GetExternalRouteDistance())
+	assert.Equal(t, uint32(200), drd.GetInternalRouteDistance())
+
+	cf := crdToAPIConfederation(&bgpv1.Confederation{Enabled: true, Identifier: 65000, MemberAsList: []uint32{65001, 65002}})
+	assert.True(t, cf.GetEnabled())
+	assert.Equal(t, uint32(65000), cf.GetIdentifier())
+	assert.Equal(t, []uint32{65001, 65002}, cf.GetMemberAsList())
+}
