@@ -2811,19 +2811,27 @@ func crdToAPIAddPaths(crd *bgpv1.AddPaths) *gobgpapi.AddPaths {
 	}
 }
 
-// send_community is deliberately NOT exposed.
+// send_community is NOT exposed, because gobgpd cannot receive it over gRPC.
 //
-// PeerConf.SendCommunity is a uint32 bitmask with no enum and no comment in the
-// proto, and - measured against a live gobgpd v1.3.0 - no echo: ListPeer
-// returns 0 for it whatever was sent. So the mapping from
-// "standard"/"extended"/"large" to bit values cannot be confirmed from the API,
-// and a wrong guess would silently advertise the wrong community attributes
-// rather than failing. A draft of this change shipped a guessed mapping with a
-// comment claiming it was measured; it was not.
+// Read from the fork's source at the pinned commit (8b99965), not inferred:
+// newNeighborFromAPIStruct and newPeerGroupFromAPIStruct in
+// pkg/server/grpc_server.go copy every other PeerConf field into oc.Neighbor -
+// routeFlapDamping, sendSoftwareVersion, removePrivate, allowOwnAsn,
+// replacePeerAsn, allowAspathLoopLocal - and simply do not copy SendCommunity.
+// The field exists in the proto, exists as oc.CommunityType in the internal
+// config, and is even exported as a metric, but the API value is dropped on the
+// floor. It is reachable only through gobgpd's config file, which k8gobgp never
+// uses. That is why ListPeer always echoes 0 for it.
 //
-// BLOCKED on a gobgp-netlink change: either echo send_community in ListPeer, or
-// replace the bitmask with a proper enum. Either makes this a few lines here.
-// Until then gobgpd's own default applies.
+// So a CRD field here would be inert by construction - the same shape as the
+// TCP-AO keychain RPCs, which exist with nothing to bind them to a session.
+//
+// Also worth recording, since it is what a reader will reach for: the encoding
+// is NOT a bitmask. oc.CommunityTypeToIntMap is standard=0, extended=1, both=2,
+// none=3. Note 0 means STANDARD, not none, and there is no "large" or "all".
+//
+// BLOCKED on gobgp-netlink copying a.Conf.SendCommunity in those two
+// converters. That is two lines there; this is a handful here.
 
 func crdToAPIRemovePrivate(s string) gobgpapi.RemovePrivate {
 	switch s {

@@ -280,7 +280,12 @@ type NeighborConfig struct {
 	Vrf               string `json:"vrf,omitempty"`
 
 	// AllowOwnAsn permits our own ASN to appear this many times in a received
-	// AS path. gobgpd errors above MaxUint8.
+	// AS path.
+	//
+	// The bound is load-bearing, not cosmetic. gobgpd's peer-group path errors
+	// above MaxUint8, but its neighbor path does a bare uint8() cast with no
+	// check (grpc_server.go, newNeighborFromAPIStruct), so 256 would silently
+	// truncate to 0 - the opposite of what was asked for.
 	// +kubebuilder:validation:Maximum=255
 	// +optional
 	AllowOwnAsn uint32 `json:"allowOwnAsn,omitempty"`
