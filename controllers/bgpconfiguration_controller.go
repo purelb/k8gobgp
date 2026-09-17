@@ -256,6 +256,12 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
 		return false
 	}
+	// defaulted: addNeighbor runs SetDefaultNeighborConfigValues, so ListPeer
+	// echoes a fully-populated BFD block for every peer - including peers that
+	// have no BFD at all, which is the case that churns if this is skipped.
+	if !bfdEqual(desired.Bfd, current.Bfd, true) {
+		return false
+	}
 	return true
 }
 
@@ -267,11 +273,15 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 	}
 
 	dc, cc := desired.Conf, current.Conf
+	// AuthPassword is not compared, for the same reason as in peerConfigEqual:
+	// ListPeerGroup redacts it before the group leaves the server.
 	if dc.PeerGroupName != cc.PeerGroupName ||
 		dc.PeerAsn != cc.PeerAsn ||
 		dc.LocalAsn != cc.LocalAsn ||
 		dc.Description != cc.Description ||
-		dc.AuthPassword != cc.AuthPassword {
+		dc.AllowOwnAsn != cc.AllowOwnAsn ||
+		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
+		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal {
 		return false
 	}
 
@@ -288,6 +298,13 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 		return false
 	}
 	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
+		return false
+	}
+	// Not defaulted, unlike the peer case above: addPeerGroup calls no
+	// defaulting function at all, so ListPeerGroup echoes the block as sent.
+	// Defaulting here would make every peer group permanently unequal, and
+	// UpdatePeerGroup loops updateNeighbor over every member.
+	if !bfdEqual(desired.Bfd, current.Bfd, false) {
 		return false
 	}
 	return true
@@ -365,7 +382,8 @@ func transportConfigEqual(desired, current *gobgpapi.Transport) bool {
 		return false
 	}
 	return desired.GetPassiveMode() == current.GetPassiveMode() &&
-		desired.GetBindInterface() == current.GetBindInterface()
+		desired.GetBindInterface() == current.GetBindInterface() &&
+		desired.GetIpTos() == current.GetIpTos()
 }
 
 // applyPolicyEqual compares the policy assignment fields that round-trip.
@@ -452,6 +470,7 @@ func definedSetEqual(desired, current *gobgpapi.DefinedSet) bool {
 	}
 	for i := range dp {
 		if dp[i].GetIpPrefix() != cp[i].GetIpPrefix() ||
+			dp[i].GetRtcPrefix() != cp[i].GetRtcPrefix() ||
 			dp[i].GetMaskLengthMin() != cp[i].GetMaskLengthMin() ||
 			dp[i].GetMaskLengthMax() != cp[i].GetMaskLengthMax() {
 			return false
@@ -2025,6 +2044,7 @@ func crdToAPIDefinedSet(crd *bgpv1.DefinedSet) *gobgpapi.DefinedSet {
 	for _, p := range crd.Prefixes {
 		prefixes = append(prefixes, &gobgpapi.Prefix{
 			IpPrefix:      p.IpPrefix,
+			RtcPrefix:     p.RtcPrefix,
 			MaskLengthMin: p.MaskLengthMin,
 			MaskLengthMax: p.MaskLengthMax,
 		})
@@ -2155,16 +2175,20 @@ func crdToAPIActions(crd *bgpv1.Actions) *gobgpapi.Actions {
 func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.PeerGroup, authPassword string) *gobgpapi.PeerGroup {
 	return &gobgpapi.PeerGroup{
 		Conf: &gobgpapi.PeerGroupConf{
-			PeerGroupName: crd.Config.PeerGroupName,
-			PeerAsn:       crd.Config.PeerAsn,
-			LocalAsn:      crd.Config.LocalAsn,
-			Description:   crd.Config.Description,
-			AuthPassword:  authPassword,
+			PeerGroupName:        crd.Config.PeerGroupName,
+			PeerAsn:              crd.Config.PeerAsn,
+			LocalAsn:             crd.Config.LocalAsn,
+			Description:          crd.Config.Description,
+			AuthPassword:         authPassword,
+			AllowOwnAsn:          crd.Config.AllowOwnAsn,
+			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
+			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
 		},
 		AfiSafis:    crdToAPIAfiSafis(crd.AfiSafis),
 		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
 		Timers:      crdToAPITimers(crd.Timers),
 		Transport:   crdToAPITransport(crd.Transport),
+		Bfd:         crdToAPIBfd(crd.BFD),
 	}
 }
 
@@ -2189,7 +2213,94 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 		GracefulRestart: crdToAPIGracefulRestart(crd.GracefulRestart),
 		RouteReflector:  crdToAPIRouteReflector(crd.RouteReflector),
 		EbgpMultihop:    crdToAPIEbgpMultihop(crd.EbgpMultihop),
+		Bfd:             crdToAPIBfd(crd.BFD),
 	}
+}
+
+// crdToAPIBfd converts a CRD BFD block. A nil block stays nil, which is what
+// tells gobgpd to inherit the peer group's - inheritance is whole-block, keyed
+// on the block being entirely zero.
+func crdToAPIBfd(crd *bgpv1.BFD) *gobgpapi.BfdPeerConfig {
+	if crd == nil {
+		return nil
+	}
+	enabled := false
+	if crd.Enabled != nil {
+		enabled = *crd.Enabled
+	}
+	return &gobgpapi.BfdPeerConfig{
+		Enabled:                  enabled,
+		Port:                     crd.Port,
+		DesiredMinimumTxInterval: crd.DesiredMinimumTxInterval,
+		RequiredMinimumReceive:   crd.RequiredMinimumReceive,
+		DetectionMultiplier:      crd.DetectionMultiplier,
+	}
+}
+
+// gobgpd's BFD defaults, applied by SetDefaultNeighborConfigValues to every
+// neighbor regardless of whether BFD is enabled. They must match the CRD's
+// kubebuilder defaults exactly, or a peer that sets a bfd block compares
+// unequal against what ListPeer echoes back and churns forever.
+const (
+	bfdDefaultPort                = 3784
+	bfdDefaultInterval            = 1000000 // microseconds
+	bfdDefaultDetectionMultiplier = 3
+)
+
+// bfdWithDefaults returns cfg with gobgpd's defaults filled in.
+//
+// Applied unconditionally, including to a nil or all-zero block: gobgpd defaults
+// every neighbor's BFD config whether or not BFD is enabled, and
+// NewPeerFromConfigStruct then emits it for every peer. So the case that churns
+// is not a partially-specified block - it is a peer with no BFD at all, where
+// the CR sends nothing and ListPeer returns a fully-populated one.
+func bfdWithDefaults(cfg *gobgpapi.BfdPeerConfig) *gobgpapi.BfdPeerConfig {
+	out := &gobgpapi.BfdPeerConfig{
+		Enabled:                  cfg.GetEnabled(),
+		Port:                     cfg.GetPort(),
+		DesiredMinimumTxInterval: cfg.GetDesiredMinimumTxInterval(),
+		RequiredMinimumReceive:   cfg.GetRequiredMinimumReceive(),
+		DetectionMultiplier:      cfg.GetDetectionMultiplier(),
+	}
+	if out.Port == 0 {
+		out.Port = bfdDefaultPort
+	}
+	if out.DetectionMultiplier == 0 {
+		out.DetectionMultiplier = bfdDefaultDetectionMultiplier
+	}
+	if out.DesiredMinimumTxInterval == 0 {
+		out.DesiredMinimumTxInterval = bfdDefaultInterval
+	}
+	if out.RequiredMinimumReceive == 0 {
+		out.RequiredMinimumReceive = bfdDefaultInterval
+	}
+	return out
+}
+
+// bfdEqual compares two BFD configs as gobgpd would report them.
+//
+// defaulted fills gobgpd's defaults on *both* sides before comparing, and it is
+// required for peers: addNeighbor runs SetDefaultNeighborConfigValues, so
+// ListPeer echoes 3784/3/1e6/1e6 against the nil block the CR sent, and without
+// it every neighbor without BFD churns.
+//
+// For peer groups it is false because addPeerGroup runs no defaulting and
+// ListPeerGroup echoes the block as sent. Measured honestly: passing true here
+// would *also* compare equal today, since both sides receive the same treatment
+// and the CRD's own defaults mean a partial block never reaches this code. It is
+// false because that is what the daemon actually does - so if the fork starts
+// defaulting peer groups, the peer path is already correct and this one fails
+// loudly rather than silently drifting.
+func bfdEqual(desired, current *gobgpapi.BfdPeerConfig, defaulted bool) bool {
+	d, c := desired, current
+	if defaulted {
+		d, c = bfdWithDefaults(desired), bfdWithDefaults(current)
+	}
+	return d.GetEnabled() == c.GetEnabled() &&
+		d.GetPort() == c.GetPort() &&
+		d.GetDesiredMinimumTxInterval() == c.GetDesiredMinimumTxInterval() &&
+		d.GetRequiredMinimumReceive() == c.GetRequiredMinimumReceive() &&
+		d.GetDetectionMultiplier() == c.GetDetectionMultiplier()
 }
 
 // --- Secret Resolution Helper ---
@@ -2278,6 +2389,7 @@ func crdToAPITransport(crd *bgpv1.Transport) *gobgpapi.Transport {
 		LocalAddress:  crd.LocalAddress,
 		PassiveMode:   crd.PassiveMode,
 		BindInterface: crd.BindInterface,
+		IpTos:         crd.IpTos,
 	}
 }
 

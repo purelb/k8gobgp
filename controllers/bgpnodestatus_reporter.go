@@ -42,11 +42,23 @@ import (
 // +kubebuilder:rbac:groups=bgp.purelb.io,resources=bgpnodestatuses/status,verbs=get;update;patch
 
 // Array size caps to prevent etcd size issues with large RIBs.
+//
+// etcd refuses a value over 1.5 MiB and the apiserver rejects earlier still, so
+// every unbounded list here needs a bound. TestStatusCapsFitEtcdBudget measures
+// the worst case these caps permit and is the reason for the specific numbers -
+// re-run it rather than adjusting a cap by eye.
 const (
 	maxLocalRoutes       = 500
 	maxReceivedRoutes    = 100
 	maxExportedRoutes    = 500
 	maxImportedAddresses = 500
+	maxNeighbors         = 128
+	maxVRFs              = 64
+	// Per local route. This is the dominant term in the whole object: it is
+	// built one address per established neighbor per local route, so it
+	// multiplies rather than adds. 16 is enough to name the peers a route is
+	// actually reaching; beyond that the count is the useful signal.
+	maxAdvertisedTo = 16
 )
 
 // GoBGPNodeStatusClient extends GoBGPStatsClient with additional methods needed by the reporter.
@@ -57,6 +69,7 @@ type GoBGPNodeStatusClient interface {
 	ListPeer(ctx context.Context, in *gobgpapi.ListPeerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPeerResponse], error)
 	ListPath(ctx context.Context, in *gobgpapi.ListPathRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPathResponse], error)
 	GetNetlink(ctx context.Context, in *gobgpapi.GetNetlinkRequest, opts ...grpc.CallOption) (*gobgpapi.GetNetlinkResponse, error)
+	GetBfdServerState(ctx context.Context, in *gobgpapi.GetBfdServerStateRequest, opts ...grpc.CallOption) (*gobgpapi.GetBfdServerStateResponse, error)
 	ListNetlinkExportRules(ctx context.Context, in *gobgpapi.ListNetlinkExportRulesRequest, opts ...grpc.CallOption) (*gobgpapi.ListNetlinkExportRulesResponse, error)
 	ListNetlinkExport(ctx context.Context, in *gobgpapi.ListNetlinkExportRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListNetlinkExportResponse], error)
 	ListVrf(ctx context.Context, in *gobgpapi.ListVrfRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListVrfResponse], error)
@@ -284,8 +297,14 @@ func (r *BGPNodeStatusReporter) collectStatus(ctx context.Context, log logr.Logg
 	if err != nil {
 		log.V(1).Info("Failed to collect neighbor status", "error", err)
 	} else {
-		status.Neighbors = neighbors
+		// NeighborCount is set from the full list, before the cap, so it stays
+		// the honest answer to "how many peers does this node have".
 		status.NeighborCount = len(neighbors)
+		if len(neighbors) > maxNeighbors {
+			neighbors = neighbors[:maxNeighbors]
+			status.Truncated = true
+		}
+		status.Neighbors = neighbors
 	}
 
 	// Collect netlink import status
@@ -317,7 +336,22 @@ func (r *BGPNodeStatusReporter) collectStatus(ctx context.Context, log logr.Logg
 	if err != nil {
 		log.V(1).Info("Failed to collect VRF status", "error", err)
 	} else {
+		if len(vrfs) > maxVRFs {
+			vrfs = vrfs[:maxVRFs]
+			status.Truncated = true
+		}
 		status.VRFs = vrfs
+	}
+
+	// BFD server state. The response carries a nil State when no peer has BFD
+	// enabled - the server was never started - which is deliberately
+	// distinguishable from a started server with zero counters. Reporting
+	// nothing in that case keeps "not listening because nobody asked" out of the
+	// CR entirely.
+	if bfdResp, err := apiClient.GetBfdServerState(ctx, &gobgpapi.GetBfdServerStateRequest{}); err != nil {
+		log.V(1).Info("Failed to get BFD server state", "error", err)
+	} else if bfdResp.GetState() != nil {
+		status.BFDServer = &bgpv1.BFDServerStatus{Listening: bfdResp.GetState().GetListening()}
 	}
 
 	// Derive health
@@ -359,6 +393,21 @@ func (r *BGPNodeStatusReporter) collectNeighborStatus(ctx context.Context, clien
 
 		if peer.Conf != nil {
 			ns.Description = peer.Conf.Description
+		}
+
+		// Gated on BFD actually being enabled. NewPeerFromConfigStruct builds
+		// State.BfdState for every peer, so without this gate every neighbor
+		// gains a bfd block reporting Unspecified - noise in every CR on every
+		// node, and bytes in the one list that has no cap.
+		if peer.GetBfd().GetEnabled() {
+			bs := peer.GetState().GetBfdState()
+			ns.BFD = &bgpv1.BFDStatus{
+				SessionState:         bfdStateToString(bs.GetSessionState()),
+				RemoteSessionState:   bfdStateToString(bs.GetRemoteSessionState()),
+				LocalDiagnosticCode:  bfdDiagToString(bs.GetLocalDiagnosticCode()),
+				RemoteDiagnosticCode: bfdDiagToString(bs.GetRemoteDiagnosticCode()),
+				FailureTransitions:   bs.GetFailureTransitions(),
+			}
 		}
 
 		// Session uptime (Established) or last error (non-Established)
@@ -574,15 +623,38 @@ func (r *BGPNodeStatusReporter) collectRIBStatus(ctx context.Context, apiClient 
 			localPrefixIndex[route.Prefix] = i
 		}
 
-		for _, neighbor := range neighbors {
+		// Counted separately from the slice length, because the slice stops
+		// growing at maxAdvertisedTo while the count must stay accurate.
+		advertisedToCount := make([]int, len(localRoutes))
+
+		// Sorted so that *which* addresses survive the cap is deterministic.
+		// ListPeer's order is not guaranteed, and without this a node with more
+		// than maxAdvertisedTo established neighbors would keep the same count
+		// but a different sample each poll - making statusEqual false forever
+		// and turning the change-suppression path into a write every cycle.
+		ordered := make([]bgpv1.NeighborStatus, len(neighbors))
+		copy(ordered, neighbors)
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i].Address < ordered[j].Address })
+
+		for _, neighbor := range ordered {
 			if neighbor.State != "Established" {
 				continue
 			}
 			adjOutPrefixes := r.getAdjOutPrefixes(ctx, apiClient, neighbor.Address, families)
 			for prefix := range adjOutPrefixes {
 				if idx, ok := localPrefixIndex[prefix]; ok {
-					localRoutes[idx].AdvertisedTo = append(localRoutes[idx].AdvertisedTo, neighbor.Address)
+					advertisedToCount[idx]++
+					if len(localRoutes[idx].AdvertisedTo) < maxAdvertisedTo {
+						localRoutes[idx].AdvertisedTo = append(localRoutes[idx].AdvertisedTo, neighbor.Address)
+					}
 				}
+			}
+		}
+
+		for i := range localRoutes {
+			localRoutes[i].AdvertisedToCount = advertisedToCount[i]
+			if advertisedToCount[i] > len(localRoutes[i].AdvertisedTo) {
+				status.Truncated = true
 			}
 		}
 	}
@@ -814,12 +886,52 @@ func (r *BGPNodeStatusReporter) writeStatus(ctx context.Context, status *bgpv1.B
 	return nil
 }
 
+// bfdDegraded reports whether BFD is configured on this node but not working.
+//
+// The second return is the condition reason, and the third the message; both are
+// empty when BFD is not in use at all. That "not in use" case is the important
+// one: deriveHealth is a pure AND, and the BFD socket binds lazily on the first
+// BFD peer, so treating `listening == false` as unhealthy without this gate
+// would mark every non-BFD node - including every local-address-mode deployment,
+// which peers with nobody - permanently unhealthy.
+func (r *BGPNodeStatusReporter) bfdDegraded(status *bgpv1.BGPNodeStatusData) (bool, string, string) {
+	configured := 0
+	down := 0
+	for _, n := range status.Neighbors {
+		if n.BFD == nil {
+			continue
+		}
+		configured++
+		if n.BFD.SessionState != "Up" {
+			down++
+		}
+	}
+	if configured == 0 {
+		return false, "", ""
+	}
+
+	if status.BFDServer == nil || !status.BFDServer.Listening {
+		return true, "ServerNotListening", fmt.Sprintf(
+			"%d neighbor(s) have BFD enabled but the BFD socket is not bound; no failure detection is running", configured)
+	}
+	if down > 0 {
+		// Usually a link-local neighborAddress configured without its %zone:
+		// transmit succeeds, BGP establishes, BFD never leaves Down. Briefly
+		// also true while a newly added session comes up.
+		return true, "SessionsDown", fmt.Sprintf("%d of %d BFD session(s) are not Up", down, configured)
+	}
+	return false, "Healthy", fmt.Sprintf("%d BFD session(s) Up", configured)
+}
+
 // deriveHealth returns true if all neighbors are Established and no import/export failures.
 func (r *BGPNodeStatusReporter) deriveHealth(status *bgpv1.BGPNodeStatusData) bool {
 	for _, n := range status.Neighbors {
 		if n.State != "Established" {
 			return false
 		}
+	}
+	if degraded, _, _ := r.bfdDegraded(status); degraded {
+		return false
 	}
 	if status.NetlinkImport != nil {
 		for _, addr := range status.NetlinkImport.ImportedAddresses {
@@ -853,6 +965,17 @@ func (r *BGPNodeStatusReporter) setReadyCondition(status *bgpv1.BGPNodeStatusDat
 		setCondition(status, "Ready", metav1.ConditionTrue, "AllHealthy", msg)
 	} else {
 		setCondition(status, "Ready", metav1.ConditionFalse, "Degraded", "one or more components unhealthy")
+	}
+
+	// BFDDegraded is reported only on nodes that actually use BFD, so a
+	// non-BFD node carries no BFD condition at all rather than a permanent
+	// False one that reads like a warning.
+	if degraded, reason, msg := r.bfdDegraded(status); reason != "" {
+		condStatus := metav1.ConditionFalse
+		if degraded {
+			condStatus = metav1.ConditionTrue
+		}
+		setCondition(status, "BFDDegraded", condStatus, reason, msg)
 	}
 }
 
@@ -908,6 +1031,54 @@ func setCondition(status *bgpv1.BGPNodeStatusData, condType string, condStatus m
 		Message:            message,
 		LastTransitionTime: now,
 	})
+}
+
+// bfdStateToString renders a BFD session state for the CR.
+//
+// The CR's vocabulary, not the protobuf enum's: NeighborStatus.State already
+// reads "Established", so emitting "BFD_SESSION_STATE_UP" beside it would put
+// two conventions in one object. Metric labels keep the enum names - that is a
+// third vocabulary, and docs/metrics.md maps between them.
+func bfdStateToString(s gobgpapi.BfdSessionState) string {
+	switch s {
+	case gobgpapi.BfdSessionState_BFD_SESSION_STATE_UP:
+		return "Up"
+	case gobgpapi.BfdSessionState_BFD_SESSION_STATE_DOWN:
+		return "Down"
+	case gobgpapi.BfdSessionState_BFD_SESSION_STATE_ADMIN_DOWN:
+		return "AdminDown"
+	case gobgpapi.BfdSessionState_BFD_SESSION_STATE_INIT:
+		return "Init"
+	default:
+		return "Unspecified"
+	}
+}
+
+// bfdDiagToString renders an RFC 5880 diagnostic code. Code 0 is
+// "NoDiagnostic", a healthy value rather than an absent one.
+func bfdDiagToString(d gobgpapi.BfdDiagnosticCode) string {
+	switch d {
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_NO_DIAGNOSTIC:
+		return "NoDiagnostic"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_DETECTION_TIMEOUT:
+		return "DetectionTimeout"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_ECHO_FAILED:
+		return "EchoFailed"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_NEIGHBOR_SIGNALED_SESSION_DOWN:
+		return "NeighborSignaledSessionDown"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_FORWARDING_PLANE_RESET:
+		return "ForwardingPlaneReset"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_PATH_DOWN:
+		return "PathDown"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_CONCATENATED_PATH_DOWN:
+		return "ConcatenatedPathDown"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_ADMINISTRATIVELY_DOWN:
+		return "AdministrativelyDown"
+	case gobgpapi.BfdDiagnosticCode_BFD_DIAGNOSTIC_CODE_REVERSE_CONCATENATED_PATH_DOWN:
+		return "ReverseConcatenatedPathDown"
+	default:
+		return "Unknown"
+	}
 }
 
 func peerStateToString(state gobgpapi.PeerState_SessionState) string {
@@ -999,6 +1170,24 @@ func sliceEmpty[T any](s []T) bool {
 	return len(s) == 0
 }
 
+func timeEqual(a, b *metav1.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Equal(b)
+}
+
+func bfdStatusEqual(a, b *bgpv1.BFDStatus) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.SessionState == b.SessionState &&
+		a.RemoteSessionState == b.RemoteSessionState &&
+		a.LocalDiagnosticCode == b.LocalDiagnosticCode &&
+		a.RemoteDiagnosticCode == b.RemoteDiagnosticCode &&
+		a.FailureTransitions == b.FailureTransitions
+}
+
 func neighborsEqual(a, b []bgpv1.NeighborStatus) bool {
 	if sliceEmpty(a) && sliceEmpty(b) {
 		return true
@@ -1020,6 +1209,17 @@ func neighborsEqual(a, b []bgpv1.NeighborStatus) bool {
 			na.State != nb.State || na.PrefixesSent != nb.PrefixesSent ||
 			na.PrefixesReceived != nb.PrefixesReceived || na.Description != nb.Description ||
 			na.LastError != nb.LastError {
+			return false
+		}
+		// SessionUpSince was already missing from this list, so a session that
+		// went down and came back between two collections looked unchanged.
+		if !timeEqual(na.SessionUpSince, nb.SessionUpSince) {
+			return false
+		}
+		// This list is an allow-list: a field not named here is invisible to the
+		// writer, so a BFD session dropping while BGP stays up would never reach
+		// the CR at all.
+		if !bfdStatusEqual(na.BFD, nb.BFD) {
 			return false
 		}
 	}
@@ -1088,6 +1288,9 @@ func ribRoutesEqual(a, b []bgpv1.RIBRoute) bool {
 	for i := range sortedA {
 		if sortedA[i].Prefix != sortedB[i].Prefix || sortedA[i].NextHop != sortedB[i].NextHop ||
 			sortedA[i].FromPeer != sortedB[i].FromPeer {
+			return false
+		}
+		if sortedA[i].AdvertisedToCount != sortedB[i].AdvertisedToCount {
 			return false
 		}
 		if !stringSlicesEqual(sortedA[i].AdvertisedTo, sortedB[i].AdvertisedTo) {

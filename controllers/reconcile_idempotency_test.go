@@ -130,6 +130,16 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 			RemotePort: 179,
 			LocalPort:  45678,
 		},
+		// Emitted for every peer, and defaulted whether or not BFD is enabled -
+		// SetDefaultNeighborConfigValues has no Enabled gate. A peer with no BFD
+		// at all still gets 3784/3/1e6/1e6 back, which is the case that churns.
+		Bfd: &gobgpapi.BfdPeerConfig{
+			Enabled:                  sent.GetBfd().GetEnabled(),
+			Port:                     orDefault(sent.GetBfd().GetPort(), 3784),
+			DesiredMinimumTxInterval: orDefault(sent.GetBfd().GetDesiredMinimumTxInterval(), 1000000),
+			RequiredMinimumReceive:   orDefault(sent.GetBfd().GetRequiredMinimumReceive(), 1000000),
+			DetectionMultiplier:      orDefault(sent.GetBfd().GetDetectionMultiplier(), 3),
+		},
 		State: &gobgpapi.PeerState{
 			NeighborAddress: sent.GetConf().GetNeighborAddress(),
 			SessionState:    gobgpapi.PeerState_SESSION_STATE_ESTABLISHED,
@@ -137,6 +147,48 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 		},
 	}
 	return echo
+}
+
+func orDefault(v, def uint32) uint32 {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+// gobgpdEchoPeerGroup returns what ListPeerGroup would report.
+//
+// Note what it does NOT do: apply BFD defaults. addPeerGroup calls no defaulting
+// function at all, so a peer group's BFD block comes back exactly as sent -
+// unlike a peer's. Comparing the two with one scheme is why this needs its own
+// helper rather than reusing gobgpdEcho.
+func gobgpdEchoPeerGroup(sent *gobgpapi.PeerGroup) *gobgpapi.PeerGroup {
+	conf := proto.CloneOf(sent.GetConf())
+	if conf != nil {
+		conf.AuthPassword = "" // redacted, same as ListPeer
+	}
+	return &gobgpapi.PeerGroup{
+		Conf:     conf,
+		AfiSafis: sent.GetAfiSafis(),
+		Bfd:      sent.GetBfd(),
+		ApplyPolicy: &gobgpapi.ApplyPolicy{
+			ImportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT},
+			ExportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT},
+		},
+		Timers: &gobgpapi.Timers{
+			Config: &gobgpapi.TimersConfig{
+				ConnectRetry:      sent.GetTimers().GetConfig().GetConnectRetry(),
+				HoldTime:          sent.GetTimers().GetConfig().GetHoldTime(),
+				KeepaliveInterval: sent.GetTimers().GetConfig().GetKeepaliveInterval(),
+			},
+		},
+		Transport: &gobgpapi.Transport{
+			LocalAddress:  "invalid IP",
+			PassiveMode:   sent.GetTransport().GetPassiveMode(),
+			BindInterface: sent.GetTransport().GetBindInterface(),
+			IpTos:         sent.GetTransport().GetIpTos(),
+		},
+	}
 }
 
 // --- fake gRPC client -------------------------------------------------------
@@ -269,6 +321,55 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 			},
 		},
 		{
+			// The case that churns if BFD defaults are applied only to a
+			// non-empty block: the CR sends nothing, gobgpd returns
+			// 3784/3/1e6/1e6. Every neighbor in a cluster that does not use BFD
+			// at all looks like this.
+			name: "no BFD block at all",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.9", PeerAsn: 64513},
+			},
+		},
+		{
+			name: "BFD enabled with CRD defaults filled in",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.10", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(true), Port: 3784,
+					DesiredMinimumTxInterval: 1000000,
+					RequiredMinimumReceive:   1000000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			// Opt-out from a peer group that has BFD on. The API server fills the
+			// other four fields as soon as the block exists, so this is a
+			// non-empty block that disables rather than an absent one.
+			name: "BFD explicitly disabled",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.11", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(false), Port: 3784,
+					DesiredMinimumTxInterval: 1000000,
+					RequiredMinimumReceive:   1000000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			name: "BFD at the fastest profile the CRD allows",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.12", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(true), Port: 3784,
+					DesiredMinimumTxInterval: 300000,
+					RequiredMinimumReceive:   300000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
 			// ListPeer redacts the password, so the comparator can never see it
 			// come back. Asserting on it means an UpdatePeer every reconcile for
 			// every authenticated peer.
@@ -339,4 +440,93 @@ func TestReconcileNeighbors_DetectsRealChange(t *testing.T) {
 
 	require.NoError(t, r.reconcileNeighbors(context.Background(), fake, cfg, map[string]*gobgpapi.PeerGroup{}, logf.Log))
 	assert.Equal(t, 1, fake.updatePeer, "a changed hold time must produce exactly one UpdatePeer")
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// TestPeerGroupConfigEqual_BFDNotDefaulted covers the peer group path, which
+// differs from the peer one: addPeerGroup runs no defaulting, so ListPeerGroup
+// echoes the BFD block as sent.
+//
+// Honest about what this does and does not prove. It asserts the peer group
+// comparator is idempotent, which is what matters. It does *not* detect the peer
+// scheme being applied here by mistake - bfdEqual defaults both sides, so nil
+// against nil compares equal either way. The reason to model the daemon
+// accurately anyway is that it stops being equivalent the moment the fork starts
+// defaulting peer groups.
+func TestPeerGroupConfigEqual_BFDNotDefaulted(t *testing.T) {
+	r := &BGPConfigurationReconciler{Log: logf.Log}
+
+	for _, tc := range []struct {
+		name  string
+		group bgpv1.PeerGroup
+	}{
+		{
+			name: "no BFD block",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{PeerGroupName: "g1", PeerAsn: 64513},
+			},
+		},
+		{
+			name: "BFD enabled",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{PeerGroupName: "g2", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(true), Port: 3784,
+					DesiredMinimumTxInterval: 1000000,
+					RequiredMinimumReceive:   1000000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			name: "AS path options set",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{
+					PeerGroupName: "g3", PeerAsn: 64513,
+					AllowOwnAsn: 2, ReplacePeerAsn: true, AllowAspathLoopLocal: true,
+				},
+			},
+		},
+		{
+			name: "MD5 password, which ListPeerGroup redacts",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{
+					PeerGroupName: "g4", PeerAsn: 64513, AuthPassword: "s3cret",
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sent := r.crdToAPIPeerGroupWithPassword(&tc.group, tc.group.Config.AuthPassword)
+			require.NotNil(t, sent)
+			assert.True(t, peerGroupConfigEqual(sent, gobgpdEchoPeerGroup(sent)),
+				"peer group compares unequal against what ListPeerGroup returns, so UpdatePeerGroup fires every reconcile")
+		})
+	}
+}
+
+// TestBfdEqual_DefaultingIsPerObject pins the asymmetry directly, so a future
+// change that unifies the two schemes fails here with an explanation rather
+// than as mysterious churn on a cluster.
+func TestBfdEqual_DefaultingIsPerObject(t *testing.T) {
+	sent := (*gobgpapi.BfdPeerConfig)(nil)
+	peerEcho := &gobgpapi.BfdPeerConfig{
+		Port: 3784, DetectionMultiplier: 3,
+		DesiredMinimumTxInterval: 1000000, RequiredMinimumReceive: 1000000,
+	}
+
+	assert.True(t, bfdEqual(sent, peerEcho, true),
+		"a peer sending no BFD must match gobgpd's defaulted echo")
+	assert.False(t, bfdEqual(sent, peerEcho, false),
+		"without defaulting the same pair is unequal - which is why the flag exists")
+	assert.True(t, bfdEqual(sent, nil, false),
+		"a peer group sending no BFD must match the empty block ListPeerGroup returns")
+	assert.True(t, bfdEqual(sent, nil, true),
+		"defaulting both sides of an empty pair is a no-op - recorded so the peer group flag is not mistaken for load-bearing")
+
+	enabled := &gobgpapi.BfdPeerConfig{Enabled: true, Port: 3784, DetectionMultiplier: 3,
+		DesiredMinimumTxInterval: 1000000, RequiredMinimumReceive: 1000000}
+	assert.False(t, bfdEqual(enabled, peerEcho, true),
+		"enabling BFD must still be detected as a change")
 }

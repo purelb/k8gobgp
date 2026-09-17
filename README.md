@@ -12,6 +12,7 @@ A Kubernetes controller for managing GoBGP configurations using Custom Resource 
 - **Full BGP Configuration via CRDs**: Manage all GoBGP settings declaratively through Kubernetes
 - **Neighbor Management**: Configure BGP peers with full support for timers, authentication, and AFI/SAFI
 - **Peer Groups**: Define reusable peer group templates for consistent neighbor configuration
+- **BFD**: Sub-second forwarding-path failure detection, opt-in per neighbor or peer group
 - **Dynamic Neighbors**: Support for dynamic BGP peering with prefix-based matching
 - **VRF Support**: Configure Virtual Routing and Forwarding instances
 - **Route Policies**: Define import/export policies with prefix lists, community matching, and AS path manipulation
@@ -346,6 +347,130 @@ spec:
         description: "Secondary upstream"
 ```
 
+### BFD (Bidirectional Forwarding Detection)
+
+BFD detects a dead forwarding path in under a second, where BGP's own hold timer
+takes tens of seconds. It is off by default and opt-in per neighbor.
+
+```yaml
+  peerGroups:
+    - config:
+        peerGroupName: "upstream-peers"
+        peerAsn: 64513
+      bfd:
+        enabled: true
+
+  neighbors:
+    # Inherits the peer group's BFD.
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerGroup: "upstream-peers"
+
+    # Opts out of it. See "inheritance is whole-block" below.
+    - config:
+        neighborAddress: "192.168.1.253"
+        peerGroup: "upstream-peers"
+      bfd:
+        enabled: false
+
+    # Standalone, with explicit timers.
+    - config:
+        neighborAddress: "192.168.1.252"
+        peerAsn: 64513
+      bfd:
+        enabled: true
+        desiredMinimumTxInterval: 1000000   # microseconds
+        requiredMinimumReceive: 1000000     # microseconds
+        detectionMultiplier: 3
+```
+
+**Timers are microseconds.** `1000000` is one second; `300000` is 300ms; `300`
+is 300 *microseconds* and is rejected. Detection time is
+`requiredMinimumReceive x detectionMultiplier`, so the defaults above give 3s.
+
+| Field | Default | Range |
+|---|---|---|
+| `enabled` | unset (inherit) | — |
+| `port` | 3784 | 1024–65535 |
+| `desiredMinimumTxInterval` | 1000000 (1s) | 300000–30000000 |
+| `requiredMinimumReceive` | 1000000 (1s) | 300000–30000000 |
+| `detectionMultiplier` | 3 | 3–255 |
+
+The local listener is always on port 3784 regardless of `port`, which only sets
+the destination for packets *sent* to that peer. RFC 5881 mandates 3784; there
+is rarely a reason to change it.
+
+#### Before you enable it
+
+**A BFD transition is a hard BGP reset.** Not a graceful restart — the session
+drops and every route through it is withdrawn. That is the point of BFD, but it
+means an over-aggressive profile converts a transient scheduling hiccup into a
+real outage.
+
+**Changing any BFD field also resets the session.** gobgpd implements a BFD
+config change as delete-then-add, which stops our transmit long enough for the
+remote end's detect timer to expire, so *the peer* tears the session down too.
+Apply BFD changes in a maintenance window, and roll them out one node at a time.
+
+**Sub-second profiles are not viable under the shipped CPU limit.** The
+DaemonSet sets `limits.cpu: 500m` against a `requests.cpu: 100m`. With the
+default 100ms CFS period that is a 50ms quota, so a container that exhausts its
+quota early in a period is frozen for up to 50ms:
+
+- At the **default** 1s/3 profile, detection is 3000ms and a worst-case 50ms
+  freeze is 1.7% of it. Comfortable.
+- At the **300ms floor**, detection is 900ms and the same freeze is 5.6% of it —
+  and, more to the point, it is a sixth of a single 300ms transmit interval, so
+  a few unlucky periods in a row can cost the packets that trigger a false
+  session-down and a hard BGP reset.
+
+If you need a sub-second profile, set `requests.cpu == limits.cpu` so the
+container is not throttled at the limit, and validate under load before relying
+on it.
+
+**Link-local peers need their scope zone.** A BFD control packet to `fe80::1`
+has no interface to leave by, and the send still succeeds on an arbitrary one.
+BGP establishes, everything reads healthy, and the BFD session never leaves
+`Down` — the failure detector you just enabled is not running. Write
+`fe80::1%eth0`, or use `neighborInterface`, which resolves the zone itself. The
+CRD rejects the zone-less form when BFD is enabled, so this fails at `kubectl
+apply` rather than in production.
+
+**Inheritance is whole-block, not per-field.** A neighbor with no `bfd:` takes
+its peer group's entire block; a neighbor with one replaces it entirely rather
+than merging field by field. `enabled` is deliberately nullable so that
+`bfd: {enabled: false}` is distinguishable from an absent block, which is what
+makes the opt-out above work.
+
+#### Observing it
+
+```bash
+# Per-neighbor session state, and whether the node's BFD socket is bound.
+kubectl get bgpnodestatus <node> -o jsonpath='{.status.neighbors[*].bfd}'
+kubectl get bgpnodestatus <node> -o jsonpath='{.status.bfdServer}'
+
+# Ground truth. BGPNodeStatus is a 60s-granularity view of a subsystem that
+# detects failure in under a second — use it to see what BFD is configured to do
+# and whether it has been failing, not as the failure detector.
+kubectl exec -n k8gobgp-system <pod> -c gobgpd -- gobgp neighbor <address>
+```
+
+A `BFDDegraded` condition appears on `BGPNodeStatus` only on nodes that actually
+use BFD, with reason `ServerNotListening` (peers want BFD and the socket is not
+bound — no failure detection is running) or `SessionsDown`. Nodes with no BFD
+peers carry no BFD condition at all, and never bind the socket; that is normal,
+and it does not affect `healthy`.
+
+Metrics are on the gobgpd endpoint (`:7475`): `bgp_bfd_server_up`,
+`bgp_peer_bfd_enabled`, `bgp_peer_bfd_failure_transitions_total`,
+`bgp_bfd_unknown_peer_total`, `bgp_bfd_received_drop_total`,
+`bgp_bfd_wrong_hop_limit_total`. See [docs/metrics.md](docs/metrics.md) and the
+sample rules in [docs/alerting/k8gobgp-alerts.yaml](docs/alerting/k8gobgp-alerts.yaml).
+
+Note that `bgp_bfd_unknown_peer_total` — the usual symptom of a zone-less
+link-local peer — is a **global** counter with no peer label. Diagnosing which
+peer it came from needs gobgpd's debug logs.
+
 ### Per-Node BGP Status (BGPNodeStatus)
 
 Each k8gobgp instance automatically writes a `BGPNodeStatus` CRD for its node, providing cluster-wide BGP visibility without `kubectl exec`.
@@ -422,6 +547,9 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
   `MultipleConfigurations` warning event naming the owner. Deleting an ignored
   configuration does not disturb the one in effect. If the owning configuration
   is deleted, the next-oldest takes over within 30 seconds.
+- **BFD changes reset the session**: enabling, disabling or retuning BFD on a
+  neighbor tears the BGP session down and rebuilds it. Apply in a maintenance
+  window. See [BFD](#bfd-bidirectional-forwarding-detection).
 - **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod restart to take effect. These are immutable at runtime in GoBGP.
 - **Neighbor/Peer Group Changes**: Neighbors, peer groups, policies, and other settings can be updated dynamically without pod restart.
 - **Netlink Import/Export**: Can be enabled or disabled dynamically without pod restart. When disabled, imported routes are withdrawn from the RIB.
