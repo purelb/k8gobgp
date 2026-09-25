@@ -1336,11 +1336,15 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	// "BGP server not running" on every reconcile with the real cause buried in the
 	// daemon's error. The CRD pattern catches obvious nonsense; this catches the
 	// rest, and names the offending value.
+	// No "global:" prefix here - Reconcile's chain already wraps this function's
+	// error with one, and adding a second produced "global: global: ..." in the
+	// logs. Observed on a live cluster, not in a test, because the tests assert on
+	// the message rather than reading it.
 	if vErr := validateListenAddresses(bgpConfig.Spec.Global.ListenAddresses); vErr != nil {
-		return fmt.Errorf("global.listenAddresses: %w", vErr)
+		return fmt.Errorf("listenAddresses: %w", vErr)
 	}
 	if vErr := validateMultipath(&bgpConfig.Spec.Global); vErr != nil {
-		return fmt.Errorf("global: %w", vErr)
+		return vErr
 	}
 
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})

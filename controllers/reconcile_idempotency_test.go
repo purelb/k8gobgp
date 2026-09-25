@@ -881,7 +881,9 @@ func TestReconcileGlobal_RejectsBadListenAddress(t *testing.T) {
 			err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
 			if tc.wantErr {
 				require.Error(t, err)
-				assert.Contains(t, err.Error(), "global.listenAddresses")
+				// reconcileGlobal does not prefix "global:" itself - Reconcile's
+				// chain does - so the field name is what this asserts on.
+				assert.Contains(t, err.Error(), "listenAddresses")
 				assert.Zero(t, fake.startBgp, "must not reach StartBgp with a bad address")
 			} else {
 				require.NoError(t, err)
