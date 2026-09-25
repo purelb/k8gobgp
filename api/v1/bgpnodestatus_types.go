@@ -65,6 +65,7 @@ type BGPNodeStatusData struct {
 	HeartbeatSeconds int32 `json:"heartbeatSeconds,omitempty"`
 
 	// Neighbors is the list of BGP neighbor session states
+	// +kubebuilder:validation:MaxItems=128
 	Neighbors []NeighborStatus `json:"neighbors,omitempty"`
 	// NeighborCount is the total number of configured neighbors
 	NeighborCount int `json:"neighborCount"`
@@ -77,11 +78,27 @@ type BGPNodeStatusData struct {
 	NetlinkExport *NetlinkExportStatus `json:"netlinkExport,omitempty"`
 
 	// VRFs reports the VRF summary
+	// +kubebuilder:validation:MaxItems=64
 	VRFs []VRFStatus `json:"vrfs,omitempty"`
 
-	// Healthy is true when all neighbors are Established and no import/export failures exist.
+	// Truncated indicates the neighbors or vrfs list was capped at its maximum.
+	// The nested rib/netlinkImport/netlinkExport objects carry their own flag.
+	// +optional
+	Truncated bool `json:"truncated,omitempty"`
+
+	// BFDServer reports the node's BFD server, when BFD is in use.
+	// +optional
+	BFDServer *BFDServerStatus `json:"bfdServer,omitempty"`
+
+	// Healthy is true when all neighbors are Established, no import/export
+	// failures exist, and BFD - if any neighbor uses it - is working.
 	// Conditions are authoritative; this is a convenience summary.
-	Healthy bool `json:"healthy,omitempty"`
+	//
+	// No omitempty: it would drop the field when false, and the printcolumn
+	// then renders an unhealthy node as a BLANK cell rather than "false" -
+	// indistinguishable from "not reported yet" in `kubectl get bgpnodestatus`,
+	// which is the single place an operator looks first.
+	Healthy bool `json:"healthy"`
 	// Conditions represent the latest available observations of the node's BGP state
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
@@ -107,6 +124,51 @@ type NeighborStatus struct {
 	Description string `json:"description,omitempty"`
 	// LastError is the BGP notification code/subcode for non-Established neighbors
 	LastError string `json:"lastError,omitempty"`
+	// BFD reports the BFD session, when BFD is enabled for this neighbor.
+	// +optional
+	BFD *BFDStatus `json:"bfd,omitempty"`
+}
+
+// BFDStatus reports the BFD session state for one neighbor.
+//
+// Deliberately no packet counters. They advance every second, which would make
+// statusEqual false on every collection and turn the change-suppression path
+// into dead code - and a monotonically increasing counter belongs on the scrape,
+// not in a CR. They are bgp_peer_bfd_{transmitted,received}_packets_total.
+//
+// Note this is a 60s-granularity view of a subsystem that detects failure in
+// under a second. It tells you what BFD is configured to do and whether it has
+// been failing; it is not the failure detector. For ground truth use
+// `gobgp neighbor <addr>`.
+// +kubebuilder:object:generate=true
+type BFDStatus struct {
+	// SessionState is our view: Up, Down, AdminDown, Init or Unspecified.
+	SessionState string `json:"sessionState"`
+	// RemoteSessionState is the peer's view of the session.
+	// +optional
+	RemoteSessionState string `json:"remoteSessionState,omitempty"`
+	// LocalDiagnosticCode is why our side last changed state.
+	//
+	// No omitempty: NoDiagnostic is code 0 and a perfectly healthy value, so
+	// omitting it when empty would hide the normal case.
+	LocalDiagnosticCode string `json:"localDiagnosticCode"`
+	// RemoteDiagnosticCode is why the peer's side last changed state.
+	RemoteDiagnosticCode string `json:"remoteDiagnosticCode"`
+	// FailureTransitions counts up-to-down transitions. Worth keeping even at a
+	// 60s heartbeat: a flap that starts and ends inside the window is invisible
+	// in sessionState but visible here. Each one is a hard BGP reset.
+	FailureTransitions uint64 `json:"failureTransitions"`
+}
+
+// BFDServerStatus reports the node's BFD server.
+// +kubebuilder:object:generate=true
+type BFDServerStatus struct {
+	// Listening is whether the BFD socket is bound.
+	//
+	// The socket binds lazily, on the first BFD peer, so false is the normal
+	// state on a node that does not use BFD - which is why this does not feed
+	// the top-level Healthy flag unconditionally.
+	Listening bool `json:"listening"`
 }
 
 // NetlinkImportStatus reports the state of the netlink import pipeline.
@@ -172,8 +234,17 @@ type RIBRoute struct {
 	NextHop string `json:"nextHop"`
 	// FromPeer is the peer that advertised this route (only for received routes)
 	FromPeer string `json:"fromPeer,omitempty"`
-	// AdvertisedTo lists neighbor addresses this route is advertised to (only for local routes)
+	// AdvertisedTo lists neighbor addresses this route is advertised to (only
+	// for local routes), capped at 16 entries. This list is the product of
+	// routes and established neighbors, so it, not the route count, is what
+	// pushes the object towards etcd's size limit.
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
 	AdvertisedTo []string `json:"advertisedTo,omitempty"`
+	// AdvertisedToCount is the true number of neighbors this route is
+	// advertised to, which exceeds len(advertisedTo) when that list was capped.
+	// +optional
+	AdvertisedToCount int `json:"advertisedToCount,omitempty"`
 	// Communities lists BGP communities attached to this route
 	Communities []string `json:"communities,omitempty"`
 }

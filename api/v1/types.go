@@ -32,15 +32,21 @@ type BGPConfiguration struct {
 
 // +kubebuilder:object:generate=true
 type BGPConfigurationSpec struct {
-	Global            GlobalSpec         `json:"global"`
-	Neighbors         []Neighbor         `json:"neighbors,omitempty"`
-	PeerGroups        []PeerGroup        `json:"peerGroups,omitempty"`
-	DynamicNeighbors  []DynamicNeighbor  `json:"dynamicNeighbors,omitempty"`
-	Vrfs              []Vrf              `json:"vrfs,omitempty"`
+	Global GlobalSpec `json:"global"`
+	// +kubebuilder:validation:MaxItems=1024
+	Neighbors []Neighbor `json:"neighbors,omitempty"`
+	// +kubebuilder:validation:MaxItems=256
+	PeerGroups []PeerGroup `json:"peerGroups,omitempty"`
+	// +kubebuilder:validation:MaxItems=256
+	DynamicNeighbors []DynamicNeighbor `json:"dynamicNeighbors,omitempty"`
+	// +kubebuilder:validation:MaxItems=256
+	Vrfs []Vrf `json:"vrfs,omitempty"`
+	// +kubebuilder:validation:MaxItems=256
 	PolicyDefinitions []PolicyDefinition `json:"policyDefinitions,omitempty"`
-	DefinedSets       []DefinedSet       `json:"definedSets,omitempty"`
-	NetlinkImport     *NetlinkImport     `json:"netlinkImport,omitempty"`
-	NetlinkExport     *NetlinkExport     `json:"netlinkExport,omitempty"`
+	// +kubebuilder:validation:MaxItems=256
+	DefinedSets   []DefinedSet   `json:"definedSets,omitempty"`
+	NetlinkImport *NetlinkImport `json:"netlinkImport,omitempty"`
+	NetlinkExport *NetlinkExport `json:"netlinkExport,omitempty"`
 }
 
 // NetlinkImport configures global netlink import for importing connected routes
@@ -124,7 +130,85 @@ type GlobalSpec struct {
 	NodeStatus *NodeStatusConfig `json:"nodeStatus,omitempty"`
 }
 
+// BFD configures Bidirectional Forwarding Detection for a session.
+//
+// Inheritance is whole-block, not per-field: a neighbor with no bfd block takes
+// its peer group's, and a neighbor with one overrides the group entirely. Since
+// the defaults below are applied by the API server as soon as a bfd block
+// exists, that override is always total - which is what makes
+// `bfd: {enabled: false}` a working opt-out from a group that has BFD on.
+//
+// Timers are microseconds. The minimums are gobgpd's, not ours: a faster
+// profile is rejected at apply time rather than silently accepted. Detection
+// time is requiredMinimumReceive x detectionMultiplier, so the defaults below
+// give 3s.
+//
+// Note that a BFD transition is a *hard* BGP reset, and that changing BFD
+// config tears the session down and rebuilds it - which stops our transmit, so
+// the remote end's detect timer expires and it resets too. Apply BFD changes in
+// a maintenance window, and see README.md on why sub-second profiles are not
+// viable under the DaemonSet's default CPU limit.
 // +kubebuilder:object:generate=true
+type BFD struct {
+	// Enabled activates BFD for this session.
+	//
+	// A pointer so that `enabled: false` survives serialization: as a plain
+	// bool with omitempty it would be indistinguishable from an absent block,
+	// and an absent block means "inherit from the peer group".
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Port is the destination UDP port for control packets sent to this peer.
+	//
+	// The local listener is always 3784 regardless of this value, so setting
+	// anything else means transmitting to a port the peer is probably not
+	// listening on. RFC 5881 mandates 3784; there is rarely a reason to change
+	// it.
+	// +kubebuilder:validation:Minimum=1024
+	// +kubebuilder:validation:Maximum=65535
+	// +kubebuilder:default=3784
+	// +optional
+	Port uint32 `json:"port,omitempty"`
+
+	// DesiredMinimumTxInterval is the minimum interval, in MICROSECONDS,
+	// between transmitted control packets. 300000 is 300ms; 300 is 300
+	// microseconds.
+	// +kubebuilder:validation:Minimum=300000
+	// +kubebuilder:validation:Maximum=30000000
+	// +kubebuilder:default=1000000
+	// +optional
+	DesiredMinimumTxInterval uint32 `json:"desiredMinimumTxInterval,omitempty"`
+
+	// RequiredMinimumReceive is the minimum interval, in MICROSECONDS, between
+	// received control packets.
+	// +kubebuilder:validation:Minimum=300000
+	// +kubebuilder:validation:Maximum=30000000
+	// +kubebuilder:default=1000000
+	// +optional
+	RequiredMinimumReceive uint32 `json:"requiredMinimumReceive,omitempty"`
+
+	// DetectionMultiplier is how many intervals may be missed before the
+	// session is declared down. Detection time is
+	// requiredMinimumReceive x detectionMultiplier.
+	// +kubebuilder:validation:Minimum=3
+	// +kubebuilder:validation:Maximum=255
+	// +kubebuilder:default=3
+	// +optional
+	DetectionMultiplier uint32 `json:"detectionMultiplier,omitempty"`
+}
+
+// +kubebuilder:object:generate=true
+// Neighbor is one BGP peer.
+//
+// The BFD/link-local rule below catches a failure with no other symptom: BFD
+// control packets to a link-local address need the scope zone to pick an
+// egress interface, and without one transmit still succeeds on some arbitrary
+// interface. BGP establishes, everything reads healthy, and the BFD session
+// never leaves Down - so the failure detector the operator just enabled is not
+// running. Use `fe80::1%eth0`, or `neighborInterface`, which resolves the zone
+// itself.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.bfd) || (has(self.bfd.enabled) && !self.bfd.enabled) || !has(self.config.neighborAddress) || !self.config.neighborAddress.lowerAscii().startsWith('fe80') || self.config.neighborAddress.contains('%')",message="a link-local neighborAddress needs its scope zone when BFD is enabled (fe80::1%eth0, not fe80::1); or use neighborInterface instead"
 type Neighbor struct {
 	Config          NeighborConfig        `json:"config"`
 	NodeSelector    *metav1.LabelSelector `json:"nodeSelector,omitempty"`
@@ -135,6 +219,10 @@ type Neighbor struct {
 	GracefulRestart *GracefulRestart      `json:"gracefulRestart,omitempty"`
 	RouteReflector  *RouteReflector       `json:"routeReflector,omitempty"`
 	EbgpMultihop    *EbgpMultihop         `json:"ebgpMultihop,omitempty"`
+	// BFD, if set, overrides whatever the peer group specifies. Omit it to
+	// inherit. See the BFD type for why the override is whole-block.
+	// +optional
+	BFD *BFD `json:"bfd,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -145,6 +233,9 @@ type PeerGroup struct {
 	ApplyPolicy  *ApplyPolicy          `json:"applyPolicy,omitempty"`
 	Timers       *Timers               `json:"timers,omitempty"`
 	Transport    *Transport            `json:"transport,omitempty"`
+	// BFD applies to every member that does not specify its own.
+	// +optional
+	BFD *BFD `json:"bfd,omitempty"`
 }
 
 // --- Detailed Sub-structs ---
@@ -160,6 +251,15 @@ type NeighborConfig struct {
 	AuthPasswordSecretRef *corev1.SecretKeySelector `json:"authPasswordSecretRef,omitempty"`
 	Description           string                    `json:"description,omitempty"`
 	LocalAsn              uint32                    `json:"localAsn,omitempty"`
+	// NeighborAddress is the peer's IP address. For a link-local IPv6 peer,
+	// include the scope zone: fe80::1%eth0.
+	//
+	// The length bound is not cosmetic. CEL rules are costed statically against
+	// the declared maxLength, so an unbounded string here makes the BFD
+	// link-local rule on Neighbor exceed the apiserver's per-rule cost budget
+	// by ~64x and the CRD is rejected outright. 64 = 45 (the longest textual
+	// IPv6 form, ::ffff:255.255.255.255) + '%' + 15 (IFNAMSIZ-1), rounded up.
+	// +kubebuilder:validation:MaxLength=64
 	// +optional
 	NeighborAddress   string `json:"neighborAddress,omitempty"`
 	PeerAsn           uint32 `json:"peerAsn"`
@@ -181,6 +281,18 @@ type PeerGroupConfig struct {
 	// AuthPasswordSecretRef references a Secret containing the BGP authentication password
 	// +optional
 	AuthPasswordSecretRef *corev1.SecretKeySelector `json:"authPasswordSecretRef,omitempty"`
+
+	// AllowOwnAsn permits this many occurrences of our own ASN in a received
+	// AS path. Bounded at 255 because gobgpd rejects anything larger.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	AllowOwnAsn uint32 `json:"allowOwnAsn,omitempty"`
+	// ReplacePeerAsn replaces the peer's ASN in the AS path with our own.
+	// +optional
+	ReplacePeerAsn bool `json:"replacePeerAsn,omitempty"`
+	// AllowAspathLoopLocal permits our own ASN in locally originated paths.
+	// +optional
+	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -221,6 +333,14 @@ type Transport struct {
 	LocalAddress  string `json:"localAddress,omitempty"`
 	PassiveMode   bool   `json:"passiveMode,omitempty"`
 	BindInterface string `json:"bindInterface,omitempty"`
+	// IpTos sets IP_TOS / IPV6_TCLASS on the BGP session.
+	//
+	// Bounded at 255 because it is a single IP header byte and gobgpd casts it
+	// to uint8 with no range check - an unbounded value would be silently
+	// truncated rather than rejected.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	IpTos uint32 `json:"ipTos,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -379,15 +499,24 @@ type AsPrependAction struct {
 
 // +kubebuilder:object:generate=true
 type DefinedSet struct {
-	Type     string   `json:"type"` // "prefix", "neighbor", "as-path", "community"
-	Name     string   `json:"name"`
-	List     []string `json:"list,omitempty"`
+	Type string   `json:"type"` // "prefix", "neighbor", "as-path", "community"
+	Name string   `json:"name"`
+	List []string `json:"list,omitempty"`
+	// +kubebuilder:validation:MaxItems=1024
 	Prefixes []Prefix `json:"prefixes,omitempty"`
 }
 
+// Prefix matches either an IP prefix or a Route Target Constrain prefix -
+// exactly one of them. gobgpd rejects a prefix with both set, so ipPrefix is
+// optional rather than required; without that, rtcPrefix could never be used.
 // +kubebuilder:object:generate=true
+// +kubebuilder:validation:XValidation:rule="has(self.ipPrefix) != has(self.rtcPrefix)",message="exactly one of ipPrefix or rtcPrefix must be set"
 type Prefix struct {
-	IpPrefix      string `json:"ipPrefix"`
+	// +optional
+	IpPrefix string `json:"ipPrefix,omitempty"`
+	// RtcPrefix is a Route Target Constrain prefix, for RTC policy matching.
+	// +optional
+	RtcPrefix     string `json:"rtcPrefix,omitempty"`
 	MaskLengthMin uint32 `json:"maskLengthMin,omitempty"`
 	MaskLengthMax uint32 `json:"maskLengthMax,omitempty"`
 }

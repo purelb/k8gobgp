@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 	bgpv1 "github.com/purelb/k8gobgp/api/v1"
@@ -46,6 +47,19 @@ import (
 
 // gobgpdEcho returns what gobgpd's ListPeer would report for a peer that was
 // added with the given config, per pkg/config/oc.NewPeerFromConfigStruct.
+// echoGlobalASN is the global ASN the fake gobgpd defaults an unset per-peer
+// local AS to. Arbitrary, but it must differ from anything a fixture sets as a
+// peer AS, or the defaulting would be invisible.
+const echoGlobalASN = 64512
+
+// defaultTimer mirrors gobgpd applying its default to an unset timer.
+func defaultTimer(sent, def uint64) uint64 {
+	if sent == 0 {
+		return def
+	}
+	return sent
+}
+
 func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 	// Transport.LocalAddress is State.LocalAddress when valid, else
 	// Config.LocalAddress - and it is rendered with netip.Addr.String(), which
@@ -62,8 +76,28 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 		clusterID = "invalid IP"
 	}
 
+	// ListPeer redacts the TCP-MD5 password before the peer leaves the server
+	// (pkg/server/server.go, "Redact here, not in the converter"). Added in the
+	// fork after v1.1.2, so this is new as of the v1.3.0 bump: a comparator that
+	// asserts on AuthPassword is now permanently unequal for every authenticated
+	// peer. Copy the Conf so the redaction does not mutate the caller's peer.
+	// proto.CloneOf, not a struct copy: a protobuf message embeds a MessageState
+	// containing a mutex, so copying it by value trips copylocks.
+	conf := proto.CloneOf(sent.GetConf())
+	if conf != nil {
+		conf.AuthPassword = ""
+		// gobgpd defaults an unset per-peer local AS to the global ASN and
+		// echoes the defaulted value. Measured on a live v1.3.0: a CR setting
+		// only peerAsn comes back with local_asn set to global.asn. Almost no
+		// neighbor overrides its local AS, so this is the common case, and
+		// echoing it as sent is what let the churn reach production.
+		if conf.LocalAsn == 0 {
+			conf.LocalAsn = echoGlobalASN
+		}
+	}
+
 	echo := &gobgpapi.Peer{
-		Conf:     sent.GetConf(),
+		Conf:     conf,
 		AfiSafis: sent.GetAfiSafis(),
 
 		// Always populated, even when the caller sent nothing.
@@ -85,14 +119,21 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 			Enabled:     sent.GetEbgpMultihop().GetEnabled(),
 			MultihopTtl: sent.GetEbgpMultihop().GetMultihopTtl(),
 		},
+		// Timers are echoed DEFAULTED, not as sent. This fake originally echoed
+		// them as sent, which is why the idempotency tests passed while
+		// production fired UpdatePeer on every reconcile for a peer that set
+		// holdTime and keepaliveInterval but not connectRetry: 0 against 120,
+		// permanently unequal.
+		//
+		// The values are measured, not remembered - `gobgp neighbor add` with no
+		// timers against a live gobgpd v1.3.0, read back with `gobgp -j
+		// neighbor`. Note MinimumAdvertisementInterval is never echoed at all, no
+		// matter what was configured.
 		Timers: &gobgpapi.Timers{
 			Config: &gobgpapi.TimersConfig{
-				ConnectRetry:      sent.GetTimers().GetConfig().GetConnectRetry(),
-				HoldTime:          sent.GetTimers().GetConfig().GetHoldTime(),
-				KeepaliveInterval: sent.GetTimers().GetConfig().GetKeepaliveInterval(),
-				// Defaulted by gobgpd; the CRD has no field for it. And note what
-				// is missing: MinimumAdvertisementInterval is never echoed, no
-				// matter what was configured.
+				ConnectRetry:           defaultTimer(sent.GetTimers().GetConfig().GetConnectRetry(), 120),
+				HoldTime:               defaultTimer(sent.GetTimers().GetConfig().GetHoldTime(), 90),
+				KeepaliveInterval:      defaultTimer(sent.GetTimers().GetConfig().GetKeepaliveInterval(), 30),
 				IdleHoldTimeAfterReset: 30,
 			},
 			State: &gobgpapi.TimersState{KeepaliveInterval: 30},
@@ -117,6 +158,16 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 			RemotePort: 179,
 			LocalPort:  45678,
 		},
+		// Emitted for every peer, and defaulted whether or not BFD is enabled -
+		// SetDefaultNeighborConfigValues has no Enabled gate. A peer with no BFD
+		// at all still gets 3784/3/1e6/1e6 back, which is the case that churns.
+		Bfd: &gobgpapi.BfdPeerConfig{
+			Enabled:                  sent.GetBfd().GetEnabled(),
+			Port:                     orDefault(sent.GetBfd().GetPort(), 3784),
+			DesiredMinimumTxInterval: orDefault(sent.GetBfd().GetDesiredMinimumTxInterval(), 1000000),
+			RequiredMinimumReceive:   orDefault(sent.GetBfd().GetRequiredMinimumReceive(), 1000000),
+			DetectionMultiplier:      orDefault(sent.GetBfd().GetDetectionMultiplier(), 3),
+		},
 		State: &gobgpapi.PeerState{
 			NeighborAddress: sent.GetConf().GetNeighborAddress(),
 			SessionState:    gobgpapi.PeerState_SESSION_STATE_ESTABLISHED,
@@ -124,6 +175,48 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 		},
 	}
 	return echo
+}
+
+func orDefault(v, def uint32) uint32 {
+	if v == 0 {
+		return def
+	}
+	return v
+}
+
+// gobgpdEchoPeerGroup returns what ListPeerGroup would report.
+//
+// Note what it does NOT do: apply BFD defaults. addPeerGroup calls no defaulting
+// function at all, so a peer group's BFD block comes back exactly as sent -
+// unlike a peer's. Comparing the two with one scheme is why this needs its own
+// helper rather than reusing gobgpdEcho.
+func gobgpdEchoPeerGroup(sent *gobgpapi.PeerGroup) *gobgpapi.PeerGroup {
+	conf := proto.CloneOf(sent.GetConf())
+	if conf != nil {
+		conf.AuthPassword = "" // redacted, same as ListPeer
+	}
+	return &gobgpapi.PeerGroup{
+		Conf:     conf,
+		AfiSafis: sent.GetAfiSafis(),
+		Bfd:      sent.GetBfd(),
+		ApplyPolicy: &gobgpapi.ApplyPolicy{
+			ImportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT},
+			ExportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT},
+		},
+		Timers: &gobgpapi.Timers{
+			Config: &gobgpapi.TimersConfig{
+				ConnectRetry:      sent.GetTimers().GetConfig().GetConnectRetry(),
+				HoldTime:          sent.GetTimers().GetConfig().GetHoldTime(),
+				KeepaliveInterval: sent.GetTimers().GetConfig().GetKeepaliveInterval(),
+			},
+		},
+		Transport: &gobgpapi.Transport{
+			LocalAddress:  "invalid IP",
+			PassiveMode:   sent.GetTransport().GetPassiveMode(),
+			BindInterface: sent.GetTransport().GetBindInterface(),
+			IpTos:         sent.GetTransport().GetIpTos(),
+		},
+	}
 }
 
 // --- fake gRPC client -------------------------------------------------------
@@ -255,6 +348,68 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 				Config: bgpv1.NeighborConfig{NeighborInterface: "eth0", PeerAsn: 64513},
 			},
 		},
+		{
+			// The case that churns if BFD defaults are applied only to a
+			// non-empty block: the CR sends nothing, gobgpd returns
+			// 3784/3/1e6/1e6. Every neighbor in a cluster that does not use BFD
+			// at all looks like this.
+			name: "no BFD block at all",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.9", PeerAsn: 64513},
+			},
+		},
+		{
+			name: "BFD enabled with CRD defaults filled in",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.10", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(true), Port: 3784,
+					DesiredMinimumTxInterval: 1000000,
+					RequiredMinimumReceive:   1000000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			// Opt-out from a peer group that has BFD on. The API server fills the
+			// other four fields as soon as the block exists, so this is a
+			// non-empty block that disables rather than an absent one.
+			name: "BFD explicitly disabled",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.11", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(false), Port: 3784,
+					DesiredMinimumTxInterval: 1000000,
+					RequiredMinimumReceive:   1000000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			name: "BFD at the fastest profile the CRD allows",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "10.0.0.12", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(true), Port: 3784,
+					DesiredMinimumTxInterval: 300000,
+					RequiredMinimumReceive:   300000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			// ListPeer redacts the password, so the comparator can never see it
+			// come back. Asserting on it means an UpdatePeer every reconcile for
+			// every authenticated peer.
+			name: "MD5-authenticated neighbor",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{
+					NeighborAddress: "10.0.0.8",
+					PeerAsn:         64513,
+					AuthPassword:    "correct horse battery staple",
+				},
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -313,4 +468,164 @@ func TestReconcileNeighbors_DetectsRealChange(t *testing.T) {
 
 	require.NoError(t, r.reconcileNeighbors(context.Background(), fake, cfg, map[string]*gobgpapi.PeerGroup{}, logf.Log))
 	assert.Equal(t, 1, fake.updatePeer, "a changed hold time must produce exactly one UpdatePeer")
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// TestPeerGroupConfigEqual_BFDNotDefaulted covers the peer group path, which
+// differs from the peer one: addPeerGroup runs no defaulting, so ListPeerGroup
+// echoes the BFD block as sent.
+//
+// Honest about what this does and does not prove. It asserts the peer group
+// comparator is idempotent, which is what matters. It does *not* detect the peer
+// scheme being applied here by mistake - bfdEqual defaults both sides, so nil
+// against nil compares equal either way. The reason to model the daemon
+// accurately anyway is that it stops being equivalent the moment the fork starts
+// defaulting peer groups.
+func TestPeerGroupConfigEqual_BFDNotDefaulted(t *testing.T) {
+	r := &BGPConfigurationReconciler{Log: logf.Log}
+
+	for _, tc := range []struct {
+		name  string
+		group bgpv1.PeerGroup
+	}{
+		{
+			name: "no BFD block",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{PeerGroupName: "g1", PeerAsn: 64513},
+			},
+		},
+		{
+			name: "BFD enabled",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{PeerGroupName: "g2", PeerAsn: 64513},
+				BFD: &bgpv1.BFD{
+					Enabled: ptr(true), Port: 3784,
+					DesiredMinimumTxInterval: 1000000,
+					RequiredMinimumReceive:   1000000,
+					DetectionMultiplier:      3,
+				},
+			},
+		},
+		{
+			name: "AS path options set",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{
+					PeerGroupName: "g3", PeerAsn: 64513,
+					AllowOwnAsn: 2, ReplacePeerAsn: true, AllowAspathLoopLocal: true,
+				},
+			},
+		},
+		{
+			name: "MD5 password, which ListPeerGroup redacts",
+			group: bgpv1.PeerGroup{
+				Config: bgpv1.PeerGroupConfig{
+					PeerGroupName: "g4", PeerAsn: 64513, AuthPassword: "s3cret",
+				},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sent := r.crdToAPIPeerGroupWithPassword(&tc.group, tc.group.Config.AuthPassword)
+			require.NotNil(t, sent)
+			assert.True(t, peerGroupConfigEqual(sent, gobgpdEchoPeerGroup(sent)),
+				"peer group compares unequal against what ListPeerGroup returns, so UpdatePeerGroup fires every reconcile")
+		})
+	}
+}
+
+// TestBfdEqual_DefaultingIsPerObject pins the asymmetry directly, so a future
+// change that unifies the two schemes fails here with an explanation rather
+// than as mysterious churn on a cluster.
+func TestBfdEqual_DefaultingIsPerObject(t *testing.T) {
+	sent := (*gobgpapi.BfdPeerConfig)(nil)
+	peerEcho := &gobgpapi.BfdPeerConfig{
+		Port: 3784, DetectionMultiplier: 3,
+		DesiredMinimumTxInterval: 1000000, RequiredMinimumReceive: 1000000,
+	}
+
+	assert.True(t, bfdEqual(sent, peerEcho, true),
+		"a peer sending no BFD must match gobgpd's defaulted echo")
+	assert.False(t, bfdEqual(sent, peerEcho, false),
+		"without defaulting the same pair is unequal - which is why the flag exists")
+	assert.True(t, bfdEqual(sent, nil, false),
+		"a peer group sending no BFD must match the empty block ListPeerGroup returns")
+	assert.True(t, bfdEqual(sent, nil, true),
+		"defaulting both sides of an empty pair is a no-op - recorded so the peer group flag is not mistaken for load-bearing")
+
+	enabled := &gobgpapi.BfdPeerConfig{Enabled: true, Port: 3784, DetectionMultiplier: 3,
+		DesiredMinimumTxInterval: 1000000, RequiredMinimumReceive: 1000000}
+	assert.False(t, bfdEqual(enabled, peerEcho, true),
+		"enabling BFD must still be detected as a change")
+}
+
+// TestPeerConfigEqual_AgainstProductionPayload pins the exact pair that churned
+// on a live cluster, captured rather than imagined.
+//
+// `desired` is built by the real converter from the BGPConfiguration that was
+// deployed; `current` is the verbatim `gobgp -j neighbor` output from the
+// gobgpd it was talking to. Every field here is transcribed from that capture.
+//
+// This exists because the synthetic fixtures above all passed while production
+// fired UpdatePeer on every reconcile. What the CR omits is what matters, and
+// this CR omits three things the fixtures happened to set: connectRetry,
+// localAsn, and any transport block. gobgpd defaults all three and echoes the
+// defaulted value, so each one was permanently unequal.
+func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
+	r := &BGPConfigurationReconciler{}
+
+	// Exactly the CR that was deployed - note what it does NOT set.
+	crd := &bgpv1.Neighbor{
+		Config: bgpv1.NeighborConfig{
+			NeighborAddress: "2001:470:b8f3:251::1",
+			PeerAsn:         64514,
+			Description:     "Gateway router on subnet-251 (IPv6)",
+		},
+		AfiSafis: []bgpv1.AfiSafi{
+			{Family: "ipv4-unicast", Enabled: true},
+			{Family: "ipv6-unicast", Enabled: true},
+		},
+		Timers: &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 90, KeepaliveInterval: 30}},
+	}
+	desired := r.crdToAPINeighborWithPassword(crd, "")
+
+	// Verbatim from `gobgp --target unix://... -j neighbor 2001:470:b8f3:251::1`
+	// against gobgpd v1.3.0 (commit 8b99965), session established.
+	current := &gobgpapi.Peer{
+		Conf: &gobgpapi.PeerConf{
+			NeighborAddress: "2001:470:b8f3:251::1",
+			PeerAsn:         64514,
+			// Defaulted from global.asn; the CR never set it.
+			LocalAsn:    64515,
+			Description: "Gateway router on subnet-251 (IPv6)",
+			Type:        gobgpapi.PeerType_PEER_TYPE_EXTERNAL,
+		},
+		// Resolved once established; the CR has no transport block at all.
+		Transport: &gobgpapi.Transport{LocalAddress: "2001:470:b8f3:251:be24:11ff:fe9b:a72b"},
+		Timers: &gobgpapi.Timers{
+			Config: &gobgpapi.TimersConfig{
+				ConnectRetry: 120, HoldTime: 90, KeepaliveInterval: 30,
+				IdleHoldTimeAfterReset: 30,
+			},
+			State: &gobgpapi.TimersState{KeepaliveInterval: 3, NegotiatedHoldTime: 9},
+		},
+		GracefulRestart: &gobgpapi.GracefulRestart{},
+		RouteReflector:  &gobgpapi.RouteReflector{RouteReflectorClusterId: "invalid IP"},
+		EbgpMultihop:    &gobgpapi.EbgpMultihop{},
+		ApplyPolicy: &gobgpapi.ApplyPolicy{
+			ImportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT},
+			ExportPolicy: &gobgpapi.PolicyAssignment{Direction: gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT},
+		},
+		Bfd: &gobgpapi.BfdPeerConfig{
+			Port: 3784, DesiredMinimumTxInterval: 1000000,
+			RequiredMinimumReceive: 1000000, DetectionMultiplier: 3,
+		},
+		AfiSafis: []*gobgpapi.AfiSafi{
+			{Config: &gobgpapi.AfiSafiConfig{Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST}, Enabled: true}},
+			{Config: &gobgpapi.AfiSafiConfig{Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST}, Enabled: true}},
+		},
+	}
+
+	assert.True(t, peerConfigEqual(desired, current),
+		"this exact pair fired UpdatePeer on every reconcile in production")
 }

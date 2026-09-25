@@ -215,10 +215,28 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if dc.NeighborInterface == "" && dc.NeighborAddress != cc.NeighborAddress {
 		return false
 	}
+	// AuthPassword is deliberately not compared. ListPeer redacts it to "" before
+	// the peer leaves the server, so the desired value can never match what comes
+	// back and asserting on it means an UpdatePeer every reconcile for every
+	// authenticated peer. A password change still reaches gobgpd: the Secret is
+	// watched, and a change there re-enters Reconcile, which sends the current
+	// value on whatever UpdatePeer the rest of this comparison produces. The gap
+	// is a password-only edit with nothing else changed - see the TODO below.
+	//
+	// TODO: track the resolved password's hash in the reconciler so a
+	// password-only change is detected without comparing the secret itself.
+	// LocalAsn is compared only when the CR sets one. gobgpd defaults an unset
+	// per-peer local AS to the global ASN and echoes the defaulted value, so an
+	// unconditional comparison is 0 against the global ASN - permanently
+	// unequal for every neighbor that does not override its local AS, which is
+	// the overwhelmingly common case. Same guard, and same known gap, as
+	// transportConfigEqual's LocalAddress: clearing localAsn to return to the
+	// global default is not detected as a change.
+	if dc.LocalAsn != 0 && dc.LocalAsn != cc.LocalAsn {
+		return false
+	}
 	if dc.PeerAsn != cc.PeerAsn ||
-		dc.LocalAsn != cc.LocalAsn ||
 		dc.Description != cc.Description ||
-		dc.AuthPassword != cc.AuthPassword ||
 		dc.PeerGroup != cc.PeerGroup ||
 		dc.AdminDown != cc.AdminDown ||
 		dc.NeighborInterface != cc.NeighborInterface ||
@@ -247,6 +265,12 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
 		return false
 	}
+	// defaulted: addNeighbor runs SetDefaultNeighborConfigValues, so ListPeer
+	// echoes a fully-populated BFD block for every peer - including peers that
+	// have no BFD at all, which is the case that churns if this is skipped.
+	if !bfdEqual(desired.Bfd, current.Bfd, true) {
+		return false
+	}
 	return true
 }
 
@@ -258,11 +282,15 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 	}
 
 	dc, cc := desired.Conf, current.Conf
+	// AuthPassword is not compared, for the same reason as in peerConfigEqual:
+	// ListPeerGroup redacts it before the group leaves the server.
 	if dc.PeerGroupName != cc.PeerGroupName ||
 		dc.PeerAsn != cc.PeerAsn ||
 		dc.LocalAsn != cc.LocalAsn ||
 		dc.Description != cc.Description ||
-		dc.AuthPassword != cc.AuthPassword {
+		dc.AllowOwnAsn != cc.AllowOwnAsn ||
+		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
+		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal {
 		return false
 	}
 
@@ -279,6 +307,13 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 		return false
 	}
 	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
+		return false
+	}
+	// Not defaulted, unlike the peer case above: addPeerGroup calls no
+	// defaulting function at all, so ListPeerGroup echoes the block as sent.
+	// Defaulting here would make every peer group permanently unequal, and
+	// UpdatePeerGroup loops updateNeighbor over every member.
+	if !bfdEqual(desired.Bfd, current.Bfd, false) {
 		return false
 	}
 	return true
@@ -336,11 +371,38 @@ func afiSafisConfigEqual(desired, current []*gobgpapi.AfiSafi) bool {
 // that field is not detected as drift - it still applies on peer creation.
 // IdleHoldTimeAfterReset is excluded because gobgpd defaults it (to 30) and the
 // CRD has no field for it.
+// timersConfigEqual compares each timer only when the CR sets one.
+//
+// gobgpd defaults every unset timer and echoes the defaulted value, so an
+// unconditional comparison is permanently unequal for any timer the CR omits.
+// Measured against a live gobgpd v1.3.0 by adding a peer with no timers block
+// and reading it back: connect_retry 120, hold_time 90, keepalive_interval 30,
+// idle_hold_time_after_reset 30.
+//
+// connect_retry is the one that bites, because no sample config sets it: a CR
+// specifying only holdTime and keepaliveInterval still compared 0 against 120
+// and fired UpdatePeer on every reconcile. That was not caught by the
+// idempotency tests, whose fake echoed timers as sent rather than as gobgpd
+// defaults them - the fake has since been corrected.
+//
+// The guard is the same one transportConfigEqual uses for LocalAddress and
+// routeReflectorEqual for the cluster ID. It carries the same known gap:
+// removing a timer from the CR to get the default back is not detected as a
+// change. That is rare, and far cheaper than churning every reconcile. It also
+// means this does not need to know what the defaults *are*, so it cannot drift
+// when the fork changes them.
 func timersConfigEqual(desired, current *gobgpapi.Timers) bool {
 	d, c := desired.GetConfig(), current.GetConfig()
-	return d.GetConnectRetry() == c.GetConnectRetry() &&
-		d.GetHoldTime() == c.GetHoldTime() &&
-		d.GetKeepaliveInterval() == c.GetKeepaliveInterval()
+	if d.GetConnectRetry() != 0 && d.GetConnectRetry() != c.GetConnectRetry() {
+		return false
+	}
+	if d.GetHoldTime() != 0 && d.GetHoldTime() != c.GetHoldTime() {
+		return false
+	}
+	if d.GetKeepaliveInterval() != 0 && d.GetKeepaliveInterval() != c.GetKeepaliveInterval() {
+		return false
+	}
+	return true
 }
 
 // transportConfigEqual compares only the controller-managed Transport fields,
@@ -356,7 +418,8 @@ func transportConfigEqual(desired, current *gobgpapi.Transport) bool {
 		return false
 	}
 	return desired.GetPassiveMode() == current.GetPassiveMode() &&
-		desired.GetBindInterface() == current.GetBindInterface()
+		desired.GetBindInterface() == current.GetBindInterface() &&
+		desired.GetIpTos() == current.GetIpTos()
 }
 
 // applyPolicyEqual compares the policy assignment fields that round-trip.
@@ -443,6 +506,7 @@ func definedSetEqual(desired, current *gobgpapi.DefinedSet) bool {
 	}
 	for i := range dp {
 		if dp[i].GetIpPrefix() != cp[i].GetIpPrefix() ||
+			dp[i].GetRtcPrefix() != cp[i].GetRtcPrefix() ||
 			dp[i].GetMaskLengthMin() != cp[i].GetMaskLengthMin() ||
 			dp[i].GetMaskLengthMax() != cp[i].GetMaskLengthMax() {
 			return false
@@ -643,11 +707,13 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	bgpConfig.Status.LastReconcileTime = &now
 
 	// Update configuration metrics (NeighborCount is set in reconcileNeighbors with post-filter count)
-	UpdateNeighborsConfigured(bgpConfig.Name, bgpConfig.Namespace, bgpConfig.Status.NeighborCount)
-	UpdatePeerGroupMetrics(bgpConfig.Name, bgpConfig.Namespace, len(desiredPeerGroups))
-	UpdateDynamicNeighborMetrics(bgpConfig.Name, bgpConfig.Namespace, len(desiredDynNeighbors))
-	UpdateVrfMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.Vrfs))
-	UpdatePolicyMetrics(bgpConfig.Name, bgpConfig.Namespace, len(bgpConfig.Spec.PolicyDefinitions), len(bgpConfig.Spec.DefinedSets))
+	n, ns := bgpConfig.Name, bgpConfig.Namespace
+	UpdateConfiguredObjects(KindNeighbor, n, ns, bgpConfig.Status.NeighborCount)
+	UpdateConfiguredObjects(KindPeerGroup, n, ns, len(desiredPeerGroups))
+	UpdateConfiguredObjects(KindDynamicNeighbor, n, ns, len(desiredDynNeighbors))
+	UpdateConfiguredObjects(KindVrf, n, ns, len(bgpConfig.Spec.Vrfs))
+	UpdateConfiguredObjects(KindPolicy, n, ns, len(bgpConfig.Spec.PolicyDefinitions))
+	UpdateConfiguredObjects(KindDefinedSet, n, ns, len(bgpConfig.Spec.DefinedSets))
 
 	if reconcileErr != nil {
 		log.Error(reconcileErr, "Reconciliation failed")
@@ -863,6 +929,37 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			if _, err := apiClient.DeleteDefinedSet(ctx, &gobgpapi.DeleteDefinedSetRequest{DefinedSet: &gobgpapi.DefinedSet{Name: set.Name}}); err != nil {
 				log.Error(err, "Failed to delete defined set during cleanup", "name", set.Name)
 				cleanupErrors = append(cleanupErrors, err)
+			}
+		}
+
+		// Disable netlink, if this configuration enabled it.
+		//
+		// Everything above removes BGP state, which lives and dies with the
+		// process. Netlink is the exception: import and export program the
+		// *kernel*, and routes this node installed outlive deletion of the CR
+		// that asked for them - until the pod happens to restart. Deleting the
+		// configuration has to withdraw them, so KeepRoutes is false on both.
+		//
+		// Failures here are logged but do not join cleanupErrors. A disable of
+		// something already disabled is an error from gobgpd, and treating it as
+		// a cleanup failure would retry forever and wedge the finalizer,
+		// leaving the CR undeletable - a worse outcome than a stale route.
+		if bgpConfig.Spec.NetlinkExport != nil && bgpConfig.Spec.NetlinkExport.Enabled {
+			if _, err := apiClient.DisableNetlinkExport(ctx, &gobgpapi.DisableNetlinkExportRequest{
+				KeepRoutes: false, // flush exported routes from the kernel
+			}); err != nil {
+				log.V(1).Info("DisableNetlinkExport during cleanup returned error (may not be enabled)", "error", err)
+			} else {
+				log.Info("Disabled netlink export during cleanup")
+			}
+		}
+		if bgpConfig.Spec.NetlinkImport != nil && bgpConfig.Spec.NetlinkImport.Enabled {
+			if _, err := apiClient.DisableNetlinkImport(ctx, &gobgpapi.DisableNetlinkImportRequest{
+				KeepRoutes: false, // withdraw imported routes from the RIB
+			}); err != nil {
+				log.V(1).Info("DisableNetlinkImport during cleanup returned error (may not be enabled)", "error", err)
+			} else {
+				log.Info("Disabled netlink import during cleanup")
 			}
 		}
 
@@ -1114,7 +1211,6 @@ func (r *BGPConfigurationReconciler) resolveEffectiveRouterID(ctx context.Contex
 
 	// Record metrics
 	RecordRouterIDResolution("success", duration)
-	UpdateRouterIDSource(resolution.Source)
 	UpdateRouterIDInfo(nil, routerIDInfoLabels(bgpConfig, resolution.RouterID, resolution.Source, r.NodeName))
 
 	// Cache in-memory for immutability (per-config, per-pod)
@@ -1444,12 +1540,18 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 			log.Info("Adding peer group", "name", name)
 			if _, err := apiClient.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{PeerGroup: desired}); err != nil {
 				log.Error(err, "Failed to add peer group", "name", name)
+				RecordPeerApplyError(name, "add_group")
+				r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerGroupApplyFailed",
+					"Failed to add peer group %s: %v", name, err)
 			}
 		} else {
 			if !peerGroupConfigEqual(desired, current) {
 				log.Info("Updating peer group", "name", name)
 				if _, err := apiClient.UpdatePeerGroup(ctx, &gobgpapi.UpdatePeerGroupRequest{PeerGroup: desired}); err != nil {
 					log.Error(err, "Failed to update peer group", "name", name)
+					RecordPeerApplyError(name, "update_group")
+					r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerGroupApplyFailed",
+						"Failed to update peer group %s: %v", name, err)
 				}
 			}
 		}
@@ -1553,13 +1655,22 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 		if current, ok := currentNeighbors[key]; !ok {
 			log.Info("Adding neighbor", "key", key)
 			if _, err := apiClient.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired}); err != nil {
+				// Counted, not just logged: gobgpd refusing a peer leaves no
+				// trace in its own metrics - the neighbor is simply absent,
+				// which looks the same as never having been configured.
 				log.Error(err, "Failed to add neighbor", "key", key)
+				RecordPeerApplyError(key, "add")
+				r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerApplyFailed",
+					"Failed to add neighbor %s: %v", key, err)
 			}
 		} else {
 			if !peerConfigEqual(desired, current) {
 				log.Info("Updating neighbor", "key", key)
 				if _, err := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: desired}); err != nil {
 					log.Error(err, "Failed to update neighbor", "key", key)
+					RecordPeerApplyError(key, "update")
+					r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerApplyFailed",
+						"Failed to update neighbor %s: %v", key, err)
 				}
 			}
 		}
@@ -1763,7 +1874,7 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 		// Handle VRF netlink import
 		if vrf.NetlinkImport != nil {
 			desiredImportEnabled := vrf.NetlinkImport.Enabled
-			currentImportEnabled := current.NetlinkImportEnabled
+			currentImportEnabled := current.GetNetlink().GetImportEnabled()
 
 			if desiredImportEnabled != currentImportEnabled {
 				if desiredImportEnabled {
@@ -1797,11 +1908,11 @@ func (r *BGPConfigurationReconciler) reconcileVrfNetlink(ctx context.Context, ap
 				// Check if interfaces changed. slices.Equal, not DeepEqual: see
 				// the note in reconcileNetlink - nil and empty are the same state
 				// here, and DeepEqual churns the importer if they differ.
-				if !slices.Equal(vrf.NetlinkImport.InterfaceList, current.NetlinkImportInterfaces) {
+				if !slices.Equal(vrf.NetlinkImport.InterfaceList, current.GetNetlink().GetImportInterfaces()) {
 					// Re-enable with new interfaces (disable first, then enable)
 					log.Info("Updating VRF netlink import interfaces",
 						"vrf", vrf.Name,
-						"currentInterfaces", current.NetlinkImportInterfaces,
+						"currentInterfaces", current.GetNetlink().GetImportInterfaces(),
 						"desiredInterfaces", vrf.NetlinkImport.InterfaceList)
 
 					_, err := apiClient.DisableVrfNetlinkImport(ctx, &gobgpapi.DisableVrfNetlinkImportRequest{
@@ -2000,6 +2111,7 @@ func crdToAPIDefinedSet(crd *bgpv1.DefinedSet) *gobgpapi.DefinedSet {
 	for _, p := range crd.Prefixes {
 		prefixes = append(prefixes, &gobgpapi.Prefix{
 			IpPrefix:      p.IpPrefix,
+			RtcPrefix:     p.RtcPrefix,
 			MaskLengthMin: p.MaskLengthMin,
 			MaskLengthMax: p.MaskLengthMax,
 		})
@@ -2130,16 +2242,20 @@ func crdToAPIActions(crd *bgpv1.Actions) *gobgpapi.Actions {
 func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.PeerGroup, authPassword string) *gobgpapi.PeerGroup {
 	return &gobgpapi.PeerGroup{
 		Conf: &gobgpapi.PeerGroupConf{
-			PeerGroupName: crd.Config.PeerGroupName,
-			PeerAsn:       crd.Config.PeerAsn,
-			LocalAsn:      crd.Config.LocalAsn,
-			Description:   crd.Config.Description,
-			AuthPassword:  authPassword,
+			PeerGroupName:        crd.Config.PeerGroupName,
+			PeerAsn:              crd.Config.PeerAsn,
+			LocalAsn:             crd.Config.LocalAsn,
+			Description:          crd.Config.Description,
+			AuthPassword:         authPassword,
+			AllowOwnAsn:          crd.Config.AllowOwnAsn,
+			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
+			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
 		},
 		AfiSafis:    crdToAPIAfiSafis(crd.AfiSafis),
 		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
 		Timers:      crdToAPITimers(crd.Timers),
 		Transport:   crdToAPITransport(crd.Transport),
+		Bfd:         crdToAPIBfd(crd.BFD),
 	}
 }
 
@@ -2164,7 +2280,94 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 		GracefulRestart: crdToAPIGracefulRestart(crd.GracefulRestart),
 		RouteReflector:  crdToAPIRouteReflector(crd.RouteReflector),
 		EbgpMultihop:    crdToAPIEbgpMultihop(crd.EbgpMultihop),
+		Bfd:             crdToAPIBfd(crd.BFD),
 	}
+}
+
+// crdToAPIBfd converts a CRD BFD block. A nil block stays nil, which is what
+// tells gobgpd to inherit the peer group's - inheritance is whole-block, keyed
+// on the block being entirely zero.
+func crdToAPIBfd(crd *bgpv1.BFD) *gobgpapi.BfdPeerConfig {
+	if crd == nil {
+		return nil
+	}
+	enabled := false
+	if crd.Enabled != nil {
+		enabled = *crd.Enabled
+	}
+	return &gobgpapi.BfdPeerConfig{
+		Enabled:                  enabled,
+		Port:                     crd.Port,
+		DesiredMinimumTxInterval: crd.DesiredMinimumTxInterval,
+		RequiredMinimumReceive:   crd.RequiredMinimumReceive,
+		DetectionMultiplier:      crd.DetectionMultiplier,
+	}
+}
+
+// gobgpd's BFD defaults, applied by SetDefaultNeighborConfigValues to every
+// neighbor regardless of whether BFD is enabled. They must match the CRD's
+// kubebuilder defaults exactly, or a peer that sets a bfd block compares
+// unequal against what ListPeer echoes back and churns forever.
+const (
+	bfdDefaultPort                = 3784
+	bfdDefaultInterval            = 1000000 // microseconds
+	bfdDefaultDetectionMultiplier = 3
+)
+
+// bfdWithDefaults returns cfg with gobgpd's defaults filled in.
+//
+// Applied unconditionally, including to a nil or all-zero block: gobgpd defaults
+// every neighbor's BFD config whether or not BFD is enabled, and
+// NewPeerFromConfigStruct then emits it for every peer. So the case that churns
+// is not a partially-specified block - it is a peer with no BFD at all, where
+// the CR sends nothing and ListPeer returns a fully-populated one.
+func bfdWithDefaults(cfg *gobgpapi.BfdPeerConfig) *gobgpapi.BfdPeerConfig {
+	out := &gobgpapi.BfdPeerConfig{
+		Enabled:                  cfg.GetEnabled(),
+		Port:                     cfg.GetPort(),
+		DesiredMinimumTxInterval: cfg.GetDesiredMinimumTxInterval(),
+		RequiredMinimumReceive:   cfg.GetRequiredMinimumReceive(),
+		DetectionMultiplier:      cfg.GetDetectionMultiplier(),
+	}
+	if out.Port == 0 {
+		out.Port = bfdDefaultPort
+	}
+	if out.DetectionMultiplier == 0 {
+		out.DetectionMultiplier = bfdDefaultDetectionMultiplier
+	}
+	if out.DesiredMinimumTxInterval == 0 {
+		out.DesiredMinimumTxInterval = bfdDefaultInterval
+	}
+	if out.RequiredMinimumReceive == 0 {
+		out.RequiredMinimumReceive = bfdDefaultInterval
+	}
+	return out
+}
+
+// bfdEqual compares two BFD configs as gobgpd would report them.
+//
+// defaulted fills gobgpd's defaults on *both* sides before comparing, and it is
+// required for peers: addNeighbor runs SetDefaultNeighborConfigValues, so
+// ListPeer echoes 3784/3/1e6/1e6 against the nil block the CR sent, and without
+// it every neighbor without BFD churns.
+//
+// For peer groups it is false because addPeerGroup runs no defaulting and
+// ListPeerGroup echoes the block as sent. Measured honestly: passing true here
+// would *also* compare equal today, since both sides receive the same treatment
+// and the CRD's own defaults mean a partial block never reaches this code. It is
+// false because that is what the daemon actually does - so if the fork starts
+// defaulting peer groups, the peer path is already correct and this one fails
+// loudly rather than silently drifting.
+func bfdEqual(desired, current *gobgpapi.BfdPeerConfig, defaulted bool) bool {
+	d, c := desired, current
+	if defaulted {
+		d, c = bfdWithDefaults(desired), bfdWithDefaults(current)
+	}
+	return d.GetEnabled() == c.GetEnabled() &&
+		d.GetPort() == c.GetPort() &&
+		d.GetDesiredMinimumTxInterval() == c.GetDesiredMinimumTxInterval() &&
+		d.GetRequiredMinimumReceive() == c.GetRequiredMinimumReceive() &&
+		d.GetDetectionMultiplier() == c.GetDetectionMultiplier()
 }
 
 // --- Secret Resolution Helper ---
@@ -2253,6 +2456,7 @@ func crdToAPITransport(crd *bgpv1.Transport) *gobgpapi.Transport {
 		LocalAddress:  crd.LocalAddress,
 		PassiveMode:   crd.PassiveMode,
 		BindInterface: crd.BindInterface,
+		IpTos:         crd.IpTos,
 	}
 }
 

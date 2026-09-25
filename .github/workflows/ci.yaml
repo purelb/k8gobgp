@@ -122,9 +122,31 @@ jobs:
         with:
           context: .
           push: false
+          # load: true puts the image in the local Docker store. Without it the
+          # result stays in the BuildKit cache under the docker-container driver
+          # and the assertions below cannot find an image to run.
+          load: true
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Two things a static pin check cannot see: that the daemon we shipped is
+      # the commit we pinned, and that it accepts the flags entrypoint.sh passes.
+      # The second one matters - gobgpd exits 1 on an unknown flag and
+      # entrypoint.sh backgrounds it, so the symptom is "Timeout waiting for
+      # gobgpd to start" on every node, naming neither the flag nor the version.
+      - name: Assert the built gobgpd matches the pin and accepts its flags
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}"
+          sha=$(grep -oPm1 '(?<=^ARG GOBGP_COMMIT=)[0-9a-f]{40}$' Dockerfile)
+          [ -n "$sha" ] || { echo "no GOBGP_COMMIT in Dockerfile"; exit 1; }
+          # --entrypoint, or this runs entrypoint.sh and starts the daemon
+          # instead of asking it for its version.
+          docker run --rm --entrypoint gobgpd "$IMG" --version
+          docker run --rm --entrypoint gobgpd "$IMG" --version | grep -q "commit: ${sha:0:7}"
+          docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --metrics-host
+          docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --pprof-disable
 
   # Static analysis of our own source. Deterministic for a pinned gosec version,
   # so this is a genuine property of the diff and stays a required check.

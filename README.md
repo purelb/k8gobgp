@@ -5,13 +5,14 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/purelb/k8gobgp)](https://goreportcard.com/report/github.com/purelb/k8gobgp)
 
-A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.1.2) for enhanced Linux kernel integration.
+A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.3.0) for enhanced Linux kernel integration.
 
 ## Features
 
 - **Full BGP Configuration via CRDs**: Manage all GoBGP settings declaratively through Kubernetes
 - **Neighbor Management**: Configure BGP peers with full support for timers, authentication, and AFI/SAFI
 - **Peer Groups**: Define reusable peer group templates for consistent neighbor configuration
+- **BFD**: Sub-second forwarding-path failure detection, opt-in per neighbor or peer group
 - **Dynamic Neighbors**: Support for dynamic BGP peering with prefix-based matching
 - **VRF Support**: Configure Virtual Routing and Forwarding instances
 - **Route Policies**: Define import/export policies with prefix lists, community matching, and AS path manipulation
@@ -346,6 +347,130 @@ spec:
         description: "Secondary upstream"
 ```
 
+### BFD (Bidirectional Forwarding Detection)
+
+BFD detects a dead forwarding path in under a second, where BGP's own hold timer
+takes tens of seconds. It is off by default and opt-in per neighbor.
+
+```yaml
+  peerGroups:
+    - config:
+        peerGroupName: "upstream-peers"
+        peerAsn: 64513
+      bfd:
+        enabled: true
+
+  neighbors:
+    # Inherits the peer group's BFD.
+    - config:
+        neighborAddress: "192.168.1.254"
+        peerGroup: "upstream-peers"
+
+    # Opts out of it. See "inheritance is whole-block" below.
+    - config:
+        neighborAddress: "192.168.1.253"
+        peerGroup: "upstream-peers"
+      bfd:
+        enabled: false
+
+    # Standalone, with explicit timers.
+    - config:
+        neighborAddress: "192.168.1.252"
+        peerAsn: 64513
+      bfd:
+        enabled: true
+        desiredMinimumTxInterval: 1000000   # microseconds
+        requiredMinimumReceive: 1000000     # microseconds
+        detectionMultiplier: 3
+```
+
+**Timers are microseconds.** `1000000` is one second; `300000` is 300ms; `300`
+is 300 *microseconds* and is rejected. Detection time is
+`requiredMinimumReceive x detectionMultiplier`, so the defaults above give 3s.
+
+| Field | Default | Range |
+|---|---|---|
+| `enabled` | unset (inherit) | — |
+| `port` | 3784 | 1024–65535 |
+| `desiredMinimumTxInterval` | 1000000 (1s) | 300000–30000000 |
+| `requiredMinimumReceive` | 1000000 (1s) | 300000–30000000 |
+| `detectionMultiplier` | 3 | 3–255 |
+
+The local listener is always on port 3784 regardless of `port`, which only sets
+the destination for packets *sent* to that peer. RFC 5881 mandates 3784; there
+is rarely a reason to change it.
+
+#### Before you enable it
+
+**A BFD transition is a hard BGP reset.** Not a graceful restart — the session
+drops and every route through it is withdrawn. That is the point of BFD, but it
+means an over-aggressive profile converts a transient scheduling hiccup into a
+real outage.
+
+**Changing any BFD field also resets the session.** gobgpd implements a BFD
+config change as delete-then-add, which stops our transmit long enough for the
+remote end's detect timer to expire, so *the peer* tears the session down too.
+Apply BFD changes in a maintenance window, and roll them out one node at a time.
+
+**Sub-second profiles are not viable under the shipped CPU limit.** The
+DaemonSet sets `limits.cpu: 500m` against a `requests.cpu: 100m`. With the
+default 100ms CFS period that is a 50ms quota, so a container that exhausts its
+quota early in a period is frozen for up to 50ms:
+
+- At the **default** 1s/3 profile, detection is 3000ms and a worst-case 50ms
+  freeze is 1.7% of it. Comfortable.
+- At the **300ms floor**, detection is 900ms and the same freeze is 5.6% of it —
+  and, more to the point, it is a sixth of a single 300ms transmit interval, so
+  a few unlucky periods in a row can cost the packets that trigger a false
+  session-down and a hard BGP reset.
+
+If you need a sub-second profile, set `requests.cpu == limits.cpu` so the
+container is not throttled at the limit, and validate under load before relying
+on it.
+
+**Link-local peers need their scope zone.** A BFD control packet to `fe80::1`
+has no interface to leave by, and the send still succeeds on an arbitrary one.
+BGP establishes, everything reads healthy, and the BFD session never leaves
+`Down` — the failure detector you just enabled is not running. Write
+`fe80::1%eth0`, or use `neighborInterface`, which resolves the zone itself. The
+CRD rejects the zone-less form when BFD is enabled, so this fails at `kubectl
+apply` rather than in production.
+
+**Inheritance is whole-block, not per-field.** A neighbor with no `bfd:` takes
+its peer group's entire block; a neighbor with one replaces it entirely rather
+than merging field by field. `enabled` is deliberately nullable so that
+`bfd: {enabled: false}` is distinguishable from an absent block, which is what
+makes the opt-out above work.
+
+#### Observing it
+
+```bash
+# Per-neighbor session state, and whether the node's BFD socket is bound.
+kubectl get bgpnodestatus <node> -o jsonpath='{.status.neighbors[*].bfd}'
+kubectl get bgpnodestatus <node> -o jsonpath='{.status.bfdServer}'
+
+# Ground truth. BGPNodeStatus is a 60s-granularity view of a subsystem that
+# detects failure in under a second — use it to see what BFD is configured to do
+# and whether it has been failing, not as the failure detector.
+kubectl exec -n k8gobgp-system <pod> -c gobgpd -- gobgp neighbor <address>
+```
+
+A `BFDDegraded` condition appears on `BGPNodeStatus` only on nodes that actually
+use BFD, with reason `ServerNotListening` (peers want BFD and the socket is not
+bound — no failure detection is running) or `SessionsDown`. Nodes with no BFD
+peers carry no BFD condition at all, and never bind the socket; that is normal,
+and it does not affect `healthy`.
+
+Metrics are on the gobgpd endpoint (`:7475`): `bgp_bfd_server_up`,
+`bgp_peer_bfd_enabled`, `bgp_peer_bfd_failure_transitions_total`,
+`bgp_bfd_unknown_peer_total`, `bgp_bfd_received_drop_total`,
+`bgp_bfd_wrong_hop_limit_total`. See [docs/metrics.md](docs/metrics.md) and the
+sample rules in [docs/alerting/k8gobgp-alerts.yaml](docs/alerting/k8gobgp-alerts.yaml).
+
+Note that `bgp_bfd_unknown_peer_total` — the usual symptom of a zone-less
+link-local peer — is a **global** counter with no peer label. Diagnosing which
+peer it came from needs gobgpd's debug logs.
+
 ### Per-Node BGP Status (BGPNodeStatus)
 
 Each k8gobgp instance automatically writes a `BGPNodeStatus` CRD for its node, providing cluster-wide BGP visibility without `kubectl exec`.
@@ -422,6 +547,9 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
   `MultipleConfigurations` warning event naming the owner. Deleting an ignored
   configuration does not disturb the one in effect. If the owning configuration
   is deleted, the next-oldest takes over within 30 seconds.
+- **BFD changes reset the session**: enabling, disabling or retuning BFD on a
+  neighbor tears the BGP session down and rebuilds it. Apply in a maintenance
+  window. See [BFD](#bfd-bidirectional-forwarding-detection).
 - **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod restart to take effect. These are immutable at runtime in GoBGP.
 - **Neighbor/Peer Group Changes**: Neighbors, peer groups, policies, and other settings can be updated dynamically without pod restart.
 - **Netlink Import/Export**: Can be enabled or disabled dynamically without pod restart. When disabled, imported routes are withdrawn from the RIB.
@@ -463,129 +591,90 @@ The manager supports the following command-line flags:
 | `--metrics-bind-address` | `:7473` | Address for the metrics endpoint |
 | `--health-probe-bind-address` | `:7474` | Address for health probes |
 | `--gobgp-endpoint` | (env: `GOBGP_ENDPOINT`) | GoBGP gRPC endpoint (e.g., `localhost:50051` or `unix:///var/run/gobgp/gobgp.sock`) |
-| `--metrics-poll-interval` | `15s` | Interval for polling BGP stats from gobgpd (minimum 15s) |
-| `--enable-per-neighbor-metrics` | `false` | Enable high-cardinality per-neighbor route metrics |
-| `--max-neighbors-metrics` | `200` | Maximum neighbors for per-neighbor metrics (0=unlimited) |
+| `--metrics-poll-interval` | `15s` | Interval for polling RIB size from gobgpd (minimum 15s). The DaemonSet sets `60s`: gobgpd's own collector is cached at 15s and this loop takes the same BGP lock |
+| `--enable-per-neighbor-metrics` | — | **Deprecated, ignored.** gobgp-netlink emits per-peer metrics natively |
+| `--max-neighbors-metrics` | — | **Deprecated, ignored.** Bound per-peer cardinality at scrape time; see [docs/metrics.md](docs/metrics.md) |
 
 ## Metrics
 
-The controller exposes Prometheus metrics on `:7473/metrics`:
+A k8gobgp pod runs two processes and each exposes its own metrics on its own
+port. They are not merged or proxied — two subsystems, two scrape targets. See
+[docs/metrics.md](docs/metrics.md) for the full reference.
 
-### Controller Metrics
+| Endpoint | Port | Namespace | Emitted by |
+|---|---|---|---|
+| Controller | `7473` `/metrics` | `k8gobgp_*` | the k8gobgp manager |
+| BGP daemon | `7475` `/metrics` | `bgp_*`, `fsm_loop_*` | gobgp-netlink (`gobgpd`) |
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_reconcile_total` | Counter | Total reconciliations by result |
-| `k8gobgp_reconcile_duration_seconds` | Histogram | Reconciliation duration |
-| `k8gobgp_neighbors_configured` | Gauge | Neighbors this config asks for on this node, after nodeSelector filtering |
-| `k8gobgp_gobgpd_connection_status` | Gauge | GoBGP daemon connection status (1=connected), by `endpoint` |
-| `k8gobgp_gobgpd_connection_errors_total` | Counter | Failed connection attempts to gobgpd, by `endpoint` |
-| `k8gobgp_configuration_ready` | Gauge | Configuration ready status (1=ready) |
-| `k8gobgp_peer_groups_configured` | Gauge | Peer groups configured on this node, after nodeSelector filtering |
-| `k8gobgp_dynamic_neighbors_configured` | Gauge | Dynamic neighbors configured on this node, after peer-group filtering |
-| `k8gobgp_vrfs_configured` | Gauge | Number of VRFs configured |
-| `k8gobgp_policies_configured` | Gauge | Number of policies configured |
-| `k8gobgp_defined_sets_configured` | Gauge | Number of defined sets configured |
-| `k8gobgp_cleanup_retries_total` | Counter | Cleanup retries during deletion |
-| `k8gobgp_cleanup_duration_seconds` | Histogram | Cleanup operation duration |
+Both are unauthenticated HTTP, and the pod runs with `hostNetwork: true`, so
+both are reachable at `<nodeIP>:<port>` from anything that can route to the node
+— including the BGP fabric. NetworkPolicy does not cover host-namespace ports.
 
-### Router ID Resolution Metrics
+The controller's own metrics on `:7473/metrics`:
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_router_id_resolution_total` | Counter | Resolution attempts by result (success/failure) |
-| `k8gobgp_router_id_resolution_duration_seconds` | Histogram | Time to resolve router ID |
-| `k8gobgp_router_id_source` | Gauge | Active resolution source (`explicit`/`template`/`node-ipv4`/`hash-from-node-name`) |
-| `k8gobgp_router_id_info` | Gauge | Router ID details, one series per BGPConfiguration (labels: `router_id`, `source`, `node`, `asn`, `name`, `namespace`) |
+### Controller metrics (`:7473`)
 
-### BGP Stats Metrics (from periodic polling)
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `k8gobgp_reconcile_total` | Counter | `name`, `namespace`, `result` | Reconciliations. `result` is `success`, `failed`, `validation_failed`, `connection_failed` or `duplicate_ignored` — note the last is normal behaviour, not a failure |
+| `k8gobgp_reconcile_duration_seconds` | Histogram | `name`, `namespace` | Reconciliation duration |
+| `k8gobgp_configured_objects` | Gauge | `kind`, `name`, `namespace` | What the CR asks for on this node, after nodeSelector filtering. `kind` is `neighbor`, `peer_group`, `dynamic_neighbor`, `vrf`, `policy` or `defined_set` |
+| `k8gobgp_configuration_ready` | Gauge | `name`, `namespace` | 1 when the CR reconciled cleanly |
+| `k8gobgp_peer_apply_errors_total` | Counter | `key`, `op` | Failures applying a peer to gobgpd. The only signal for a peer gobgpd refused — such a peer never appears in `ListPeer`, so no `bgp_*` metric describes it |
+| `k8gobgp_gobgpd_connection_status` | Gauge | `endpoint` | 1 when gobgpd answered its last RPC. Driven by the readiness check |
+| `k8gobgp_gobgpd_connection_errors_total` | Counter | `endpoint` | Failed attempts to reach gobgpd |
+| `k8gobgp_cleanup_retries_total` | Counter | `name`, `namespace` | Retries during finalizer cleanup |
+| `k8gobgp_cleanup_duration_seconds` | Histogram | `name`, `namespace` | Cleanup duration |
+| `k8gobgp_rib_routes` | Gauge | `family` | Routes in the global RIB. **No gobgp-netlink equivalent** — its collectors are all per-peer and none calls `GetTable` |
+| `k8gobgp_metrics_collection_duration_seconds` | Histogram | — | Time to collect RIB stats |
+| `k8gobgp_metrics_collection_errors_total` | Counter | — | Collection failures |
+| `k8gobgp_router_id_resolution_total` | Counter | `result` | Router ID resolution attempts |
+| `k8gobgp_router_id_resolution_duration_seconds` | Histogram | — | Resolution duration. Buckets top out at 2.048s |
+| `k8gobgp_router_id_info` | Gauge | `router_id`, `source`, `node`, `asn`, `name`, `namespace` | Always 1; read the labels |
+| `k8gobgp_nodestatus_write_total` | Counter | `result` | BGPNodeStatus writes |
+| `k8gobgp_nodestatus_collection_duration_seconds` | Histogram | — | Time to collect node status |
+| `k8gobgp_nodestatus_last_successful_write_timestamp_seconds` | Gauge | — | Alert on staleness, do not gate readiness on it |
+| `k8gobgp_nodestatus_object_size_bytes` | Gauge | — | Approximate serialized size |
 
-These metrics are collected every `--metrics-poll-interval` (default 15s) directly from gobgpd.
+Also on `:7473`: controller-runtime's `controller_runtime_*`, `workqueue_*` and
+`rest_client_*`, plus Go runtime and process metrics.
 
-Collecting `k8gobgp_routes_advertised` requires gobgpd to evaluate export policy
-against the local RIB for each neighbor, so the cost of a poll grows with both
-RIB size and neighbor count. This happens on every poll regardless of
-`--enable-per-neighbor-metrics`, because the metric is always exported. Watch
-`k8gobgp_metrics_collection_duration_seconds` and raise `--metrics-poll-interval`
-if collection is expensive on a large RIB; the collector also logs a
-"Slow metrics collection" line when a cycle exceeds 5s, and skips a cycle
-entirely if the previous one is still running (`k8gobgp_metrics_collection_skipped_total`).
+### BGP daemon metrics (`:7475`)
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_neighbors` | Gauge | Neighbors on this node by FSM state (label: `state`). All seven states are always present, so an empty state reads `0` rather than disappearing |
-| `k8gobgp_rib_routes` | Gauge | Routes in RIB by address family (label: `family`) |
-| `k8gobgp_routes_received` | Gauge | Total routes received from all neighbors |
-| `k8gobgp_routes_accepted` | Gauge | Total routes accepted from all neighbors |
-| `k8gobgp_routes_advertised` | Gauge | Total routes advertised to all neighbors |
+72 families covering session state, routes, BFD, kernel FIB programming and loop
+timing. See [docs/metrics.md](docs/metrics.md) for the full list, the label
+traps, ready-made queries and a scrape-time keep-list — per-peer cardinality is
+`29 + 3F` series without BFD and `33 + 3F` with, where `F` is the number of
+enabled address families, and gobgp-netlink applies no cap of its own.
 
-`state` is one of `idle`, `connect`, `active`, `opensent`, `openconfirm`,
-`established`, `unknown`. The per-state counts always sum to the neighbor total:
+### Migrating from the previous metric set
 
-```promql
-sum without(state) (k8gobgp_neighbors)          # total neighbors on this node
-k8gobgp_neighbors{state="established"}          # sessions that are up
-```
+Twelve `k8gobgp_*` metrics were removed because gobgp-netlink emits the same
+data natively, from the daemon that owns it. The replacements are **not** a
+straight rename — `neighbor=` becomes `peer=`, `state=established` becomes
+`session_state=SESSION_STATE_ESTABLISHED`, and `family=ipv4_unicast` becomes
+`route_family=ipv4-unicast` with the separator flipped, which means
+`k8gobgp_rib_routes` and `bgp_routes_*` cannot be joined without relabeling.
 
-### Per-Neighbor Metrics
+[docs/metrics.md](docs/metrics.md) carries the full mapping. The short version:
 
-All per-neighbor metrics are limited to `--max-neighbors-metrics` neighbors
-(default 200; `0` means unlimited). Neighbors beyond the limit are selected
-deterministically by sorted key, and the number omitted is reported so they are
-not a silent blind spot.
+| Removed | Replacement |
+|---|---|
+| `k8gobgp_neighbors{state}` | `count by (instance, session_state) (bgp_peer_state)` |
+| `k8gobgp_neighbor_state` | `bgp_peer_state` |
+| `k8gobgp_neighbor_session_flaps_total` | `delta(bgp_peer_flop_count[15m])` — a gauge, so `delta` not `increase` |
+| `k8gobgp_neighbor_session_established_timestamp_seconds` | `bgp_peer_established_timestamp_seconds`, gated on `bgp_peer_state` |
+| `k8gobgp_neighbor_routes_*` | `bgp_routes_*{peer, route_family}` |
+| `k8gobgp_routes_*` | `sum by (instance) (bgp_routes_*)` |
+| `k8gobgp_{neighbors,peer_groups,...}_configured` | `k8gobgp_configured_objects{kind="..."}` |
+| `k8gobgp_router_id_source` | `count by (source) (k8gobgp_router_id_info)` |
 
-The `neighbor` label is the neighbor's address, or `iface:<name>` for
-unnumbered (interface-based) peers.
+`--enable-per-neighbor-metrics` and `--max-neighbors-metrics` are accepted and
+ignored; they warn on use and will be removed. Bound per-peer cardinality at
+scrape time instead.
 
-Always exported — one series per neighbor:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_neighbor_state` | Gauge | Each neighbor's current FSM state (labels: `neighbor`, `state`; value is always 1) |
-| `k8gobgp_neighbor_session_flaps_total` | Counter | Session flaps per neighbor, as counted by gobgpd |
-| `k8gobgp_neighbor_session_established_timestamp_seconds` | Gauge | When the session came up. **Absent** while the session is down |
-| `k8gobgp_neighbor_metrics_truncated` | Gauge | Neighbors omitted by the cardinality limit |
-
-Opt-in with `--enable-per-neighbor-metrics`, because these multiply by address
-family — three metrics become three series per family per neighbor:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_neighbor_routes_received` | Gauge | Routes received by neighbor and family |
-| `k8gobgp_neighbor_routes_accepted` | Gauge | Routes accepted by neighbor and family |
-| `k8gobgp_neighbor_routes_advertised` | Gauge | Routes advertised by neighbor and family |
-
-Useful queries:
-
-```promql
-k8gobgp_neighbor_state{state="established"}                    # which peers are up
-k8gobgp_neighbor_state{state=~"active|connect|opensent"}       # peers stuck mid-handshake
-increase(k8gobgp_neighbor_session_flaps_total[15m]) > 2        # flapping peers
-k8gobgp_neighbor_metrics_truncated > 0                         # peers not being reported
-```
-
-### BGPNodeStatus Reporter Metrics
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_nodestatus_write_total` | Counter | Status write attempts by result (success/error/skipped) |
-| `k8gobgp_nodestatus_collection_duration_seconds` | Histogram | Time to collect node status from gobgpd and netlink |
-| `k8gobgp_nodestatus_last_successful_write_timestamp` | Gauge | Unix timestamp of last successful write (for staleness alerts) |
-| `k8gobgp_nodestatus_object_size_bytes` | Gauge | Approximate BGPNodeStatus object size |
-
-Example staleness alert:
-```
-time() - k8gobgp_nodestatus_last_successful_write_timestamp > 300
-```
-
-### Metrics Collection Health
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| `k8gobgp_metrics_collection_duration_seconds` | Histogram | Time to collect BGP stats |
-| `k8gobgp_metrics_collection_errors_total` | Counter | Collection errors |
-| `k8gobgp_metrics_collection_skipped_total` | Counter | Collections skipped (previous still running) |
-| `k8gobgp_metrics_cardinality_limit_hit_total` | Counter | Poll cycles in which the per-neighbor limit was hit. Increments once per cycle while truncating, so it grows steadily rather than indicating severity — alert on `k8gobgp_neighbor_metrics_truncated` instead, which reports how many neighbors are actually missing |
+Sample alert rules, including the queries above:
+[docs/alerting/k8gobgp-alerts.yaml](docs/alerting/k8gobgp-alerts.yaml).
 
 ## Development
 
@@ -750,5 +839,5 @@ limitations under the License.
 ## Acknowledgments
 
 - [GoBGP](https://github.com/osrg/gobgp) - The BGP implementation
-- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.1.2 - Enhanced GoBGP fork with netlink integration
+- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.3.0 - Enhanced GoBGP fork with netlink integration
 - [PureLB](https://purelb.io) - Kubernetes load balancer project

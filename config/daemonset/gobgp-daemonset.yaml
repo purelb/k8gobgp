@@ -7,6 +7,13 @@ metadata:
   name: k8gobgp
   namespace: k8gobgp-system
 spec:
+  # Stated rather than left to the default, and minReadySeconds so a replaced
+  # pod has time to re-establish its BGP sessions before the next node is taken.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  minReadySeconds: 30
   selector:
     matchLabels:
       app.kubernetes.io/name: k8gobgp
@@ -45,6 +52,12 @@ spec:
           runAsNonRoot: false  # Must be root for network operations
 
         env:
+        # Under hostNetwork this is the node's address, and it is what gobgpd
+        # binds its metrics endpoint to.
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -77,6 +90,11 @@ spec:
           protocol: TCP
         - containerPort: 7473
           name: metrics
+          protocol: TCP
+        # gobgp-netlink's own metrics. A separate subsystem on a separate port,
+        # scraped as its own target - see docs/metrics.md.
+        - containerPort: 7475
+          name: gobgp-metrics
           protocol: TCP
         - containerPort: 7474
           name: health

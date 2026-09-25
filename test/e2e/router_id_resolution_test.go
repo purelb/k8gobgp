@@ -42,10 +42,15 @@ import (
 )
 
 const (
-	testNamespace = "k8gobgp-system"
-	testTimeout   = 2 * time.Minute
-	pollInterval  = 5 * time.Second
+	defaultTestNamespace = "k8gobgp-system"
+	testTimeout          = 2 * time.Minute
+	pollInterval         = 5 * time.Second
 )
+
+// testNamespace is where k8gobgp is deployed. It is not always
+// k8gobgp-system - deployed as a sidecar it lives in its host's namespace - and
+// a hardcoded value made this suite unrunnable anywhere else.
+var testNamespace = defaultTestNamespace
 
 var (
 	k8sClient  client.Client
@@ -53,6 +58,10 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if ns := os.Getenv("K8GOBGP_NAMESPACE"); ns != "" {
+		testNamespace = ns
+	}
+
 	// Setup: Create Kubernetes clients
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
@@ -410,4 +419,246 @@ func hasCondition(config *bgpv1.BGPConfiguration, condType, status string) bool 
 
 func randomSuffix() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano()%1000000000)
+}
+
+// --- BFD -------------------------------------------------------------------
+
+// TestBFD_Validation exercises the CRD's BFD validation against a real
+// apiserver. These are apiserver-side checks, so they run without a BFD-capable
+// peer and without BGP establishing at all - which is the point, because the
+// rule they cover exists to catch a misconfiguration that has no other symptom.
+//
+// The rules are also costed statically by the apiserver, so this doubles as the
+// check that they fit the CEL budget: a rule over budget makes the CRD
+// unloadable, and nothing in `go build` or `go test` sees that.
+func TestBFD_Validation(t *testing.T) {
+	ctx := context.Background()
+	enabled, disabled := true, false
+
+	cases := []struct {
+		name       string
+		neighbor   bgpv1.Neighbor
+		wantReject bool
+		because    string
+	}{
+		{
+			name:       "link-local without a zone, BFD enabled",
+			wantReject: true,
+			because:    "control packets have no interface to leave by; BGP establishes and BFD never leaves Down",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "fe80::1", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &enabled},
+			},
+		},
+		{
+			name:       "link-local without a zone, uppercase",
+			wantReject: true,
+			because:    "an IPv6 address is case-insensitive; the rule lowercases before matching",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "FE80::1", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &enabled},
+			},
+		},
+		{
+			name:    "link-local WITH a zone",
+			because: "the zone is what makes it routable, so this is the correct form",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "fe80::1%eth0", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &enabled},
+			},
+		},
+		{
+			name:    "link-local without a zone, BFD explicitly disabled",
+			because: "this is the whole-block opt-out from a peer group; rejecting it would reject the way you turn BFD off",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "fe80::1", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &disabled},
+			},
+		},
+		{
+			name:    "link-local without a zone, no BFD block",
+			because: "without BFD the zone-less form still works for BGP",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "fe80::1", PeerAsn: 64513},
+			},
+		},
+		{
+			name:    "neighborInterface with BFD",
+			because: "gobgpd resolves the address and its zone from the interface",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborInterface: "eth1", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &enabled},
+			},
+		},
+		{
+			name:       "interval below gobgpd's floor",
+			wantReject: true,
+			because:    "300 is microseconds, not milliseconds - the unit trap the bound exists to catch",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "192.0.2.1", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &enabled, RequiredMinimumReceive: 300},
+			},
+		},
+		{
+			name:       "detection multiplier below 3",
+			wantReject: true,
+			because:    "gobgpd rejects it at apply time; better to fail at kubectl apply",
+			neighbor: bgpv1.Neighbor{
+				Config: bgpv1.NeighborConfig{NeighborAddress: "192.0.2.1", PeerAsn: 64513},
+				BFD:    &bgpv1.BFD{Enabled: &enabled, DetectionMultiplier: 1},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &bgpv1.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-bfd-" + randomSuffix(),
+					Namespace: testNamespace,
+				},
+				Spec: bgpv1.BGPConfigurationSpec{
+					Global:    bgpv1.GlobalSpec{ASN: 64512},
+					Neighbors: []bgpv1.Neighbor{tc.neighbor},
+				},
+			}
+
+			// DryRunAll: this is a schema assertion, and creating the object for
+			// real would make a second BGPConfiguration in the cluster, which
+			// this controller deliberately ignores.
+			err := k8sClient.Create(ctx, config, client.DryRunAll)
+
+			switch {
+			case tc.wantReject && err == nil:
+				t.Errorf("expected rejection (%s), but the apiserver accepted it", tc.because)
+			case tc.wantReject && err != nil:
+				t.Logf("rejected as expected: %v", err)
+			case !tc.wantReject && err != nil:
+				t.Errorf("expected acceptance (%s), got: %v", tc.because, err)
+			}
+		})
+	}
+}
+
+// TestBFD_DefaultsAppliedByAPIServer checks that a bfd block is defaulted on
+// write, which is what makes whole-block inheritance work: the block a neighbor
+// overrides its peer group with is always complete, never a partial merge.
+func TestBFD_DefaultsAppliedByAPIServer(t *testing.T) {
+	ctx := context.Background()
+	enabled := true
+
+	config := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-bfd-defaults-" + randomSuffix(),
+			Namespace: testNamespace,
+		},
+		Spec: bgpv1.BGPConfigurationSpec{
+			Global: bgpv1.GlobalSpec{ASN: 64512},
+			Neighbors: []bgpv1.Neighbor{
+				// Only enabled is set; everything else must come back defaulted.
+				{
+					Config: bgpv1.NeighborConfig{NeighborAddress: "192.0.2.1", PeerAsn: 64513},
+					BFD:    &bgpv1.BFD{Enabled: &enabled},
+				},
+				// No bfd block at all must stay absent, not become a defaulted
+				// one - absent is how a neighbor says "inherit".
+				{
+					Config: bgpv1.NeighborConfig{NeighborAddress: "192.0.2.2", PeerAsn: 64513},
+				},
+			},
+		},
+	}
+
+	if err := k8sClient.Create(ctx, config, client.DryRunAll); err != nil {
+		t.Fatalf("Failed to create BGPConfiguration: %v", err)
+	}
+
+	got := config.Spec.Neighbors[0].BFD
+	if got == nil {
+		t.Fatal("bfd block disappeared")
+	}
+	// These must match bfdWithDefaults in the controller, or a peer that sets a
+	// bfd block compares unequal against what ListPeer echoes and churns.
+	for _, c := range []struct {
+		field string
+		got   uint32
+		want  uint32
+	}{
+		{"port", got.Port, 3784},
+		{"desiredMinimumTxInterval", got.DesiredMinimumTxInterval, 1000000},
+		{"requiredMinimumReceive", got.RequiredMinimumReceive, 1000000},
+		{"detectionMultiplier", got.DetectionMultiplier, 3},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.field, c.got, c.want)
+		}
+	}
+	t.Logf("apiserver-defaulted bfd: %+v", *got)
+
+	if config.Spec.Neighbors[1].BFD != nil {
+		t.Errorf("a neighbor with no bfd block gained one (%+v); absent must stay absent so it inherits",
+			*config.Spec.Neighbors[1].BFD)
+	}
+}
+
+// TestBFD_NonBFDNodesStayHealthy is the regression guard for the health gate.
+//
+// The BFD socket binds lazily on the first BFD peer, so a cluster not using BFD
+// reports bfdServer.listening false on every node. deriveHealth is a pure AND;
+// consuming that unguarded marks every such node - including every
+// local-address-mode deployment, which peers with nobody - permanently
+// unhealthy. This asserts the reported state of the cluster as it actually runs.
+func TestBFD_NonBFDNodesStayHealthy(t *testing.T) {
+	ctx := context.Background()
+
+	var statuses bgpv1.BGPNodeStatusList
+	if err := k8sClient.List(ctx, &statuses); err != nil {
+		t.Fatalf("Failed to list BGPNodeStatus: %v", err)
+	}
+	if len(statuses.Items) == 0 {
+		t.Skip("no BGPNodeStatus objects; k8gobgp is not reporting on this cluster")
+	}
+
+	for _, s := range statuses.Items {
+		st := s.Status
+		usesBFD := false
+		for _, n := range st.Neighbors {
+			if n.BFD != nil {
+				usesBFD = true
+			}
+		}
+
+		var bfdCond *metav1.Condition
+		for i := range st.Conditions {
+			if st.Conditions[i].Type == "BFDDegraded" {
+				bfdCond = &st.Conditions[i]
+			}
+		}
+
+		listening := st.BFDServer != nil && st.BFDServer.Listening
+		t.Logf("%s: usesBFD=%t listening=%t healthy=%t bfdCondition=%v",
+			st.NodeName, usesBFD, listening, st.Healthy, bfdCond != nil)
+
+		if usesBFD {
+			continue // the degraded path is asserted by the controller unit tests
+		}
+		if bfdCond != nil {
+			t.Errorf("%s has no BFD neighbors but reports a BFDDegraded condition (%s); "+
+				"a non-BFD node must carry no BFD condition at all",
+				st.NodeName, bfdCond.Reason)
+		}
+		if !st.Healthy && allNeighborsEstablished(st) {
+			t.Errorf("%s has every neighbor Established and no BFD, but reports healthy=false "+
+				"(bfdServer.listening=%t) - the health gate has regressed", st.NodeName, listening)
+		}
+	}
+}
+
+func allNeighborsEstablished(st bgpv1.BGPNodeStatusData) bool {
+	for _, n := range st.Neighbors {
+		if n.State != "Established" {
+			return false
+		}
+	}
+	return true
 }
