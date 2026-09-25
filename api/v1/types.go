@@ -116,8 +116,24 @@ type GlobalSpec struct {
 	// Must be at least /24 (256 addresses). Each cluster should use a unique pool.
 	// Default: "10.255.0.0/16"
 	// +optional
-	RouterIDPool    string   `json:"routerIDPool,omitempty"`
-	ListenPort      int32    `json:"listenPort,omitempty"`
+	RouterIDPool string `json:"routerIDPool,omitempty"`
+	ListenPort   int32  `json:"listenPort,omitempty"`
+	// ListenAddresses are the local addresses gobgpd accepts BGP connections on.
+	// Omit it to take gobgpd's default, which is every interface ("0.0.0.0" and
+	// "::").
+	//
+	// The pattern rejects obvious nonsense early, with a message that names the
+	// field. It is deliberately not a complete IP grammar - the authoritative
+	// check is netip.ParseAddr in the controller, which is what gobgpd itself
+	// uses, so a value that passes here and fails there is reported before
+	// StartBgp rather than after.
+	//
+	// CEL isIP() would be stricter but needs apiserver 1.31+, and a CEL rule that
+	// cannot compile makes the whole CRD unapplyable rather than degrading.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=45
+	// +kubebuilder:validation:items:Pattern=`^[0-9a-fA-F:.]+(%[0-9a-zA-Z._-]+)?$`
+	// +optional
 	ListenAddresses []string `json:"listenAddresses,omitempty"`
 	// Families is the global address-family set. Omit it to keep gobgpd's
 	// default of ipv4-unicast and ipv6-unicast.
@@ -488,7 +504,17 @@ type Transport struct {
 
 // +kubebuilder:object:generate=true
 type GracefulRestart struct {
-	Enabled     bool   `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
+	// RestartTime is how long a peer should hold this speaker's routes while it
+	// restarts, in seconds. Omit it to take gobgpd's default, which is the
+	// session's hold time.
+	//
+	// Bounded at 4095 because RFC 4724 section 3 gives Restart Time 12 bits,
+	// sharing a 16-bit word with a 4-bit flags nibble. A larger value does not
+	// fail - it silently overflows into the flags and corrupts the capability, so
+	// this is not a Go type limit and 65535 would be the wrong bound.
+	// +kubebuilder:validation:Maximum=4095
+	// +optional
 	RestartTime uint32 `json:"restartTime,omitempty"`
 	HelperOnly  bool   `json:"helperOnly,omitempty"`
 }

@@ -841,3 +841,47 @@ func TestReconcileGlobal_DefaultedFieldsDoNotDrift(t *testing.T) {
 		t.Fatalf("no drift expected for daemon-defaulted fields, got: %s", e)
 	}
 }
+
+// A bad listen address must be reported before StartBgp, not after.
+//
+// gobgpd parses these with netip.ParseAddr and fails the whole StartBgp when one
+// is bad, which surfaces as "BGP server not running" on every reconcile with the
+// real cause buried in the daemon's error.
+func TestReconcileGlobal_RejectsBadListenAddress(t *testing.T) {
+	cases := []struct {
+		name    string
+		addrs   []string
+		wantErr bool
+	}{
+		{name: "valid v4 and v6", addrs: []string{"10.0.0.1", "2001:db8::1"}},
+		{name: "link-local with zone", addrs: []string{"fe80::1%eth0"}},
+		{name: "omitted entirely", addrs: nil},
+		{name: "not an address", addrs: []string{"not-an-address"}, wantErr: true},
+		{name: "empty string", addrs: []string{""}, wantErr: true},
+		// net.ParseIP accepts a bare prefix's text in some forms; netip does not,
+		// and netip is what the daemon uses.
+		{name: "a prefix, not an address", addrs: []string{"10.0.0.0/24"}, wantErr: true},
+		{name: "one bad among good", addrs: []string{"10.0.0.1", "10.0.0.256"}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &bgpv1.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: "listen", Namespace: "purelb"},
+				Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
+					ASN: 64512, RouterID: "10.0.0.1", ListenAddresses: tc.addrs,
+				}},
+			}
+			fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{Asn: 64512, RouterId: "10.0.0.1"}}
+			r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: record.NewFakeRecorder(64), NodeName: "node-1"}
+
+			err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "global.listenAddresses")
+				assert.Zero(t, fake.startBgp, "must not reach StartBgp with a bad address")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

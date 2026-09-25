@@ -1309,6 +1309,15 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		BindToDevice:    bgpConfig.Spec.Global.BindToDevice,
 	}
 
+	// Checked before either StartBgp below, not after. gobgpd parses these with
+	// netip.ParseAddr and fails the whole StartBgp if one is bad, which surfaces as
+	// "BGP server not running" on every reconcile with the real cause buried in the
+	// daemon's error. The CRD pattern catches obvious nonsense; this catches the
+	// rest, and names the offending value.
+	if vErr := validateListenAddresses(bgpConfig.Spec.Global.ListenAddresses); vErr != nil {
+		return fmt.Errorf("global.listenAddresses: %w", vErr)
+	}
+
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
 	if err != nil {
 		// gRPC error - server may not be accessible
@@ -1409,6 +1418,24 @@ func UpdateGlobalRestartRequired(bgpConfig *bgpv1.BGPConfiguration, drifted map[
 	rec.Eventf(bgpConfig, corev1.EventTypeWarning, "GlobalRestartRequired",
 		"These global settings differ from the running gobgpd and need a pod restart on this node to apply: %s",
 		strings.Join(fields, ", "))
+}
+
+// validateListenAddresses rejects a listen address gobgpd would reject.
+//
+// netip.ParseAddr, matching the daemon, rather than net.ParseIP: the two disagree
+// on enough inputs that validating with one and running the other is how a value
+// passes here and fails at StartBgp. net.ParseIP also accepts a CIDR-looking
+// string's address half in some forms, and a listen address is not a prefix.
+func validateListenAddresses(addrs []string) error {
+	for _, a := range addrs {
+		if a == "" {
+			return fmt.Errorf("empty address")
+		}
+		if _, err := netip.ParseAddr(a); err != nil {
+			return fmt.Errorf("%q is not a valid IP address: %w", a, err)
+		}
+	}
+	return nil
 }
 
 // routeSelectionOptionsEqual compares the four fields that survived v1.3.5.
