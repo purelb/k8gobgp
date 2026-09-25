@@ -22,6 +22,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ptr is for the CRD fields that carry explicit presence, where stating the zero
+// value means something different from omitting the field.
+func ptr[T any](v T) *T { return &v }
+
 func TestBGPConfigurationSpec(t *testing.T) {
 	spec := BGPConfigurationSpec{
 		Global: GlobalSpec{
@@ -93,7 +97,7 @@ func TestNeighborConfig(t *testing.T) {
 		NeighborAddress:   "192.168.1.254",
 		PeerAsn:           64513,
 		LocalAsn:          64512,
-		Description:       "Test neighbor",
+		Description:       ptr("Test neighbor"),
 		PeerGroup:         "upstream",
 		AdminDown:         false,
 		NeighborInterface: "eth0",
@@ -103,7 +107,8 @@ func TestNeighborConfig(t *testing.T) {
 	assert.Equal(t, "192.168.1.254", config.NeighborAddress)
 	assert.Equal(t, uint32(64513), config.PeerAsn)
 	assert.Equal(t, uint32(64512), config.LocalAsn)
-	assert.Equal(t, "Test neighbor", config.Description)
+	require.NotNil(t, config.Description)
+	assert.Equal(t, "Test neighbor", *config.Description)
 	assert.Equal(t, "upstream", config.PeerGroup)
 	assert.False(t, config.AdminDown)
 	assert.Equal(t, "eth0", config.NeighborInterface)

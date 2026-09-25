@@ -263,10 +263,12 @@ type PeerGroup struct {
 //
 // Two consequences worth knowing:
 //
-//   - A member cannot override a group's true with an explicit false, or opt out
-//     of a group's authPassword, because these are plain fields and the API
-//     server cannot distinguish "unset" from "set to the zero value". Omit the
-//     setting from the group instead, or do not put the neighbor in the group.
+//   - A member CAN override a group's value with a zero one. description,
+//     authPassword, allowOwnAsn, replacePeerAsn, allowAspathLoopLocal and
+//     sendSoftwareVersion carry explicit presence, so `authPassword: ""` opts a
+//     member out of its group's TCP-MD5 password and `replacePeerAsn: false`
+//     overrides a group that sets it true. Omitting the field inherits; setting
+//     it - to anything, including the zero value - claims it.
 //
 //   - allowOwnAsn, replacePeerAsn and allowAspathLoopLocal share one presence
 //     signal in gobgpd. Stating any one of them claims all three, so the other
@@ -281,12 +283,12 @@ type PeerGroup struct {
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
 	// +optional
-	AuthPassword string `json:"authPassword,omitempty"`
+	AuthPassword *string `json:"authPassword,omitempty"`
 	// AuthPasswordSecretRef references a Secret containing the BGP authentication password
 	// The Secret must contain a key matching the neighbor address or a default key "password"
 	// +optional
 	AuthPasswordSecretRef *corev1.SecretKeySelector `json:"authPasswordSecretRef,omitempty"`
-	Description           string                    `json:"description,omitempty"`
+	Description           *string                   `json:"description,omitempty"`
 	LocalAsn              uint32                    `json:"localAsn,omitempty"`
 	// NeighborAddress is the peer's IP address. For a link-local IPv6 peer,
 	// include the scope zone: fe80::1%eth0.
@@ -314,13 +316,13 @@ type NeighborConfig struct {
 	// truncate to 0 - the opposite of what was asked for.
 	// +kubebuilder:validation:Maximum=255
 	// +optional
-	AllowOwnAsn uint32 `json:"allowOwnAsn,omitempty"`
+	AllowOwnAsn *uint32 `json:"allowOwnAsn,omitempty"`
 	// ReplacePeerAsn rewrites the peer's ASN with ours in advertised AS paths.
 	// +optional
-	ReplacePeerAsn bool `json:"replacePeerAsn,omitempty"`
+	ReplacePeerAsn *bool `json:"replacePeerAsn,omitempty"`
 	// AllowAspathLoopLocal permits a local AS-path loop.
 	// +optional
-	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
+	AllowAspathLoopLocal *bool `json:"allowAspathLoopLocal,omitempty"`
 	// SendCommunity filters which community attributes are advertised to this
 	// peer, applied AFTER the export policy - so a policy that adds a community
 	// cannot walk past it.
@@ -353,7 +355,7 @@ type NeighborConfig struct {
 	RouteFlapDamping bool `json:"routeFlapDamping,omitempty"`
 	// SendSoftwareVersion advertises the software-version capability (RFC 9384).
 	// +optional
-	SendSoftwareVersion bool `json:"sendSoftwareVersion,omitempty"`
+	SendSoftwareVersion *bool `json:"sendSoftwareVersion,omitempty"`
 }
 
 // +kubebuilder:object:generate=true

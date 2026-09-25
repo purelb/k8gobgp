@@ -118,10 +118,10 @@ func TestRoundTripNeighbor(t *testing.T) {
 			crd: bgpv1.Neighbor{
 				Config: bgpv1.NeighborConfig{
 					NeighborAddress: "10.90.0.4", PeerAsn: 64513, LocalAsn: 64512,
-					Description: "everything", AdminDown: false,
-					AllowOwnAsn: 3, ReplacePeerAsn: true, AllowAspathLoopLocal: true,
+					Description: ptr("everything"), AdminDown: false,
+					AllowOwnAsn: ptr(uint32(3)), ReplacePeerAsn: ptr(true), AllowAspathLoopLocal: ptr(true),
 					RemovePrivate: "replace", RouteFlapDamping: true,
-					SendSoftwareVersion: true, SendCommunity: "both",
+					SendSoftwareVersion: ptr(true), SendCommunity: "both",
 				},
 				AfiSafis: []bgpv1.AfiSafi{
 					{Family: "ipv4-unicast", Enabled: true,
@@ -157,7 +157,7 @@ func TestRoundTripNeighbor(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			desired := r.crdToAPINeighborWithPassword(&tc.crd, "")
+			desired := r.crdToAPINeighborWithPassword(&tc.crd, nil)
 			// Delete first: AddPeer errors on an existing peer, and a suite that
 			// only passes against a pristine daemon fails confusingly on the
 			// second run.
@@ -369,6 +369,16 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 	defer done()
 	r := &BGPConfigurationReconciler{}
 
+	// Clear anything a previous run left behind. A peer group cannot be deleted
+	// while it still has members, so the peers go first - otherwise DeletePeerGroup
+	// fails silently and AddPeerGroup reports "can't overwrite the existing
+	// peer-group", which looks like a daemon bug rather than leftover state.
+	for i := 1; i <= 9; i++ {
+		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{
+			Address: fmt.Sprintf("10.90.0.%d", i),
+		})
+	}
+
 	const pg = "rt-inherit"
 	// The group states values for everything a member might inherit.
 	group := bgpv1.PeerGroup{Config: bgpv1.PeerGroupConfig{
@@ -384,10 +394,40 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 	})
 	require.NoError(t, err, "AddPeerGroup")
 
+	// A second group that sets a password, for the opt-out case. Kept separate so
+	// the other cases are not all authenticated.
+	const pgWithPassword = "rt-inherit-md5"
+	groupPw := bgpv1.PeerGroup{Config: bgpv1.PeerGroupConfig{
+		PeerGroupName: pgWithPassword, PeerAsn: 64513, AuthPassword: "group-secret",
+	}}
+	_, _ = c.DeletePeerGroup(ctx, &gobgpapi.DeletePeerGroupRequest{Name: pgWithPassword})
+	_, err = c.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{
+		PeerGroup: r.crdToAPIPeerGroupWithPassword(&groupPw, "group-secret"),
+	})
+	require.NoError(t, err, "AddPeerGroup (md5)")
+
+	// readBackIn adds the neighbor and returns what ListPeer reports. The password
+	// is resolved the way reconcileNeighbors resolves it, so an explicitly empty
+	// authPassword reaches the daemon as a non-nil empty string rather than as
+	// absence - which is the whole point of the opt-out case.
+	readBackIn := func(t *testing.T, group string, n bgpv1.Neighbor) (*gobgpapi.Peer, *gobgpapi.Peer) {
+		t.Helper()
+		desired := r.crdToAPINeighborWithPassword(&n, n.Config.AuthPassword)
+		addr := n.Config.NeighborAddress
+		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr})
+		_, err := c.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired})
+		require.NoError(t, err, "AddPeer rejected our config")
+		stream, err := c.ListPeer(ctx, &gobgpapi.ListPeerRequest{Address: addr})
+		require.NoError(t, err)
+		resp, err := stream.Recv()
+		require.NoError(t, err)
+		return desired, resp.GetPeer()
+	}
+
 	// readBack adds the neighbor and returns what ListPeer reports.
 	readBack := func(t *testing.T, n bgpv1.Neighbor) (*gobgpapi.Peer, *gobgpapi.Peer) {
 		t.Helper()
-		desired := r.crdToAPINeighborWithPassword(&n, "")
+		desired := r.crdToAPINeighborWithPassword(&n, nil)
 		addr := n.Config.NeighborAddress
 		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr})
 		_, err := c.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired})
@@ -423,7 +463,7 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 	t.Run("member stating its own value keeps it", func(t *testing.T) {
 		desired, current := readBack(t, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
 			NeighborAddress: "10.90.0.2", PeerAsn: 64513, PeerGroup: pg,
-			Description: "mine-not-the-groups", SendSoftwareVersion: true,
+			Description: ptr("mine-not-the-groups"), SendSoftwareVersion: ptr(true),
 		}})
 		cc := current.GetConf()
 		// This is the v1.3.4/v1.3.5 field-presence fix. Before it, the group won.
@@ -435,13 +475,41 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 		}
 	})
 
+	t.Run("member opts out of the group's TCP-MD5", func(t *testing.T) {
+		// The reason description, authPassword and the as-path fields are pointers
+		// in the CRD. A plain string cannot distinguish "said nothing, inherit the
+		// group's password" from "said empty, do not authenticate", so before this
+		// a grouped member could not decline its group's TCP-MD5 key at all.
+		//
+		// Asserted through PeerState.AuthPasswordSet rather than the password,
+		// which ListPeer redacts.
+		withPw := bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.8", PeerAsn: 64513, PeerGroup: pgWithPassword,
+		}}
+		_, current := readBackIn(t, pgWithPassword, withPw)
+		require.True(t, current.GetState().GetAuthPasswordSet(),
+			"omitting authPassword must inherit the group's")
+
+		optOut := bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.9", PeerAsn: 64513, PeerGroup: pgWithPassword,
+			AuthPassword: ptr(""),
+		}}
+		desired, current := readBackIn(t, pgWithPassword, optOut)
+		require.False(t, current.GetState().GetAuthPasswordSet(),
+			"authPassword: \"\" must opt out of the group's password, not inherit it")
+		if !peerConfigEqual(desired, current) {
+			reportPeerDiff(t, desired, current)
+			t.Error("peerConfigEqual is FALSE for a member that opted out of its group's password")
+		}
+	})
+
 	t.Run("as-path options are claimed as one block", func(t *testing.T) {
 		// Stating one of the three claims all three: the other two stop
 		// inheriting and fall back to their defaults. Surprising, documented on
 		// NeighborConfig, and asserted here so it cannot change silently.
 		_, current := readBack(t, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
 			NeighborAddress: "10.90.0.3", PeerAsn: 64513, PeerGroup: pg,
-			AllowOwnAsn: 5,
+			AllowOwnAsn: ptr(uint32(5)),
 		}})
 		cc := current.GetConf()
 		require.Equal(t, uint32(5), cc.GetAllowOwnAsn(), "stated value must win")
@@ -483,9 +551,9 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 		// file is a readback after a single add, which is why none of them saw it.
 		n := bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
 			NeighborAddress: "10.90.0.6", PeerAsn: 64513, PeerGroup: pg,
-			Description: "owned", AuthPassword: "s3cret", LocalAsn: 64598,
+			Description: ptr("owned"), AuthPassword: ptr("s3cret"), LocalAsn: 64598,
 		}}
-		desired := r.crdToAPINeighborWithPassword(&n, "s3cret")
+		desired := r.crdToAPINeighborWithPassword(&n, ptr("s3cret"))
 		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: n.Config.NeighborAddress})
 		_, err := c.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired})
 		require.NoError(t, err)

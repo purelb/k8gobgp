@@ -448,12 +448,12 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 				Config: bgpv1.NeighborConfig{
 					NeighborAddress:      "10.0.0.20",
 					PeerAsn:              64513,
-					AllowOwnAsn:          3,
-					ReplacePeerAsn:       true,
-					AllowAspathLoopLocal: true,
+					AllowOwnAsn:          proto.Uint32(3),
+					ReplacePeerAsn:       proto.Bool(true),
+					AllowAspathLoopLocal: proto.Bool(true),
 					RemovePrivate:        "replace",
 					RouteFlapDamping:     true,
-					SendSoftwareVersion:  true,
+					SendSoftwareVersion:  proto.Bool(true),
 					SendCommunity:        "both",
 				},
 			},
@@ -487,7 +487,7 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 				Config: bgpv1.NeighborConfig{
 					NeighborAddress: "10.0.0.8",
 					PeerAsn:         64513,
-					AuthPassword:    "correct horse battery staple",
+					AuthPassword:    proto.String("correct horse battery staple"),
 				},
 			},
 		},
@@ -550,7 +550,7 @@ func TestReconcileNeighbors_DetectsRealChange(t *testing.T) {
 	}
 
 	r := &BGPConfigurationReconciler{Log: logf.Log}
-	fake := &fakeGoBGP{peers: []*gobgpapi.Peer{gobgpdEcho(r.crdToAPINeighborWithPassword(&existing, ""))}}
+	fake := &fakeGoBGP{peers: []*gobgpapi.Peer{gobgpdEcho(r.crdToAPINeighborWithPassword(&existing, nil))}}
 
 	require.NoError(t, r.reconcileNeighbors(context.Background(), fake, cfg, map[string]*gobgpapi.PeerGroup{}, logf.Log))
 	assert.Equal(t, 1, fake.updatePeer, "a changed hold time must produce exactly one UpdatePeer")
@@ -665,7 +665,7 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 		Config: bgpv1.NeighborConfig{
 			NeighborAddress: "2001:470:b8f3:251::1",
 			PeerAsn:         64514,
-			Description:     "Gateway router on subnet-251 (IPv6)",
+			Description:     proto.String("Gateway router on subnet-251 (IPv6)"),
 		},
 		AfiSafis: []bgpv1.AfiSafi{
 			{Family: "ipv4-unicast", Enabled: true},
@@ -673,7 +673,7 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 		},
 		Timers: &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 90, KeepaliveInterval: 30}},
 	}
-	desired := r.crdToAPINeighborWithPassword(crd, "")
+	desired := r.crdToAPINeighborWithPassword(crd, nil)
 
 	// Verbatim from `gobgp --target unix://... -j neighbor 2001:470:b8f3:251::1`
 	// against gobgpd v1.3.0 (commit 8b99965), session established.

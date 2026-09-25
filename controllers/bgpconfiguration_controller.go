@@ -256,12 +256,15 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if dc.PeerGroup == "" && dc.PeerAsn != cc.PeerAsn {
 		return false
 	}
-	// Description is compared only when the CR sets one, for the same reason as
-	// LocalAsn above: the converter sends nil for an unset description so the
-	// peer group can still supply one, and gobgpd echoes the resolved value.
-	// Comparing unconditionally would be "" against the group's description,
-	// permanently unequal for every grouped peer that does not set its own.
-	if dc.GetDescription() != "" && dc.GetDescription() != cc.GetDescription() {
+	// Description is compared only when the CR states one. The converter sends
+	// nil for an omitted description so the peer group can still supply it, and
+	// gobgpd echoes the resolved value - comparing that against nil would be
+	// permanently unequal for every grouped peer without its own.
+	//
+	// Presence, not emptiness: description is a *string in the CRD, so
+	// `description: ""` is a deliberate override of a group's value and must be
+	// compared. A GetDescription() != "" test would silently skip exactly that.
+	if dc.Description != nil && dc.GetDescription() != cc.GetDescription() {
 		return false
 	}
 	if dc.PeerGroup != cc.PeerGroup ||
@@ -1765,12 +1768,17 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 			}
 		}
 
-		// Resolve auth password from Secret or inline value
-		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
+		// Resolve auth password from Secret or inline value.
+		//
+		// A peer group is only ever a source of values and never inherits, so
+		// api.PeerGroupConf carries no explicit presence and the CRD field stays a
+		// plain string. The resolver is shared with the neighbor path, which does
+		// need presence, so adapt at the boundary rather than forking it.
+		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, &pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
 		if err != nil {
 			return nil, fmt.Errorf("peer group %q: %w", pg.Config.PeerGroupName, err)
 		}
-		desiredPeerGroups[pg.Config.PeerGroupName] = r.crdToAPIPeerGroupWithPassword(&pg, authPassword)
+		desiredPeerGroups[pg.Config.PeerGroupName] = r.crdToAPIPeerGroupWithPassword(&pg, ptrDeref(authPassword))
 	}
 
 	// 3. Delete unwanted peer groups
@@ -2009,6 +2017,13 @@ func (r *BGPConfigurationReconciler) reportInertFields(bgpConfig *bgpv1.BGPConfi
 // grouped peer whose only owned field is its password nothing else would ever
 // trigger a correction.
 func (r *BGPConfigurationReconciler) authPasswordDrifted(bgpConfig *bgpv1.BGPConfiguration, key string, desired, current *gobgpapi.Peer, log logr.Logger) bool {
+	// Nil means the CR stated nothing, so the peer group's password - if any -
+	// applies and there is nothing here to compare against. A non-nil empty string
+	// is different: it is a deliberate opt-out, and the daemon should report no
+	// password set.
+	if desired.GetConf().AuthPassword == nil {
+		return false
+	}
 	want := desired.GetConf().GetAuthPassword() != ""
 	have := current.GetState().GetAuthPasswordSet()
 	if want == have {
@@ -2677,7 +2692,7 @@ func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.Pe
 }
 
 // crdToAPINeighborWithPassword converts a CRD Neighbor to API Peer with resolved password
-func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Neighbor, authPassword string) *gobgpapi.Peer {
+func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Neighbor, authPassword *string) *gobgpapi.Peer {
 	return &gobgpapi.Peer{
 		Conf: &gobgpapi.PeerConf{
 			NeighborAddress:   crd.Config.NeighborAddress,
@@ -2692,14 +2707,19 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 			// AllowOwnAsn, ReplacePeerAsn and AllowAspathLoopLocal share one
 			// block-level presence guard on the daemon side, so stating any one
 			// of them claims all three and the other two stop inheriting.
+			// Passed straight through: these CRD fields are pointers, so the CR
+			// itself carries the presence the daemon reads. Omitted means nil
+			// means inherit; stated - including stated as the zero value - claims
+			// the field. localAsn stays a zero test because 0 already means "use
+			// the global ASN", so unset and explicit zero are the same request.
 			LocalAsn:             ptrIfSet(crd.Config.LocalAsn),
-			Description:          ptrIfSet(crd.Config.Description),
-			AuthPassword:         ptrIfSet(authPassword),
-			AllowOwnAsn:          ptrIfSet(crd.Config.AllowOwnAsn),
-			ReplacePeerAsn:       ptrIfSet(crd.Config.ReplacePeerAsn),
-			AllowAspathLoopLocal: ptrIfSet(crd.Config.AllowAspathLoopLocal),
+			Description:          crd.Config.Description,
+			AuthPassword:         authPassword,
+			AllowOwnAsn:          crd.Config.AllowOwnAsn,
+			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
+			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
 			RemovePrivate:        crdToAPIRemovePrivatePtr(crd.Config.RemovePrivate),
-			SendSoftwareVersion:  ptrIfSet(crd.Config.SendSoftwareVersion),
+			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
 		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
@@ -2803,7 +2823,14 @@ func bfdEqual(desired, current *gobgpapi.BfdPeerConfig, defaulted bool) bool {
 
 // resolveAuthPassword resolves the authentication password from either inline value or Secret reference.
 // Returns an error if a SecretRef is specified but the Secret or key cannot be found.
-func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, namespace string, authPassword string, secretRef *corev1.SecretKeySelector, log logr.Logger) (string, error) {
+// resolveAuthPassword returns the password to send, or nil when the CR states
+// none.
+//
+// The nil is load-bearing: api.PeerConf.auth_password carries explicit presence,
+// so nil lets a peer group supply the password while a non-nil empty string is an
+// explicit opt-out from it. A plain "" could not express that difference, which is
+// why authPassword became a *string in the CRD.
+func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, namespace string, authPassword *string, secretRef *corev1.SecretKeySelector, log logr.Logger) (*string, error) {
 	// If SecretRef is specified, prefer it over inline password
 	if secretRef != nil && secretRef.Name != "" {
 		secret := &corev1.Secret{}
@@ -2812,14 +2839,16 @@ func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, na
 			Name:      secretRef.Name,
 		}
 		if err := r.Get(ctx, secretName, secret); err != nil {
-			return "", fmt.Errorf("failed to get Secret %q for auth password: %w", secretRef.Name, err)
+			return nil, fmt.Errorf("failed to get Secret %q for auth password: %w", secretRef.Name, err)
 		}
 		if password, ok := secret.Data[secretRef.Key]; ok {
-			return string(password), nil
+			p := string(password)
+			return &p, nil
 		}
-		return "", fmt.Errorf("key %q not found in Secret %q", secretRef.Key, secretRef.Name)
+		return nil, fmt.Errorf("key %q not found in Secret %q", secretRef.Key, secretRef.Name)
 	}
-	// Fall back to inline password (deprecated)
+	// Fall back to inline password (deprecated). Passed through as-is, nil
+	// included, so "stated nothing" stays distinguishable from "stated empty".
 	return authPassword, nil
 }
 
@@ -3168,6 +3197,16 @@ func ptrIfSet[T comparable](v T) *T {
 		return nil
 	}
 	return &v
+}
+
+// ptrDeref returns *p, or the zero value when p is nil. The inverse of ptrIfSet,
+// for the paths that genuinely have no presence to carry.
+func ptrDeref[T any](p *T) T {
+	if p == nil {
+		var zero T
+		return zero
+	}
+	return *p
 }
 
 // crdToAPIRemovePrivatePtr is the api.PeerConf form of crdToAPIRemovePrivate.
