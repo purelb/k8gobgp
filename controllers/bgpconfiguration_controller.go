@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/netip"
@@ -190,6 +191,26 @@ func isDynamicallyAcceptedPeer(peer *gobgpapi.Peer, prefixes []netip.Prefix) boo
 
 // deletePeerByKey issues a DeletePeer request using either Interface or Address
 // depending on whether the peer is interface-based.
+// listPeerKeys returns the keys gobgpd currently holds, keyed the way
+// neighborKeyFromCRD keys the CR so the two can be compared directly.
+func listPeerKeys(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient) (map[string]bool, error) {
+	stream, err := apiClient.ListPeer(ctx, &gobgpapi.ListPeerRequest{})
+	if err != nil {
+		return nil, err
+	}
+	keys := map[string]bool{}
+	for {
+		res, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			return keys, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		keys[neighborKey(res.GetPeer().GetConf())] = true
+	}
+}
+
 func deletePeerByKey(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, cfg *bgpv1.NeighborConfig) error {
 	if cfg.NeighborInterface != "" {
 		_, err := apiClient.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Interface: cfg.NeighborInterface})
@@ -1059,9 +1080,35 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 		var cleanupErrors []error
 
 		// Delete neighbors first (must be done before peer groups).
-		// Delete unconditionally (don't check nodeSelector) using interface or address as appropriate.
+		//
+		// Only the ones gobgpd actually has. The CR is walked without checking
+		// nodeSelector - a neighbor may have been applied on some other node - so
+		// for any CR that uses nodeSelector at least one entry was never
+		// configured here, and gobgpd answers DeletePeer for an unknown address
+		// with "can't delete a peer configuration for X". That counted as a
+		// cleanup failure, cleanupErrors never emptied, the finalizer was never
+		// removed, and the CR stayed in Terminating for ever. Observed on a live
+		// cluster: kubectl delete timed out and the finalizer had to be cleared by
+		// hand.
+		//
+		// The second pass made it worse - it also failed for the neighbor the
+		// first pass had successfully deleted - so even a single-subnet CR
+		// deadlocked after one retry.
+		//
+		// One ListPeer rather than matching on the daemon's error string: the
+		// message is not an API contract, and this is the same set the reconcile
+		// path already builds. A ListPeer failure is not fatal here; fall back to
+		// attempting every delete, which is the old behavior and no worse.
+		present, listErr := listPeerKeys(ctx, apiClient)
+		if listErr != nil {
+			log.V(1).Info("ListPeer failed during cleanup; attempting every delete", "error", listErr.Error())
+		}
 		for _, n := range bgpConfig.Spec.Neighbors {
 			key := neighborKeyFromCRD(&n.Config)
+			if listErr == nil && !present[key] {
+				log.V(1).Info("Neighbor not configured on this node, nothing to delete", "key", key)
+				continue
+			}
 			if err := deletePeerByKey(ctx, apiClient, &n.Config); err != nil {
 				log.Error(err, "Failed to delete neighbor during cleanup", "key", key)
 				cleanupErrors = append(cleanupErrors, err)
@@ -1336,11 +1383,15 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	// "BGP server not running" on every reconcile with the real cause buried in the
 	// daemon's error. The CRD pattern catches obvious nonsense; this catches the
 	// rest, and names the offending value.
+	// No "global:" prefix here - Reconcile's chain already wraps this function's
+	// error with one, and adding a second produced "global: global: ..." in the
+	// logs. Observed on a live cluster, not in a test, because the tests assert on
+	// the message rather than reading it.
 	if vErr := validateListenAddresses(bgpConfig.Spec.Global.ListenAddresses); vErr != nil {
-		return fmt.Errorf("global.listenAddresses: %w", vErr)
+		return fmt.Errorf("listenAddresses: %w", vErr)
 	}
 	if vErr := validateMultipath(&bgpConfig.Spec.Global); vErr != nil {
-		return fmt.Errorf("global: %w", vErr)
+		return vErr
 	}
 
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
@@ -1554,6 +1605,22 @@ func (r *BGPConfigurationReconciler) resolveEffectiveRouterID(ctx context.Contex
 		// In a DaemonSet, each pod resolves its own node's IP, so per-node details
 		// are available via pod annotations, metrics, and Kubernetes events instead.
 		bgpConfig.Status.RouterIDSource = entry.source
+
+		// Re-assert the condition so its observedGeneration tracks the object.
+		//
+		// Only the first resolve used to set it, and every later reconcile took this
+		// path, so the condition kept the generation it was created with. Reproduced:
+		// a config at generation 1 reported observedGeneration 1; after an unrelated
+		// spec edit the object was at generation 2 and the condition still said 1.
+		//
+		// That is not cosmetic - observedGeneration is the documented way to ask
+		// "has the controller seen my change yet", so anything waiting on it waits
+		// for ever. It is what TestRouterIDResolution_Immutability polls for.
+		//
+		// The status is unchanged, so updateStatusCondition leaves
+		// lastTransitionTime alone and only refreshes the generation.
+		r.updateStatusCondition(ctx, bgpConfig, "RouterIDResolved", metav1.ConditionTrue,
+			"Resolved", fmt.Sprintf("Router ID resolved via %s", entry.source))
 
 		return entry.routerID, nil
 	}
@@ -3624,13 +3691,30 @@ func (r *BGPConfigurationReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// Initialize node cache for router ID resolution
 	r.InitNodeCache()
 
+	// GenerationChangedPredicate is scoped to the BGPConfiguration watch, NOT set
+	// with WithEventFilter.
+	//
+	// WithEventFilter applies to every watch this controller registers, including
+	// the corev1.Node one below - and the apiserver does not maintain
+	// metadata.generation on Node objects. Verified on a live cluster: a Node's
+	// generation is unset and stays unset across label edits, so the predicate
+	// compared 0 != 0, returned false, and every node label change was dropped
+	// before nodeLabelChangePredicate was ever consulted.
+	//
+	// The effect was that nodeSelector did not respond to label changes at runtime.
+	// A neighbor gated on a label was added or removed only on the next .spec edit
+	// or pod restart, which looks like the feature working - just slowly - rather
+	// than a watch that never fires. Adding a label to a node produced zero
+	// reconciles.
+	//
+	// So the generation filter goes where generation is meaningful, and the Node
+	// watch keeps its own predicate.
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&bgpv1.BGPConfiguration{}).
+		For(&bgpv1.BGPConfiguration{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Watches(&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.nodeToRequests),
 			builder.WithPredicates(r.nodeLabelChangePredicate()),
 		).
-		WithEventFilter(predicate.GenerationChangedPredicate{}).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: 1,
 			RateLimiter:             workqueue.NewTypedItemExponentialFailureRateLimiter[ctrl.Request](time.Second, 5*time.Minute),
