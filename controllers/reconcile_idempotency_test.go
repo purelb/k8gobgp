@@ -16,6 +16,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -1009,3 +1010,101 @@ func TestInheritedBlocks(t *testing.T) {
 }
 
 func ptrTo[T any](v T) *T { return &v }
+
+// The RouterIDResolved condition's observedGeneration must track the object.
+//
+// Only the first resolve used to set it. Every later reconcile took the in-memory
+// cache path, which returned early without touching the condition, so it kept the
+// generation it was created with - and observedGeneration is the documented way to
+// ask "has the controller seen my change yet", so anything waiting on it waited for
+// ever. TestRouterIDResolution_Immutability polls exactly that.
+func TestResolveEffectiveRouterID_RefreshesObservedGeneration(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "rid", Namespace: "purelb", Generation: 1},
+		Spec:       bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{ASN: 64512, RouterID: "10.0.0.1"}},
+	}
+	r := &BGPConfigurationReconciler{Log: logf.Log, NodeName: "node-1"}
+
+	// First resolve: populates the cache and the condition.
+	id, err := r.resolveEffectiveRouterID(context.Background(), cfg, logf.Log)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.1", id)
+	require.Equal(t, int64(1), conditionGeneration(t, cfg, "RouterIDResolved"))
+
+	// An unrelated spec change bumps the generation. The router ID is immutable, so
+	// the next reconcile takes the cache path - which must still refresh the
+	// condition.
+	cfg.Generation = 2
+	id, err = r.resolveEffectiveRouterID(context.Background(), cfg, logf.Log)
+	require.NoError(t, err)
+	require.Equal(t, "10.0.0.1", id, "router ID must stay immutable")
+	assert.Equal(t, int64(2), conditionGeneration(t, cfg, "RouterIDResolved"),
+		"observedGeneration must track the object, or anything polling it waits for ever")
+}
+
+func conditionGeneration(t *testing.T, cfg *bgpv1.BGPConfiguration, condType string) int64 {
+	t.Helper()
+	for _, c := range cfg.Status.Conditions {
+		if c.Type == condType {
+			return c.ObservedGeneration
+		}
+	}
+	t.Fatalf("condition %q not found", condType)
+	return 0
+}
+
+// Cleanup must not treat a peer that was never configured on this node as a failure.
+//
+// reconcileDelete walks every neighbor in the CR without checking nodeSelector, so
+// for any CR that uses one at least one entry was never applied here. gobgpd answers
+// DeletePeer for an unknown address with an error, that counted as a cleanup
+// failure, and the finalizer was never removed - the CR stayed in Terminating for
+// ever. Observed on a live cluster: kubectl delete timed out and the finalizer had to
+// be cleared by hand.
+type fakeDeleteGoBGP struct {
+	gobgpapi.GoBgpServiceClient
+	have        []*gobgpapi.Peer // what gobgpd holds
+	deleteCalls []string
+	failUnknown bool // reject a delete for an address not in `have`, as gobgpd does
+}
+
+func (f *fakeDeleteGoBGP) ListPeer(_ context.Context, _ *gobgpapi.ListPeerRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPeerResponse], error) {
+	return &fakeListPeerStream{peers: f.have}, nil
+}
+
+func (f *fakeDeleteGoBGP) DeletePeer(_ context.Context, r *gobgpapi.DeletePeerRequest, _ ...grpc.CallOption) (*gobgpapi.DeletePeerResponse, error) {
+	key := r.GetAddress()
+	if r.GetInterface() != "" {
+		key = "iface:" + r.GetInterface()
+	}
+	f.deleteCalls = append(f.deleteCalls, key)
+	if f.failUnknown {
+		for _, p := range f.have {
+			if neighborKey(p.GetConf()) == key {
+				return &gobgpapi.DeletePeerResponse{}, nil
+			}
+		}
+		return nil, fmt.Errorf("can't delete a peer configuration for %s", key)
+	}
+	return &gobgpapi.DeletePeerResponse{}, nil
+}
+
+func TestListPeerKeys_SkipsPeersNotOnThisNode(t *testing.T) {
+	// gobgpd holds only the subnet-251 neighbor; the CR names both.
+	fake := &fakeDeleteGoBGP{
+		have: []*gobgpapi.Peer{
+			{Conf: &gobgpapi.PeerConf{NeighborAddress: "10.0.251.1", PeerAsn: 64514}},
+		},
+		failUnknown: true,
+	}
+	present, err := listPeerKeys(context.Background(), fake)
+	require.NoError(t, err)
+	assert.True(t, present["10.0.251.1"], "the peer gobgpd holds must be present")
+	assert.False(t, present["10.0.250.1"], "a peer applied on another node must be absent")
+
+	// And the delete the old code issued for the absent one does fail, which is why
+	// skipping it is the fix rather than a nicety.
+	_, err = fake.DeletePeer(context.Background(), &gobgpapi.DeletePeerRequest{Address: "10.0.250.1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "can't delete a peer configuration")
+}
