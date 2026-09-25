@@ -131,11 +131,14 @@ type GlobalSpec struct {
 	Families              []string               `json:"families,omitempty"`
 	UseMultiplePaths      bool                   `json:"useMultiplePaths,omitempty"`
 	RouteSelectionOptions *RouteSelectionOptions `json:"routeSelectionOptions,omitempty"`
-	DefaultRouteDistance  *DefaultRouteDistance  `json:"defaultRouteDistance,omitempty"`
-	Confederation         *Confederation         `json:"confederation,omitempty"`
-	GracefulRestart       *GracefulRestart       `json:"gracefulRestart,omitempty"`
-	ApplyPolicy           *ApplyPolicy           `json:"applyPolicy,omitempty"`
-	BindToDevice          string                 `json:"bindToDevice,omitempty"`
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
+	DefaultRouteDistance *DefaultRouteDistance `json:"defaultRouteDistance,omitempty"`
+	Confederation        *Confederation        `json:"confederation,omitempty"`
+	GracefulRestart      *GracefulRestart      `json:"gracefulRestart,omitempty"`
+	ApplyPolicy          *ApplyPolicy          `json:"applyPolicy,omitempty"`
+	BindToDevice         string                `json:"bindToDevice,omitempty"`
 	// NodeStatus configures per-node BGPNodeStatus reporting
 	// +optional
 	NodeStatus *NodeStatusConfig `json:"nodeStatus,omitempty"`
@@ -251,6 +254,29 @@ type PeerGroup struct {
 
 // --- Detailed Sub-structs ---
 
+// NeighborConfig is a neighbor's own settings.
+//
+// Peer-group inheritance: for a neighbor that names a peerGroup, any field left
+// unset here takes the group's value. That is why an omitted field is sent to
+// gobgpd as absent rather than as a zero - stating a field claims it and stops
+// the group supplying it.
+//
+// Two consequences worth knowing:
+//
+//   - A member cannot override a group's true with an explicit false, or opt out
+//     of a group's authPassword, because these are plain fields and the API
+//     server cannot distinguish "unset" from "set to the zero value". Omit the
+//     setting from the group instead, or do not put the neighbor in the group.
+//
+//   - allowOwnAsn, replacePeerAsn and allowAspathLoopLocal share one presence
+//     signal in gobgpd. Stating any one of them claims all three, so the other
+//     two fall back to their defaults instead of inheriting from the group.
+//     State all three together, or none.
+//
+//   - peerAsn is the exception: where a peer group states one, the group's value
+//     always wins and a differing value here is discarded. The controller emits a
+//     PeerAsnOverridden warning event when that happens.
+//
 // +kubebuilder:object:generate=true
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
@@ -320,6 +346,9 @@ type NeighborConfig struct {
 	// +optional
 	RemovePrivate string `json:"removePrivate,omitempty"`
 	// RouteFlapDamping enables RFC 2439 damping for this peer.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	// +optional
 	RouteFlapDamping bool `json:"routeFlapDamping,omitempty"`
 	// SendSoftwareVersion advertises the software-version capability (RFC 9384).
@@ -376,6 +405,9 @@ type PeerGroupConfig struct {
 	// +optional
 	RemovePrivate string `json:"removePrivate,omitempty"`
 	// RouteFlapDamping enables RFC 2439 damping for members of this group.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	// +optional
 	RouteFlapDamping bool `json:"routeFlapDamping,omitempty"`
 	// SendSoftwareVersion advertises the software-version capability (RFC 9384).
@@ -411,15 +443,29 @@ type AddPaths struct {
 }
 
 // +kubebuilder:object:generate=true
+// Timers holds session timers.
+//
+// Whole-block inheritance: for a neighbor in a peer group, supplying this block
+// at all claims every timer in it. A neighbor that sets only connectRetry
+// therefore stops inheriting the group's holdTime and keepaliveInterval and falls
+// back to gobgpd's defaults. Repeat the group's values here, or omit the block.
+//
+// Editing holdTime or keepaliveInterval rebuilds the BGP session as of
+// gobgp-netlink v1.3.5; connectRetry and idleHoldTimeAfterReset do not. Editing
+// them on a peer group rebuilds every member's session at once, so enable
+// graceful restart first.
 type Timers struct {
 	Config TimersConfig `json:"config"`
 }
 
 // +kubebuilder:object:generate=true
 type TimersConfig struct {
-	ConnectRetry                 uint64 `json:"connectRetry,omitempty"`
-	HoldTime                     uint64 `json:"holdTime,omitempty"`
-	KeepaliveInterval            uint64 `json:"keepaliveInterval,omitempty"`
+	ConnectRetry      uint64 `json:"connectRetry,omitempty"`
+	HoldTime          uint64 `json:"holdTime,omitempty"`
+	KeepaliveInterval uint64 `json:"keepaliveInterval,omitempty"`
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	MinimumAdvertisementInterval uint64 `json:"minimumAdvertisementInterval,omitempty"`
 }
 
@@ -514,10 +560,19 @@ type RouteSelectionOptions struct {
 	// ExternalCompareRouterID compares router IDs for external paths.
 	ExternalCompareRouterID bool `json:"externalCompareRouterID,omitempty"`
 	// AdvertiseInactiveRoutes advertises routes not installed in the FIB.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	AdvertiseInactiveRoutes bool `json:"advertiseInactiveRoutes,omitempty"`
 	// EnableAigp enables AIGP metric comparison.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	EnableAigp bool `json:"enableAigp,omitempty"`
 	// IgnoreNextHopIgpMetric skips the next-hop IGP metric.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	IgnoreNextHopIgpMetric bool `json:"ignoreNextHopIgpMetric,omitempty"`
 	// DisableBestPathSelection turns off best-path selection entirely.
 	DisableBestPathSelection bool `json:"disableBestPathSelection,omitempty"`

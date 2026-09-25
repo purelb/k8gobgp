@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -579,9 +580,68 @@ func TestCrdToAPINeighborWithPassword(t *testing.T) {
 
 	assert.Equal(t, "192.168.1.254", result.Conf.NeighborAddress)
 	assert.Equal(t, uint32(64513), result.Conf.PeerAsn)
-	assert.Equal(t, "Test peer", result.Conf.Description)
-	assert.Equal(t, "test-password", result.Conf.AuthPassword)
+	assert.Equal(t, "Test peer", result.Conf.GetDescription())
+	assert.Equal(t, "test-password", result.Conf.GetAuthPassword())
+	// Both are stated by the CR, so both must be sent as pointers - a nil here
+	// would hand the field to the peer group instead.
+	assert.NotNil(t, result.Conf.Description)
+	assert.NotNil(t, result.Conf.AuthPassword)
 	assert.Len(t, result.AfiSafis, 1)
+}
+
+// A CR that does not state an inheritable field must send nil for it, so the
+// peer group can still supply the value.
+//
+// gobgp-netlink v1.3.5 treats a non-nil api.PeerConf field as "the client owns
+// this, do not inherit it". Sending an explicit zero instead of nil therefore
+// switches off peer-group inheritance silently: no churn, no error, the group's
+// setting simply stops applying. Nothing else in the suite would notice, because
+// the daemon echoes the zero straight back and every comparison agrees.
+func TestCrdToAPINeighborSendsNilForUnstatedFields(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, bgpv1.AddToScheme(scheme))
+	r := &BGPConfigurationReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+
+	bare := &bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+		NeighborAddress: "10.0.0.1",
+		PeerAsn:         64513,
+		PeerGroup:       "spines",
+	}}
+	conf := r.crdToAPINeighborWithPassword(bare, "").GetConf()
+	assert.Nil(t, conf.Description, "unstated description must inherit")
+	assert.Nil(t, conf.LocalAsn, "unstated localAsn must inherit")
+	assert.Nil(t, conf.AuthPassword, "unresolved password must inherit")
+	assert.Nil(t, conf.AllowOwnAsn, "unstated allowOwnAsn must inherit")
+	assert.Nil(t, conf.ReplacePeerAsn, "unstated replacePeerAsn must inherit")
+	assert.Nil(t, conf.AllowAspathLoopLocal, "unstated allowAspathLoopLocal must inherit")
+	assert.Nil(t, conf.RemovePrivate, "unstated removePrivate must inherit")
+	assert.Nil(t, conf.SendSoftwareVersion, "unstated sendSoftwareVersion must inherit")
+	assert.Nil(t, conf.SendCommunity, "unstated sendCommunity must inherit")
+
+	// And a CR that does state them must claim them.
+	stated := &bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+		NeighborAddress:      "10.0.0.2",
+		PeerAsn:              64513,
+		PeerGroup:            "spines",
+		Description:          "spine-1",
+		LocalAsn:             64512,
+		AllowOwnAsn:          2,
+		ReplacePeerAsn:       true,
+		AllowAspathLoopLocal: true,
+		RemovePrivate:        "all",
+		SendSoftwareVersion:  true,
+		SendCommunity:        "standard",
+	}}
+	conf = r.crdToAPINeighborWithPassword(stated, "pw").GetConf()
+	assert.Equal(t, "spine-1", conf.GetDescription())
+	assert.Equal(t, uint32(64512), conf.GetLocalAsn())
+	assert.Equal(t, "pw", conf.GetAuthPassword())
+	assert.Equal(t, uint32(2), conf.GetAllowOwnAsn())
+	assert.True(t, conf.GetReplacePeerAsn())
+	assert.True(t, conf.GetAllowAspathLoopLocal())
+	assert.Equal(t, gobgpapi.RemovePrivate_REMOVE_PRIVATE_ALL, conf.GetRemovePrivate())
+	assert.True(t, conf.GetSendSoftwareVersion())
+	assert.NotNil(t, conf.SendCommunity)
 }
 
 // Test helper function for peer group password resolution
@@ -925,13 +985,18 @@ func TestPeerConfigEqual(t *testing.T) {
 			Conf: &gobgpapi.PeerConf{
 				NeighborAddress:   "10.0.0.1",
 				PeerAsn:           64513,
-				LocalAsn:          64512,
-				Description:       "test",
-				AuthPassword:      "secret",
+				LocalAsn:          proto.Uint32(64512),
+				Description:       proto.String("test"),
+				AuthPassword:      proto.String("secret"),
 				PeerGroup:         "group1",
 				NeighborInterface: "",
 				Vrf:               "",
 			},
+			// The daemon computes AuthPasswordSet from the resolved config and
+			// reports it on every ListPeer, so a fixture that sets a password must
+			// set this too or peerConfigEqual's presence check sees a peer whose
+			// password gobgpd is not using.
+			State: &gobgpapi.PeerState{AuthPasswordSet: true},
 			AfiSafis: []*gobgpapi.AfiSafi{
 				{Config: &gobgpapi.AfiSafiConfig{
 					Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
@@ -1000,10 +1065,29 @@ func TestPeerConfigEqual(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:    "different PeerAsn",
+			// basePeer is in a peer group, and oc's forcedOverwrittenConfig makes
+			// the group own peer-as wherever the group states one. UpdatePeer
+			// cannot change it, so peerConfigEqual deliberately does not look.
+			name:    "grouped peer: differing PeerAsn is the group's to own",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
+				p.Conf.PeerAsn = 64514
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			// Ungrouped, nothing can overwrite it, so a difference is real drift.
+			name: "ungrouped peer: differing PeerAsn is a real change",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.PeerGroup = ""
+				return p
+			}(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.PeerGroup = ""
 				p.Conf.PeerAsn = 64514
 				return p
 			}(),
@@ -1014,12 +1098,13 @@ func TestPeerConfigEqual(t *testing.T) {
 			// peer leaves the server, so "the passwords differ" is indistinguishable
 			// from "gobgpd redacted it" - and treating that as a difference means an
 			// UpdatePeer every reconcile for every authenticated peer. A password
-			// change still reaches gobgpd via the Secret watch re-entering Reconcile.
+			// change is not detected here at all: the Secret is not watched, and the
+			// value is redacted on read. Presence is compared instead.
 			name:    "differing AuthPassword is ignored: gobgpd redacts it",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
-				p.Conf.AuthPassword = ""
+				p.Conf.AuthPassword = proto.String("")
 				return p
 			}(),
 			expected: true,
@@ -1363,12 +1448,13 @@ func TestTimersConfigEqual(t *testing.T) {
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}, State: &gobgpapi.TimersState{}},
 	), "Timers.State is ignored")
 
-	// gobgpd defaults IdleHoldTimeAfterReset and never echoes
-	// MinimumAdvertisementInterval; comparing either guarantees churn.
+	// gobgpd defaults IdleHoldTimeAfterReset, so comparing it guarantees churn.
+	// MinimumAdvertisementInterval used to be tested here too; gobgp-netlink
+	// v1.3.5 deleted the field because nothing read it.
 	assert.True(t, timersConfigEqual(
-		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90, MinimumAdvertisementInterval: 5}},
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90, IdleHoldTimeAfterReset: 30}},
-	), "gobgpd-defaulted and never-echoed timer fields are ignored")
+	), "gobgpd-defaulted timer fields are ignored")
 
 	assert.False(t, timersConfigEqual(
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
@@ -1727,24 +1813,22 @@ func TestCrdToAPIGlobalFamilies(t *testing.T) {
 	assert.Contains(t, err.Error(), "afiSafis")
 }
 
-// The global sub-messages were accepted by the CRD and dropped on the floor.
+// The global sub-messages the daemon still implements.
+//
+// This test used to cover defaultRouteDistance and three routeSelectionOptions
+// booleans as well. gobgp-netlink v1.3.5 deleted all four from the API because
+// nothing implemented them, so the converters no longer send them and there is
+// nothing to assert; reportInertFields covers the CRD side.
 func TestCrdToAPIGlobalSubMessages(t *testing.T) {
 	assert.Nil(t, crdToAPIRouteSelectionOptions(nil))
-	assert.Nil(t, crdToAPIDefaultRouteDistance(nil))
 	assert.Nil(t, crdToAPIConfederation(nil))
 
 	rso := crdToAPIRouteSelectionOptions(&bgpv1.RouteSelectionOptions{
 		AlwaysCompareMed: true, IgnoreAsPathLength: true, ExternalCompareRouterID: true,
-		AdvertiseInactiveRoutes: true, EnableAigp: true, IgnoreNextHopIgpMetric: true,
 		DisableBestPathSelection: true,
 	})
 	assert.True(t, rso.GetAlwaysCompareMed() && rso.GetIgnoreAsPathLength() &&
-		rso.GetExternalCompareRouterId() && rso.GetAdvertiseInactiveRoutes() &&
-		rso.GetEnableAigp() && rso.GetIgnoreNextHopIgpMetric() && rso.GetDisableBestPathSelection())
-
-	drd := crdToAPIDefaultRouteDistance(&bgpv1.DefaultRouteDistance{ExternalRouteDistance: 20, InternalRouteDistance: 200})
-	assert.Equal(t, uint32(20), drd.GetExternalRouteDistance())
-	assert.Equal(t, uint32(200), drd.GetInternalRouteDistance())
+		rso.GetExternalCompareRouterId() && rso.GetDisableBestPathSelection())
 
 	cf := crdToAPIConfederation(&bgpv1.Confederation{Enabled: true, Identifier: 65000, MemberAsList: []uint32{65001, 65002}})
 	assert.True(t, cf.GetEnabled())

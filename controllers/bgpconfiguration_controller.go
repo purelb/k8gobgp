@@ -215,16 +215,25 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if dc.NeighborInterface == "" && dc.NeighborAddress != cc.NeighborAddress {
 		return false
 	}
-	// AuthPassword is deliberately not compared. ListPeer redacts it to "" before
-	// the peer leaves the server, so the desired value can never match what comes
-	// back and asserting on it means an UpdatePeer every reconcile for every
-	// authenticated peer. A password change still reaches gobgpd: the Secret is
-	// watched, and a change there re-enters Reconcile, which sends the current
-	// value on whatever UpdatePeer the rest of this comparison produces. The gap
-	// is a password-only edit with nothing else changed - see the TODO below.
+	// AuthPassword's value is deliberately not compared. ListPeer redacts it to a
+	// non-nil empty string before the peer leaves the server, so the desired value
+	// can never match what comes back and asserting on it means an UpdatePeer
+	// every reconcile for every authenticated peer.
 	//
-	// TODO: track the resolved password's hash in the reconciler so a
-	// password-only change is detected without comparing the secret itself.
+	// Its *presence* is compared instead, which is free: PeerState.AuthPasswordSet
+	// is a plain bool that round-trips, so it cannot churn, and it catches the case
+	// that matters - a password the CR asks for that the daemon is not using.
+	//
+	// The Secret is NOT watched. SetupWithManager registers BGPConfiguration and
+	// corev1.Node only, and resolveAuthPassword reads Secrets on demand, so a
+	// password-only edit to a Secret does not re-enter Reconcile at all. An earlier
+	// version of this comment claimed otherwise.
+	//
+	// TODO: watch the referenced Secrets, or track the resolved password's hash, so
+	// a password-only change is detected without comparing the secret itself.
+	//
+	// The presence check lives in reconcileNeighbors, not here: AuthPasswordSet is
+	// on PeerState, and this function's contract is to ignore runtime state.
 	// LocalAsn is compared only when the CR sets one. gobgpd defaults an unset
 	// per-peer local AS to the global ASN and echoes the defaulted value, so an
 	// unconditional comparison is 0 against the global ASN - permanently
@@ -232,41 +241,64 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	// the overwhelmingly common case. Same guard, and same known gap, as
 	// transportConfigEqual's LocalAddress: clearing localAsn to return to the
 	// global default is not detected as a change.
-	if dc.LocalAsn != 0 && dc.LocalAsn != cc.LocalAsn {
+	if dc.GetLocalAsn() != 0 && dc.GetLocalAsn() != cc.GetLocalAsn() {
 		return false
 	}
-	if dc.PeerAsn != cc.PeerAsn ||
-		dc.Description != cc.Description ||
-		dc.PeerGroup != cc.PeerGroup ||
+	// peer-as is in oc's forcedOverwrittenConfig, so a peer group owns it
+	// wherever the group states one, and UpdatePeer cannot change that. A
+	// grouped member whose CR names a different ASN would read the group's back
+	// for ever, so comparing it churns on something we cannot fix. Where the
+	// group states none, gobgp-netlink v1.3.5 preserves the member's value, so
+	// there is nothing to detect either. Ungrouped peers are compared normally.
+	//
+	// A difference here for a grouped peer means the group overrode the member,
+	// which reconcileNeighbors reports as an event - see reportPeerAsnOverridden.
+	if dc.PeerGroup == "" && dc.PeerAsn != cc.PeerAsn {
+		return false
+	}
+	// Description is compared only when the CR sets one, for the same reason as
+	// LocalAsn above: the converter sends nil for an unset description so the
+	// peer group can still supply one, and gobgpd echoes the resolved value.
+	// Comparing unconditionally would be "" against the group's description,
+	// permanently unequal for every grouped peer that does not set its own.
+	if dc.GetDescription() != "" && dc.GetDescription() != cc.GetDescription() {
+		return false
+	}
+	if dc.PeerGroup != cc.PeerGroup ||
 		dc.AdminDown != cc.AdminDown ||
 		dc.NeighborInterface != cc.NeighborInterface ||
-		dc.Vrf != cc.Vrf ||
-		// Verified round-trippable against a live gobgpd v1.3.0: ListPeer
-		// echoes each of these back as sent. send_community is absent from this
-		// list because it does NOT echo - it always returns 0 - so comparing it
-		// would churn every reconcile; it is not sent either. See the note above
-		// crdToAPIRemovePrivate.
-		dc.AllowOwnAsn != cc.AllowOwnAsn ||
-		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
-		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal ||
-		dc.RouteFlapDamping != cc.RouteFlapDamping ||
-		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
+		dc.Vrf != cc.Vrf {
 		return false
 	}
-	// RemovePrivate is NOT compared here, although it IS for peers.
+	// Explicit-presence fields, measured round-trippable against a live
+	// gobgp-netlink v1.3.5: ListPeer reports each one unconditionally
+	// (NewPeerFromConfigStruct wraps them in proto.X, "never nil on the read
+	// path"), so current is never nil and the getters are always safe.
 	//
-	// The asymmetry is the daemon's. newPeerGroupFromAPIStruct stores it, so the
-	// value takes effect, but NewPeerGroupFromConfigStruct builds the
-	// api.PeerGroupConf without it, so ListPeerGroup never reports it back - it
-	// is write-only for peer groups. Comparing it means UpdatePeerGroup on every
-	// reconcile, and that loops updateNeighbor over every member of the group.
-	// Found by TestRoundTripPeerGroup, not by inspection.
-	//
-	// BLOCKED on gobgp-netlink adding RemovePrivate to
-	// NewPeerGroupFromConfigStruct - one line, and it would make this symmetric
-	// with the peer path. Until then a change to a group's removePrivate reaches
-	// gobgpd only when some other field changes alongside it.
-
+	// Each is compared only when the CR stated it. The converter sends nil
+	// otherwise, which is what lets a peer group supply the value - comparing a
+	// nil desired against the group's resolved value would churn for ever.
+	// "Stated it" is a non-zero test, because these CRD fields are plain values
+	// with omitempty and cannot distinguish unset from explicitly false.
+	if dc.AllowOwnAsn != nil && dc.GetAllowOwnAsn() != cc.GetAllowOwnAsn() {
+		return false
+	}
+	if dc.ReplacePeerAsn != nil && dc.GetReplacePeerAsn() != cc.GetReplacePeerAsn() {
+		return false
+	}
+	if dc.AllowAspathLoopLocal != nil && dc.GetAllowAspathLoopLocal() != cc.GetAllowAspathLoopLocal() {
+		return false
+	}
+	if dc.SendSoftwareVersion != nil && dc.GetSendSoftwareVersion() != cc.GetSendSoftwareVersion() {
+		return false
+	}
+	// RemovePrivate rounds trips as of gobgp-netlink v1.3.5: util.go's
+	// removePrivateToAPI reports it on both the peer and the peer-group read
+	// path. It was previously excluded on the peer side by a comment copied from
+	// peerGroupConfigEqual that was never true here.
+	if dc.RemovePrivate != nil && dc.GetRemovePrivate() != cc.GetRemovePrivate() {
+		return false
+	}
 	// Compared as of v1.3.1, where it round-trips. In v1.3.0 ListPeer returned
 	// 0 for it whatever was sent, so comparing it would have churned forever.
 	// The struct field, NOT GetSendCommunity(): for a field with explicit
@@ -280,22 +312,39 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if !afiSafisConfigEqual(desired.AfiSafis, current.AfiSafis) {
 		return false
 	}
-	if !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+	// Blocks a peer group can supply are skipped when this neighbor is in a group
+	// and its CR did not state the block.
+	//
+	// Presence is block-level on the gRPC path: our converters send nil for an
+	// omitted block, which is what lets the group's value apply, and ListPeer then
+	// reports the group's resolved value. Comparing that against nil would fail
+	// every reconcile and issue an UpdatePeer that cannot change it, because the
+	// value belongs to the group.
+	//
+	// timersConfigEqual needs no such guard - it already tests each field on
+	// != 0, so an absent block compares equal - and afiSafisConfigEqual returns
+	// true for an empty desired list. bfd and gracefulRestart are not skippable
+	// because our PeerGroup CRD has no such blocks, so there is nothing to
+	// inherit and the comparison is always meaningful.
+	inherits := func(block any) bool {
+		return dc.GetPeerGroup() != "" && block == nil
+	}
+	if !inherits(desired.ApplyPolicy) && !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
 		return false
 	}
 	if !timersConfigEqual(desired.Timers, current.Timers) {
 		return false
 	}
-	if !transportConfigEqual(desired.Transport, current.Transport) {
+	if !inherits(desired.Transport) && !transportConfigEqual(desired.Transport, current.Transport) {
 		return false
 	}
 	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
 		return false
 	}
-	if !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
+	if !inherits(desired.RouteReflector) && !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
 		return false
 	}
-	if !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
+	if !inherits(desired.EbgpMultihop) && !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
 		return false
 	}
 	// defaulted: addNeighbor runs SetDefaultNeighborConfigValues, so ListPeer
@@ -317,31 +366,35 @@ func peerGroupConfigEqual(desired, current *gobgpapi.PeerGroup) bool {
 	dc, cc := desired.Conf, current.Conf
 	// AuthPassword is not compared, for the same reason as in peerConfigEqual:
 	// ListPeerGroup redacts it before the group leaves the server.
+	// LocalAsn is compared only when the CR sets one, for the same reason as in
+	// peerConfigEqual: gobgpd defaults an unset local AS to the global ASN and
+	// echoes the defaulted value. Measured against a live gobgp-netlink v1.3.5 by
+	// TestRoundTripPeerGroup/minimal - a group sending only peerAsn and
+	// peerGroupName comes back with localAsn set to global.asn, so an
+	// unconditional comparison fired UpdatePeerGroup on every reconcile, and
+	// updatePeerGroup loops updateNeighbor over every member of the group.
+	if dc.LocalAsn != 0 && dc.LocalAsn != cc.LocalAsn {
+		return false
+	}
 	if dc.PeerGroupName != cc.PeerGroupName ||
 		dc.PeerAsn != cc.PeerAsn ||
-		dc.LocalAsn != cc.LocalAsn ||
 		dc.Description != cc.Description ||
 		dc.AllowOwnAsn != cc.AllowOwnAsn ||
 		dc.ReplacePeerAsn != cc.ReplacePeerAsn ||
 		dc.AllowAspathLoopLocal != cc.AllowAspathLoopLocal ||
-		dc.RouteFlapDamping != cc.RouteFlapDamping ||
 		dc.SendSoftwareVersion != cc.SendSoftwareVersion {
 		return false
 	}
-	// RemovePrivate is NOT compared here, although it IS for peers.
-	//
-	// The asymmetry is the daemon's. newPeerGroupFromAPIStruct stores it, so the
-	// value takes effect, but NewPeerGroupFromConfigStruct builds the
-	// api.PeerGroupConf without it, so ListPeerGroup never reports it back - it
-	// is write-only for peer groups. Comparing it means UpdatePeerGroup on every
-	// reconcile, and that loops updateNeighbor over every member of the group.
-	// Found by TestRoundTripPeerGroup, not by inspection.
-	//
-	// BLOCKED on gobgp-netlink adding RemovePrivate to
-	// NewPeerGroupFromConfigStruct - one line, and it would make this symmetric
-	// with the peer path. Until then a change to a group's removePrivate reaches
-	// gobgpd only when some other field changes alongside it.
-
+	// RemovePrivate round-trips as of gobgp-netlink v1.3.5: util.go's
+	// removePrivateToAPI populates it in NewPeerGroupFromConfigStruct, so
+	// ListPeerGroup reports it. Before that it was write-only for peer groups and
+	// comparing it meant UpdatePeerGroup every reconcile, which loops
+	// updateNeighbor over every member. PeerGroupConf carries plain values, not
+	// explicit presence - a peer group is only ever a source of values and never
+	// inherits - so this is a direct comparison.
+	if dc.RemovePrivate != cc.RemovePrivate {
+		return false
+	}
 	// Compared as of v1.3.1, where it round-trips. In v1.3.0 ListPeer returned
 	// 0 for it whatever was sent, so comparing it would have churned forever.
 	// The struct field, NOT GetSendCommunity(): for a field with explicit
@@ -534,9 +587,21 @@ func policyAssignmentEqual(desired, current *gobgpapi.PolicyAssignment) bool {
 // config (DeferralTime, NotificationEnabled, LonglivedEnabled). None of those
 // are ours to assert.
 func gracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
-	return desired.GetEnabled() == current.GetEnabled() &&
-		desired.GetRestartTime() == current.GetRestartTime() &&
-		desired.GetHelperOnly() == current.GetHelperOnly()
+	if desired.GetEnabled() != current.GetEnabled() ||
+		desired.GetHelperOnly() != current.GetHelperOnly() {
+		return false
+	}
+	// RestartTime is compared only when the CR sets one. gobgpd defaults an unset
+	// restart time to HoldTime and echoes the defaulted value - measured against a
+	// live gobgp-netlink v1.3.5: sent 0, reported 90 - so comparing it
+	// unconditionally is 0 against the hold time for every peer that enables
+	// graceful restart without naming a restart time. Same guard, and same known
+	// gap, as timersConfigEqual's siblings: clearing restartTime to return to the
+	// default is not detected as a change.
+	if desired.GetRestartTime() != 0 && desired.GetRestartTime() != current.GetRestartTime() {
+		return false
+	}
+	return true
 }
 
 // routeReflectorEqual compares the route-reflector settings.
@@ -561,43 +626,22 @@ func ebgpMultihopEqual(desired, current *gobgpapi.EbgpMultihop) bool {
 		desired.GetMultihopTtl() == current.GetMultihopTtl()
 }
 
-// definedSetEqual compares a defined set field by field.
+// definedSetListEqual compares two defined-set member lists exactly.
 //
-// The whole-message comparison this replaces was unequal in two ways that had
-// nothing to do with the content: a CR list of [] is a non-nil empty slice where
-// gobgpd reports nil, and reflect.DeepEqual on a protobuf message also inspects
-// the unexported sizeCache and unknownFields, the latter populated whenever the
-// daemon sends a field this client does not know. Either one re-issues
-// AddDefinedSet(Replace: true) on every reconcile.
-// definedSetListEqual compares community and as-path lists ignoring the regex
-// anchors gobgpd adds.
+// Verbatim, in configured order, as of gobgp-netlink v1.3.5. The set types keep
+// an "originals" slice alongside the compiled regexps - the fork's comment on it
+// says "The compiled form is what matches; this is what is reported" - so
+// ListDefinedSet hands back precisely the strings the CR supplied.
 //
-// ParseCommunityRegexp turns a plain "65000:100" into "^65000:100$" before
-// storing it, so ListDefinedSet hands back an anchored form that never matches
-// what the CR said and reconcileDefinedSets rewrites the set on every reconcile.
-// Found by TestRoundTripDefinedSet; it is cheaper than the peer cases - a
-// redundant AddDefinedSet touches no session - but it is still an RPC and a log
-// line every pass.
-//
-// Anchors are stripped from both sides rather than replicating gobgpd's parser.
-// That parser has four branches - bare integer decomposed to "^hi:lo$", AS:VALUE
-// anchored, well-known names mapped to numbers, anything else compiled as-is -
-// and duplicating it here would be a second copy to keep in step with the fork.
-//
-// KNOWN GAP: a community written as a bare integer ("4259840") still churns,
-// because gobgpd rewrites it to "^65000:0$" and no amount of anchor-stripping
-// recovers that. Write communities as AS:VALUE, which is the documented form and
-// what every sample uses.
+// This used to strip "^" and "$" from both sides, because ParseCommunityRegexp
+// canonicalised as it compiled and "65000:100" came back as "^65000:100$".
+// Stripping is now wrong in both directions: it is unnecessary, and because
+// strings.Trim takes a cutset rather than a prefix and suffix it made "^65000$"
+// and "65000" compare equal, so editing a set between those two forms produced
+// no RPC at all. The earlier KNOWN GAP about bare integers is gone with it -
+// a community written as "4259840" is now reported as "4259840".
 func definedSetListEqual(desired, current []string) bool {
-	if len(desired) != len(current) {
-		return false
-	}
-	for i := range desired {
-		if strings.Trim(desired[i], "^$") != strings.Trim(current[i], "^$") {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(desired, current)
 }
 
 func definedSetEqual(desired, current *gobgpapi.DefinedSet) bool {
@@ -791,6 +835,7 @@ func (r *BGPConfigurationReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		desiredPeerGroups   map[string]*gobgpapi.PeerGroup
 		desiredDynNeighbors map[string]*gobgpapi.DynamicNeighbor
 	)
+	r.reportInertFields(bgpConfig, log)
 	if err = r.reconcileGlobal(ctx, apiClient, bgpConfig, log); err != nil {
 		reconcileErr = fmt.Errorf("global: %w", err)
 	} else if err = r.reconcileDefinedSets(ctx, apiClient, bgpConfig, log); err != nil {
@@ -1248,10 +1293,13 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		Families:              families,
 		UseMultiplePaths:      bgpConfig.Spec.Global.UseMultiplePaths,
 		RouteSelectionOptions: crdToAPIRouteSelectionOptions(bgpConfig.Spec.Global.RouteSelectionOptions),
-		DefaultRouteDistance:  crdToAPIDefaultRouteDistance(bgpConfig.Spec.Global.DefaultRouteDistance),
-		Confederation:         crdToAPIConfederation(bgpConfig.Spec.Global.Confederation),
-		GracefulRestart:       crdToAPIGracefulRestart(bgpConfig.Spec.Global.GracefulRestart),
-		BindToDevice:          bgpConfig.Spec.Global.BindToDevice,
+		// global.defaultRouteDistance is deliberately not sent: gobgp-netlink
+		// v1.3.5 deleted Global.default_route_distance because nothing in the
+		// daemon implemented it. The CRD field is retained and inert - see
+		// reportInertFields.
+		Confederation:   crdToAPIConfederation(bgpConfig.Spec.Global.Confederation),
+		GracefulRestart: crdToAPIGracefulRestart(bgpConfig.Spec.Global.GracefulRestart),
+		BindToDevice:    bgpConfig.Spec.Global.BindToDevice,
 	}
 
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
@@ -1865,7 +1913,8 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 					"Failed to add neighbor %s: %v", key, err)
 			}
 		} else {
-			if !peerConfigEqual(desired, current) {
+			r.reportPeerAsnOverridden(bgpConfig, key, desired, current, log)
+			if !peerConfigEqual(desired, current) || r.authPasswordDrifted(bgpConfig, key, desired, current, log) {
 				log.Info("Updating neighbor", "key", key)
 				if _, err := apiClient.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: desired}); err != nil {
 					log.Error(err, "Failed to update neighbor", "key", key)
@@ -1877,6 +1926,132 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 		}
 	}
 	return nil
+}
+
+// reportInertFields warns once per reconcile for each inert field the CR sets.
+//
+// The six fields it looks for are the ones gobgp-netlink v1.3.5 removed from its
+// API. All were accepted by the daemon and implemented by nothing, which is why
+// the fork deleted them; setting one has never had an effect. They stay in the
+// CRD because removing a field from a structural schema makes the apiserver
+// prune it silently - kubectl apply succeeds, no error, the value vanishes - and
+// a loud warning is more use than a quiet deletion.
+//
+// This is a secondary signal, not the primary one. Reconcile is driven by spec
+// generation changes, so a CR that set one of these fields long ago and is never
+// edited produces no event until the agent restarts, and Events age out. The
+// durable check is the pre-flight query in the upgrade notes.
+func (r *BGPConfigurationReconciler) reportInertFields(bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) {
+	var set []string
+	g := bgpConfig.Spec.Global
+	if g.DefaultRouteDistance != nil {
+		set = append(set, "global.defaultRouteDistance")
+	}
+	if rso := g.RouteSelectionOptions; rso != nil {
+		if rso.AdvertiseInactiveRoutes {
+			set = append(set, "global.routeSelectionOptions.advertiseInactiveRoutes")
+		}
+		if rso.EnableAigp {
+			set = append(set, "global.routeSelectionOptions.enableAigp")
+		}
+		if rso.IgnoreNextHopIgpMetric {
+			set = append(set, "global.routeSelectionOptions.ignoreNextHopIgpMetric")
+		}
+	}
+	for _, n := range bgpConfig.Spec.Neighbors {
+		if n.Config.RouteFlapDamping {
+			set = append(set, "neighbors[].config.routeFlapDamping")
+			break
+		}
+	}
+	for _, pg := range bgpConfig.Spec.PeerGroups {
+		if pg.Config.RouteFlapDamping {
+			set = append(set, "peerGroups[].config.routeFlapDamping")
+			break
+		}
+	}
+	for _, n := range bgpConfig.Spec.Neighbors {
+		if n.Timers != nil && n.Timers.Config.MinimumAdvertisementInterval != 0 {
+			set = append(set, "neighbors[].timers.config.minimumAdvertisementInterval")
+			break
+		}
+	}
+	for _, pg := range bgpConfig.Spec.PeerGroups {
+		if pg.Timers != nil && pg.Timers.Config.MinimumAdvertisementInterval != 0 {
+			set = append(set, "peerGroups[].timers.config.minimumAdvertisementInterval")
+			break
+		}
+	}
+	if len(set) == 0 {
+		return
+	}
+	log.Info("Ignoring settings that gobgp-netlink no longer implements", "fields", set)
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "InertSettings",
+		"These settings are accepted by the CRD but not implemented by gobgpd and have no effect: %s",
+		strings.Join(set, ", "))
+}
+
+// authPasswordDrifted reports whether gobgpd is using a TCP-MD5 password when the
+// CR says it should not, or vice versa.
+//
+// peerConfigEqual cannot compare the password itself: ListPeer redacts it to a
+// non-nil empty string, so the desired value never matches and comparing it would
+// mean an UpdatePeer every reconcile for every authenticated peer. Presence is
+// comparable though - PeerState.AuthPasswordSet is a plain bool the daemon
+// computes from the resolved config, so it round-trips and cannot churn.
+//
+// Returning true forces the update, which re-sends the password and repairs the
+// session. That is worth doing even though the event is the more useful signal:
+// a peer silently running unauthenticated is the failure mode here, and for a
+// grouped peer whose only owned field is its password nothing else would ever
+// trigger a correction.
+func (r *BGPConfigurationReconciler) authPasswordDrifted(bgpConfig *bgpv1.BGPConfiguration, key string, desired, current *gobgpapi.Peer, log logr.Logger) bool {
+	want := desired.GetConf().GetAuthPassword() != ""
+	have := current.GetState().GetAuthPasswordSet()
+	if want == have {
+		return false
+	}
+	log.Info("TCP-MD5 authentication state differs from the CR",
+		"key", key, "configured", want, "inEffect", have)
+	if r.Recorder == nil {
+		return true
+	}
+	r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "AuthPasswordDrift",
+		"Neighbor %s: CR specifies TCP-MD5 authentication=%t but gobgpd reports %t; re-sending the configuration.",
+		key, want, have)
+	return true
+}
+
+// reportPeerAsnOverridden says so when a peer group has discarded a grouped
+// neighbor's stated peerAsn.
+//
+// peer-as is the one field left in oc's forcedOverwrittenConfig, so where a peer
+// group states one the group wins and UpdatePeer cannot change it.
+// peerConfigEqual therefore skips the comparison for grouped peers - otherwise
+// every reconcile would issue an update that cannot take effect. That skip
+// removes the only symptom an operator had, so replace it with a deliberate
+// signal: the CR names an ASN, the daemon reports a different one, and the
+// difference is fixable by editing the CR or the group.
+//
+// gobgp-netlink v1.3.5 no longer zeroes a member's peerAsn when the group states
+// none, so this fires only on a genuine group-versus-member disagreement.
+func (r *BGPConfigurationReconciler) reportPeerAsnOverridden(bgpConfig *bgpv1.BGPConfiguration, key string, desired, current *gobgpapi.Peer, log logr.Logger) {
+	dc, cc := desired.GetConf(), current.GetConf()
+	if dc.GetPeerGroup() == "" || dc.GetPeerAsn() == cc.GetPeerAsn() {
+		return
+	}
+	log.Info("Peer group overrode neighbor peerAsn",
+		"key", key, "peerGroup", dc.GetPeerGroup(),
+		"configured", dc.GetPeerAsn(), "inEffect", cc.GetPeerAsn())
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(bgpConfig, corev1.EventTypeWarning, "PeerAsnOverridden",
+		"Neighbor %s specifies peerAsn %d but peer group %q supplies %d; the group's value is used. Set peerAsn on the group, or remove the neighbor from it.",
+		key, dc.GetPeerAsn(), dc.GetPeerGroup(), cc.GetPeerAsn())
 }
 
 func (r *BGPConfigurationReconciler) reconcileNetlink(ctx context.Context, apiClient gobgpapi.GoBgpServiceClient, bgpConfig *bgpv1.BGPConfiguration, log logr.Logger) error {
@@ -1952,17 +2127,30 @@ func (r *BGPConfigurationReconciler) reconcileNetlink(ctx context.Context, apiCl
 
 	// Check if we need to update netlink export configuration
 	//
-	// BLOCKED: dampeningInterval and routeProtocol drift cannot be detected.
-	// GetNetlinkResponse reports only ImportEnabled, ExportEnabled, Vrf,
-	// Interfaces and VrfImports, and ListNetlinkExportRules reports per-rule
-	// settings but not these two global ones - so there is nothing to compare a
-	// changed CR value against. Changing either alone is silently ignored until
-	// something else forces an update. Unblocked by adding them to
-	// GetNetlinkResponse in gobgp-netlink; comparing them before then would mean
-	// comparing against a zero value, which is a permanent update loop.
+	// dampeningInterval and routeProtocol are compared as of gobgp-netlink
+	// v1.3.5, which added both to GetNetlinkResponse. Measured against a live
+	// daemon: sent 250/186, reported 250/186. Before that there was nothing to
+	// compare a changed CR value against and editing either alone was silently
+	// ignored until something else forced an update.
+	//
+	// Guarded on non-zero because the daemon defaults an unset dampeningInterval
+	// to 100 and an unset routeProtocol to 186 (RTPROT_BGP) and reports the
+	// defaulted value, so comparing a CR that omits them would be 0 against the
+	// default - a permanent update loop, which is the failure the old note warned
+	// about. Clearing either back to the default is therefore not detected, the
+	// same known gap as the other defaulted fields.
 	needsExportUpdate := false
 	if desiredExportEnabled != currentNetlink.ExportEnabled {
 		needsExportUpdate = true
+	}
+	if desiredExportEnabled && bgpConfig.Spec.NetlinkExport != nil {
+		e := bgpConfig.Spec.NetlinkExport
+		if e.DampeningInterval != 0 && e.DampeningInterval != currentNetlink.GetDampeningInterval() {
+			needsExportUpdate = true
+		}
+		if e.RouteProtocol != 0 && e.RouteProtocol != currentNetlink.GetRouteProtocol() {
+			needsExportUpdate = true
+		}
 	}
 
 	// If export is enabled, also check if the rules have changed
@@ -2235,10 +2423,6 @@ func crdToAPINetlinkExportRules(rules []bgpv1.NetlinkExportRule) []*gobgpapi.Net
 	}
 	apiRules := make([]*gobgpapi.NetlinkExportRuleConfig, 0, len(rules))
 	for _, rule := range rules {
-		validateNexthop := true // default to true
-		if rule.ValidateNexthop != nil {
-			validateNexthop = *rule.ValidateNexthop
-		}
 		apiRules = append(apiRules, &gobgpapi.NetlinkExportRuleConfig{
 			Name:               rule.Name,
 			CommunityList:      rule.CommunityList,
@@ -2246,7 +2430,11 @@ func crdToAPINetlinkExportRules(rules []bgpv1.NetlinkExportRule) []*gobgpapi.Net
 			Vrf:                rule.Vrf,
 			TableId:            rule.TableId,
 			Metric:             rule.Metric,
-			ValidateNexthop:    validateNexthop,
+			// Passed through: gobgp-netlink defaults an absent
+			// validate_nexthop to true, which is what the local default below
+			// used to do by hand. Measured against v1.3.5: nil -> validate,
+			// true -> validate, false -> skip.
+			ValidateNexthop: rule.ValidateNexthop,
 		})
 	}
 	return apiRules
@@ -2477,7 +2665,6 @@ func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.Pe
 			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
 			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
 			RemovePrivate:        crdToAPIRemovePrivate(crd.Config.RemovePrivate),
-			RouteFlapDamping:     crd.Config.RouteFlapDamping,
 			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
@@ -2495,21 +2682,24 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 		Conf: &gobgpapi.PeerConf{
 			NeighborAddress:   crd.Config.NeighborAddress,
 			PeerAsn:           crd.Config.PeerAsn,
-			LocalAsn:          crd.Config.LocalAsn,
-			Description:       crd.Config.Description,
-			AuthPassword:      authPassword,
 			PeerGroup:         crd.Config.PeerGroup,
 			AdminDown:         crd.Config.AdminDown,
 			NeighborInterface: crd.Config.NeighborInterface,
 			Vrf:               crd.Config.Vrf,
-			// Previously unexposed: PeerConf carried these all along and the
-			// CRD had no way to set them.
-			AllowOwnAsn:          crd.Config.AllowOwnAsn,
-			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
-			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
-			RemovePrivate:        crdToAPIRemovePrivate(crd.Config.RemovePrivate),
-			RouteFlapDamping:     crd.Config.RouteFlapDamping,
-			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
+			// Explicit presence as of gobgp-netlink v1.3.5: nil means "inherit
+			// from my peer group", a pointer means "I own this". See ptrIfSet.
+			//
+			// AllowOwnAsn, ReplacePeerAsn and AllowAspathLoopLocal share one
+			// block-level presence guard on the daemon side, so stating any one
+			// of them claims all three and the other two stop inheriting.
+			LocalAsn:             ptrIfSet(crd.Config.LocalAsn),
+			Description:          ptrIfSet(crd.Config.Description),
+			AuthPassword:         ptrIfSet(authPassword),
+			AllowOwnAsn:          ptrIfSet(crd.Config.AllowOwnAsn),
+			ReplacePeerAsn:       ptrIfSet(crd.Config.ReplacePeerAsn),
+			AllowAspathLoopLocal: ptrIfSet(crd.Config.AllowAspathLoopLocal),
+			RemovePrivate:        crdToAPIRemovePrivatePtr(crd.Config.RemovePrivate),
+			SendSoftwareVersion:  ptrIfSet(crd.Config.SendSoftwareVersion),
 			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
 		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
@@ -2683,10 +2873,13 @@ func crdToAPITimers(crd *bgpv1.Timers) *gobgpapi.Timers {
 	}
 	return &gobgpapi.Timers{
 		Config: &gobgpapi.TimersConfig{
-			ConnectRetry:                 crd.Config.ConnectRetry,
-			HoldTime:                     crd.Config.HoldTime,
-			KeepaliveInterval:            crd.Config.KeepaliveInterval,
-			MinimumAdvertisementInterval: crd.Config.MinimumAdvertisementInterval,
+			ConnectRetry:      crd.Config.ConnectRetry,
+			HoldTime:          crd.Config.HoldTime,
+			KeepaliveInterval: crd.Config.KeepaliveInterval,
+			// timers.minimumAdvertisementInterval is deliberately not sent:
+			// gobgp-netlink v1.3.5 deleted TimersConfig.
+			// minimum_advertisement_interval because nothing read it. The CRD
+			// field is retained and inert - see reportInertFields.
 		},
 	}
 }
@@ -2776,20 +2969,11 @@ func crdToAPIRouteSelectionOptions(crd *bgpv1.RouteSelectionOptions) *gobgpapi.R
 		AlwaysCompareMed:         crd.AlwaysCompareMed,
 		IgnoreAsPathLength:       crd.IgnoreAsPathLength,
 		ExternalCompareRouterId:  crd.ExternalCompareRouterID,
-		AdvertiseInactiveRoutes:  crd.AdvertiseInactiveRoutes,
-		EnableAigp:               crd.EnableAigp,
-		IgnoreNextHopIgpMetric:   crd.IgnoreNextHopIgpMetric,
 		DisableBestPathSelection: crd.DisableBestPathSelection,
-	}
-}
-
-func crdToAPIDefaultRouteDistance(crd *bgpv1.DefaultRouteDistance) *gobgpapi.DefaultRouteDistance {
-	if crd == nil {
-		return nil
-	}
-	return &gobgpapi.DefaultRouteDistance{
-		ExternalRouteDistance: crd.ExternalRouteDistance,
-		InternalRouteDistance: crd.InternalRouteDistance,
+		// advertiseInactiveRoutes, enableAigp and ignoreNextHopIgpMetric are
+		// deliberately not sent: gobgp-netlink v1.3.5 deleted all three because
+		// nothing in the daemon implemented them. The CRD fields are retained
+		// and inert - see reportInertFields.
 	}
 }
 
@@ -2946,11 +3130,57 @@ func crdToAPISendCommunity(s string) *uint32 {
 // Unlike v1.3.0, this round-trips: SendCommunityToAPI returns nil for an unset
 // CommunityType rather than a fabricated 0, so ListPeer reports genuine absence
 // and nil-vs-nil compares equal instead of churning.
+//
+// A nil desired means "not stated", which for a neighbor in a peer group is what
+// lets the group's value apply. gobgpd then reports the group's resolved value,
+// so requiring both sides to be nil would be false for every grouped member that
+// inherits - caught by TestRoundTripPeerGroupInheritance against a live v1.3.5,
+// where a group setting sendCommunity churned every member that did not.
+//
+// Skipping a nil desired costs the ability to detect a community filter set
+// outside the CR, which is the same trade every other presence-guarded field
+// makes here.
 func sendCommunityEqual(desired, current *uint32) bool {
-	if desired == nil || current == nil {
-		return desired == current
+	if desired == nil {
+		return true
 	}
-	return *desired == *current
+	return current != nil && *desired == *current
+}
+
+// ptrIfSet returns &v, or nil when v is the zero value.
+//
+// This is the send-path half of peer-group inheritance. gobgp-netlink v1.3.5
+// gave the inheritable api.PeerConf scalars explicit presence, and treats a
+// non-nil field as "the client owns this, do not inherit it"
+// (recordNeighborPresence). Sending an explicit zero for a field the CR left
+// unset would therefore suppress the peer group's value silently - no churn, no
+// error, the group's setting simply stops applying.
+//
+// The predicate is a zero test, not a presence test, because the CRD fields are
+// plain values with omitempty: the apiserver cannot tell us "unset" from
+// "explicitly empty or false". The consequence is that a grouped member cannot
+// override a group's true with an explicit false, or opt out of a group's
+// TCP-MD5 password. Making those CRD fields pointers is the fix; see the field
+// comments in api/v1/types.go.
+func ptrIfSet[T comparable](v T) *T {
+	var zero T
+	if v == zero {
+		return nil
+	}
+	return &v
+}
+
+// crdToAPIRemovePrivatePtr is the api.PeerConf form of crdToAPIRemovePrivate.
+// Peers carry explicit presence for this field, so an unset CRD value must send
+// nil rather than REMOVE_PRIVATE_UNSPECIFIED - the latter would claim the field
+// and stop the peer group supplying it. Peer groups keep the plain form: a group
+// is only ever a source of values and never inherits.
+func crdToAPIRemovePrivatePtr(s string) *gobgpapi.RemovePrivate {
+	v := crdToAPIRemovePrivate(s)
+	if v == gobgpapi.RemovePrivate_REMOVE_PRIVATE_UNSPECIFIED {
+		return nil
+	}
+	return &v
 }
 
 func crdToAPIRemovePrivate(s string) gobgpapi.RemovePrivate {

@@ -85,7 +85,7 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 	// containing a mutex, so copying it by value trips copylocks.
 	conf := proto.CloneOf(sent.GetConf())
 	if conf != nil {
-		conf.AuthPassword = ""
+		conf.AuthPassword = proto.String("")
 		// gobgpd round-trips SendCommunity as of v1.3.1: SendCommunityToAPI
 		// returns nil for an unset CommunityType rather than a fabricated 0, so
 		// absence survives rather than coming back as "standard". Cloning Conf
@@ -96,8 +96,34 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 		// only peerAsn comes back with local_asn set to global.asn. Almost no
 		// neighbor overrides its local AS, so this is the common case, and
 		// echoing it as sent is what let the churn reach production.
-		if conf.LocalAsn == 0 {
-			conf.LocalAsn = echoGlobalASN
+		if conf.GetLocalAsn() == 0 {
+			conf.LocalAsn = proto.Uint32(echoGlobalASN)
+		}
+		// The read path reports every explicit-presence field unconditionally -
+		// NewPeerFromConfigStruct wraps each one in proto.X and its comment says
+		// "Always reported, never nil on the read path". A fake that echoed our
+		// nils back would let a comparator that ignores presence look correct,
+		// which is precisely how the original UpdatePeer churn reached
+		// production. With no peer group in play the resolved value is the zero
+		// value, so nil becomes a pointer to zero.
+		if conf.Description == nil {
+			conf.Description = proto.String("")
+		}
+		if conf.AllowOwnAsn == nil {
+			conf.AllowOwnAsn = proto.Uint32(0)
+		}
+		if conf.ReplacePeerAsn == nil {
+			conf.ReplacePeerAsn = proto.Bool(false)
+		}
+		if conf.AllowAspathLoopLocal == nil {
+			conf.AllowAspathLoopLocal = proto.Bool(false)
+		}
+		if conf.SendSoftwareVersion == nil {
+			conf.SendSoftwareVersion = proto.Bool(false)
+		}
+		if conf.RemovePrivate == nil {
+			rp := gobgpapi.RemovePrivate_REMOVE_PRIVATE_UNSPECIFIED
+			conf.RemovePrivate = &rp
 		}
 	}
 
@@ -177,6 +203,12 @@ func gobgpdEcho(sent *gobgpapi.Peer) *gobgpapi.Peer {
 			NeighborAddress: sent.GetConf().GetNeighborAddress(),
 			SessionState:    gobgpapi.PeerState_SESSION_STATE_ESTABLISHED,
 			Messages:        &gobgpapi.Messages{},
+			// Computed by the daemon from the resolved config and reported on
+			// every ListPeer, which is what makes TCP-MD5 presence comparable at
+			// all - the password itself comes back redacted. Read from the
+			// ORIGINAL request, not from conf: the redaction above has already
+			// blanked the clone.
+			AuthPasswordSet: sent.GetConf().GetAuthPassword() != "",
 		},
 	}
 	return echo
@@ -198,7 +230,9 @@ func orDefault(v, def uint32) uint32 {
 func gobgpdEchoPeerGroup(sent *gobgpapi.PeerGroup) *gobgpapi.PeerGroup {
 	conf := proto.CloneOf(sent.GetConf())
 	if conf != nil {
-		conf.AuthPassword = "" // redacted, same as ListPeer
+		// PeerGroupConf keeps plain values - a peer group is only ever a source
+		// of values and never inherits, so it gained no explicit presence.
+		conf.AuthPassword = "" // redacted, same as ListPeerGroup
 	}
 	return &gobgpapi.PeerGroup{
 		Conf:     conf,
@@ -406,8 +440,9 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 			// The PeerConf fields that had no CRD surface until they were wired.
 			// Each is compared, so each is a fresh chance to churn - measured
 			// against a live gobgpd v1.3.0, ListPeer echoes all six back as
-			// sent. send_community is deliberately absent: it does NOT echo
-			// (always 0), which is why it is neither sent nor compared.
+			// sent. send_community is both sent and compared as of v1.3.1, where
+			// it gained explicit presence and started round-tripping; it is
+			// covered by sendCommunityEqual rather than here.
 			name: "every previously-unexposed PeerConf field set",
 			neighbor: bgpv1.Neighbor{
 				Config: bgpv1.NeighborConfig{
@@ -472,7 +507,12 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 
 			// What the reconciler would send for this CR, then what gobgpd
 			// would report back afterwards.
-			sent := r.crdToAPINeighborWithPassword(&tc.neighbor, "")
+			//
+			// The password has to be the resolved one, not "": reconcileNeighbors
+			// resolves it from the CR before converting, so passing "" here builds
+			// a `current` that disagrees with what the reconciler will send and the
+			// TCP-MD5 presence check reports drift on an unchanged neighbor.
+			sent := r.crdToAPINeighborWithPassword(&tc.neighbor, tc.neighbor.Config.AuthPassword)
 			require.NotNil(t, sent, "converter returned nil")
 
 			fake := &fakeGoBGP{peers: []*gobgpapi.Peer{gobgpdEcho(sent)}}
@@ -642,8 +682,8 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 			NeighborAddress: "2001:470:b8f3:251::1",
 			PeerAsn:         64514,
 			// Defaulted from global.asn; the CR never set it.
-			LocalAsn:    64515,
-			Description: "Gateway router on subnet-251 (IPv6)",
+			LocalAsn:    proto.Uint32(64515),
+			Description: proto.String("Gateway router on subnet-251 (IPv6)"),
 			Type:        gobgpapi.PeerType_PEER_TYPE_EXTERNAL,
 		},
 		// Resolved once established; the CR has no transport block at all.

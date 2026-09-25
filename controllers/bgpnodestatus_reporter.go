@@ -397,9 +397,9 @@ func (r *BGPNodeStatusReporter) collectNeighborStatus(ctx context.Context, clien
 			PeerASN:  peer.Conf.GetPeerAsn(),
 		}
 
-		if peer.Conf != nil {
-			ns.Description = peer.Conf.Description
-		}
+		// GetDescription(), not the field: Description gained explicit presence
+		// in gobgp-netlink v1.3.5 and is now *string.
+		ns.Description = peer.Conf.GetDescription()
 
 		// Gated on BFD actually being enabled. NewPeerFromConfigStruct builds
 		// State.BfdState for every peer, so without this gate every neighbor

@@ -191,19 +191,21 @@ func reportPeerDiff(t *testing.T, desired, current *gobgpapi.Peer) {
 		ok   bool
 	}
 	for _, c := range []check{
-		{"Conf.PeerAsn", dc.GetPeerAsn() == cc.GetPeerAsn()},
+		// These mirror peerConfigEqual's guards exactly. A check that is stricter
+		// than the comparator reports diffs the reconciler will not act on, which
+		// reads as a harness failure for correct behaviour.
+		{"Conf.PeerAsn", dc.GetPeerGroup() != "" || dc.GetPeerAsn() == cc.GetPeerAsn()},
 		{"Conf.LocalAsn", dc.GetLocalAsn() == 0 || dc.GetLocalAsn() == cc.GetLocalAsn()},
-		{"Conf.Description", dc.GetDescription() == cc.GetDescription()},
+		{"Conf.Description", dc.GetDescription() == "" || dc.GetDescription() == cc.GetDescription()},
 		{"Conf.PeerGroup", dc.GetPeerGroup() == cc.GetPeerGroup()},
 		{"Conf.AdminDown", dc.GetAdminDown() == cc.GetAdminDown()},
 		{"Conf.NeighborInterface", dc.GetNeighborInterface() == cc.GetNeighborInterface()},
 		{"Conf.Vrf", dc.GetVrf() == cc.GetVrf()},
-		{"Conf.AllowOwnAsn", dc.GetAllowOwnAsn() == cc.GetAllowOwnAsn()},
-		{"Conf.ReplacePeerAsn", dc.GetReplacePeerAsn() == cc.GetReplacePeerAsn()},
-		{"Conf.AllowAspathLoopLocal", dc.GetAllowAspathLoopLocal() == cc.GetAllowAspathLoopLocal()},
-		{"Conf.RemovePrivate", dc.GetRemovePrivate() == cc.GetRemovePrivate()},
-		{"Conf.RouteFlapDamping", dc.GetRouteFlapDamping() == cc.GetRouteFlapDamping()},
-		{"Conf.SendSoftwareVersion", dc.GetSendSoftwareVersion() == cc.GetSendSoftwareVersion()},
+		{"Conf.AllowOwnAsn", dc.AllowOwnAsn == nil || dc.GetAllowOwnAsn() == cc.GetAllowOwnAsn()},
+		{"Conf.ReplacePeerAsn", dc.ReplacePeerAsn == nil || dc.GetReplacePeerAsn() == cc.GetReplacePeerAsn()},
+		{"Conf.AllowAspathLoopLocal", dc.AllowAspathLoopLocal == nil || dc.GetAllowAspathLoopLocal() == cc.GetAllowAspathLoopLocal()},
+		{"Conf.RemovePrivate", dc.RemovePrivate == nil || dc.GetRemovePrivate() == cc.GetRemovePrivate()},
+		{"Conf.SendSoftwareVersion", dc.SendSoftwareVersion == nil || dc.GetSendSoftwareVersion() == cc.GetSendSoftwareVersion()},
 		{"Conf.SendCommunity", sendCommunityEqual(dc.SendCommunity, cc.SendCommunity)},
 		{"AfiSafis", afiSafisConfigEqual(desired.GetAfiSafis(), current.GetAfiSafis())},
 		{"ApplyPolicy", applyPolicyEqual(desired.GetApplyPolicy(), current.GetApplyPolicy())},
@@ -349,4 +351,173 @@ func mustJSON(m proto.Message) string {
 		return fmt.Sprintf("%+v", m)
 	}
 	return string(b)
+}
+
+// --- peer-group inheritance ---------------------------------------------------
+
+// TestRoundTripPeerGroupInheritance covers the cases where a neighbor is in a
+// peer group, which is where presence semantics decide the outcome and where
+// every peer-group defect in this engagement lived.
+//
+// The shapes here are deliberately the inheritance direction - group states a
+// value, member omits it - because that is the direction no other test in this
+// file exercises. A send path that claimed every field with an explicit zero
+// would pass every other case in this suite and silently switch off inheritance
+// for all of them.
+func TestRoundTripPeerGroupInheritance(t *testing.T) {
+	c, ctx, done := rtClient(t)
+	defer done()
+	r := &BGPConfigurationReconciler{}
+
+	const pg = "rt-inherit"
+	// The group states values for everything a member might inherit.
+	group := bgpv1.PeerGroup{Config: bgpv1.PeerGroupConfig{
+		PeerGroupName: pg, PeerAsn: 64513, Description: "from-the-group",
+		AllowOwnAsn: 3, ReplacePeerAsn: true, AllowAspathLoopLocal: true,
+		RemovePrivate: "all", SendSoftwareVersion: true, SendCommunity: "none",
+	},
+		Timers: &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 30, KeepaliveInterval: 10}},
+	}
+	_, _ = c.DeletePeerGroup(ctx, &gobgpapi.DeletePeerGroupRequest{Name: pg})
+	_, err := c.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{
+		PeerGroup: r.crdToAPIPeerGroupWithPassword(&group, ""),
+	})
+	require.NoError(t, err, "AddPeerGroup")
+
+	// readBack adds the neighbor and returns what ListPeer reports.
+	readBack := func(t *testing.T, n bgpv1.Neighbor) (*gobgpapi.Peer, *gobgpapi.Peer) {
+		t.Helper()
+		desired := r.crdToAPINeighborWithPassword(&n, "")
+		addr := n.Config.NeighborAddress
+		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: addr})
+		_, err := c.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired})
+		require.NoError(t, err, "AddPeer rejected our config")
+		stream, err := c.ListPeer(ctx, &gobgpapi.ListPeerRequest{Address: addr})
+		require.NoError(t, err)
+		resp, err := stream.Recv()
+		require.NoError(t, err)
+		return desired, resp.GetPeer()
+	}
+
+	t.Run("member omitting a field inherits the group's", func(t *testing.T) {
+		desired, current := readBack(t, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.1", PeerAsn: 64513, PeerGroup: pg,
+		}})
+		cc := current.GetConf()
+		require.Equal(t, "from-the-group", cc.GetDescription(), "description must inherit")
+		require.Equal(t, uint32(3), cc.GetAllowOwnAsn(), "allowOwnAsn must inherit")
+		require.True(t, cc.GetReplacePeerAsn(), "replacePeerAsn must inherit")
+		require.True(t, cc.GetAllowAspathLoopLocal(), "allowAspathLoopLocal must inherit")
+		require.True(t, cc.GetSendSoftwareVersion(), "sendSoftwareVersion must inherit")
+		require.Equal(t, gobgpapi.RemovePrivate_REMOVE_PRIVATE_ALL, cc.GetRemovePrivate(), "removePrivate must inherit")
+		require.Equal(t, uint64(30), current.GetTimers().GetConfig().GetHoldTime(), "timers must inherit")
+
+		// And the comparator must not churn on any of it.
+		if !peerConfigEqual(desired, current) {
+			reportPeerDiff(t, desired, current)
+			t.Error("peerConfigEqual is FALSE for a grouped neighbor that inherits: " +
+				"every reconcile would fire UpdatePeer for a config we did not set")
+		}
+	})
+
+	t.Run("member stating its own value keeps it", func(t *testing.T) {
+		desired, current := readBack(t, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.2", PeerAsn: 64513, PeerGroup: pg,
+			Description: "mine-not-the-groups", SendSoftwareVersion: true,
+		}})
+		cc := current.GetConf()
+		// This is the v1.3.4/v1.3.5 field-presence fix. Before it, the group won.
+		require.Equal(t, "mine-not-the-groups", cc.GetDescription(),
+			"a member's own description must survive peer-group inheritance")
+		if !peerConfigEqual(desired, current) {
+			reportPeerDiff(t, desired, current)
+			t.Error("peerConfigEqual is FALSE for a grouped neighbor stating its own fields")
+		}
+	})
+
+	t.Run("as-path options are claimed as one block", func(t *testing.T) {
+		// Stating one of the three claims all three: the other two stop
+		// inheriting and fall back to their defaults. Surprising, documented on
+		// NeighborConfig, and asserted here so it cannot change silently.
+		_, current := readBack(t, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.3", PeerAsn: 64513, PeerGroup: pg,
+			AllowOwnAsn: 5,
+		}})
+		cc := current.GetConf()
+		require.Equal(t, uint32(5), cc.GetAllowOwnAsn(), "stated value must win")
+		require.False(t, cc.GetReplacePeerAsn(),
+			"stating allowOwnAsn claims the whole as-path block, so replacePeerAsn must NOT inherit")
+		require.False(t, cc.GetAllowAspathLoopLocal(),
+			"stating allowOwnAsn claims the whole as-path block, so allowAspathLoopLocal must NOT inherit")
+	})
+
+	t.Run("partial timers block claims the whole block", func(t *testing.T) {
+		_, current := readBack(t, bgpv1.Neighbor{
+			Config: bgpv1.NeighborConfig{NeighborAddress: "10.90.0.4", PeerAsn: 64513, PeerGroup: pg},
+			Timers: &bgpv1.Timers{Config: bgpv1.TimersConfig{ConnectRetry: 77}},
+		})
+		got := current.GetTimers().GetConfig()
+		require.Equal(t, uint64(77), got.GetConnectRetry(), "stated value must win")
+		require.NotEqual(t, uint64(30), got.GetHoldTime(),
+			"sending any timers block claims all of it, so the group's holdTime must NOT inherit")
+	})
+
+	t.Run("group owns peerAsn where it states one", func(t *testing.T) {
+		desired, current := readBack(t, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.5", PeerAsn: 64599, PeerGroup: pg,
+		}})
+		require.Equal(t, uint32(64513), current.GetConf().GetPeerAsn(),
+			"peer-as is force-overwritten by the group, so the group's ASN must be in effect")
+		// And the comparator must not churn on a value it cannot change.
+		if !peerConfigEqual(desired, current) {
+			reportPeerDiff(t, desired, current)
+			t.Error("peerConfigEqual is FALSE on a group-overridden peerAsn: it would fire " +
+				"UpdatePeer every reconcile for something UpdatePeer cannot fix")
+		}
+	})
+
+	t.Run("owned fields survive a session rebuild", func(t *testing.T) {
+		// The v1.3.4 defect: the reset path dropped field presence, so a grouped
+		// member lost every field it owned - TCP-MD5 included - on the first edit
+		// that rebuilt the session, and never converged. Every other case in this
+		// file is a readback after a single add, which is why none of them saw it.
+		n := bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.6", PeerAsn: 64513, PeerGroup: pg,
+			Description: "owned", AuthPassword: "s3cret", LocalAsn: 64598,
+		}}
+		desired := r.crdToAPINeighborWithPassword(&n, "s3cret")
+		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: n.Config.NeighborAddress})
+		_, err := c.AddPeer(ctx, &gobgpapi.AddPeerRequest{Peer: desired})
+		require.NoError(t, err)
+
+		// holdTime is in NeedsResendOpenMessage as of v1.3.5, so this edit takes
+		// the deleteNeighbor/addNeighbor path.
+		rebuild := proto.CloneOf(desired)
+		rebuild.Timers = &gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 60, KeepaliveInterval: 20}}
+		_, err = c.UpdatePeer(ctx, &gobgpapi.UpdatePeerRequest{Peer: rebuild})
+		require.NoError(t, err, "UpdatePeer")
+
+		stream, err := c.ListPeer(ctx, &gobgpapi.ListPeerRequest{Address: n.Config.NeighborAddress})
+		require.NoError(t, err)
+		resp, err := stream.Recv()
+		require.NoError(t, err)
+		cc := resp.GetPeer()
+
+		require.Equal(t, "owned", cc.GetConf().GetDescription(), "description must survive the rebuild")
+		require.Equal(t, uint32(64598), cc.GetConf().GetLocalAsn(), "localAsn must survive the rebuild")
+		require.True(t, cc.GetState().GetAuthPasswordSet(), "TCP-MD5 must survive the rebuild")
+	})
+
+	t.Run("graceful restart with restartTime omitted does not churn", func(t *testing.T) {
+		desired, current := readBack(t, bgpv1.Neighbor{
+			Config:          bgpv1.NeighborConfig{NeighborAddress: "10.90.0.7", PeerAsn: 64513},
+			GracefulRestart: &bgpv1.GracefulRestart{Enabled: true},
+		})
+		require.NotZero(t, current.GetGracefulRestart().GetRestartTime(),
+			"gobgpd defaults restartTime from holdTime and echoes it")
+		if !gracefulRestartEqual(desired.GetGracefulRestart(), current.GetGracefulRestart()) {
+			t.Errorf("gracefulRestartEqual is FALSE with restartTime omitted: sent %d, got %d",
+				desired.GetGracefulRestart().GetRestartTime(), current.GetGracefulRestart().GetRestartTime())
+		}
+	})
 }

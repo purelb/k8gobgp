@@ -116,9 +116,23 @@ jobs:
           echo "---" >> dist/rbac.yaml
           cat config/rbac/role_binding.yaml >> dist/rbac.yaml
 
-          # Generate production daemonset with versioned image tag
+          # Generate production daemonset with versioned image tag.
+          #
+          # This substitution depends on the literal "ghcr.io/purelb/k8gobgp:latest"
+          # appearing in the source manifest. Pinning that manifest to a real tag
+          # would turn this into a silent no-op and ship the wrong image reference,
+          # so the assertion below fails the release instead of discovering it
+          # afterwards. Anyone tempted to pin the source manifest: pin here.
           sed "s|ghcr.io/purelb/k8gobgp:latest|ghcr.io/purelb/k8gobgp:${VERSION}|g" \
             config/daemonset/gobgp-daemonset-prod.yaml > dist/daemonset.yaml
+          if grep -q "ghcr.io/purelb/k8gobgp:latest" dist/daemonset.yaml; then
+            echo "::error::dist/daemonset.yaml still references :latest - the version substitution did not apply"
+            exit 1
+          fi
+          if ! grep -q "ghcr.io/purelb/k8gobgp:${VERSION}" dist/daemonset.yaml; then
+            echo "::error::dist/daemonset.yaml does not reference ${VERSION} - the source manifest image line changed shape"
+            exit 1
+          fi
 
           # Generate all-in-one install manifest
           # Order: Namespace, CRDs, RBAC, DaemonSet
