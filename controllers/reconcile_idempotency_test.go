@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,6 +28,7 @@ import (
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 	bgpv1 "github.com/purelb/k8gobgp/api/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -714,4 +716,128 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 
 	assert.True(t, peerConfigEqual(desired, current),
 		"this exact pair fired UpdatePeer on every reconcile in production")
+}
+
+// --- global drift ------------------------------------------------------------
+
+// fakeGlobalGoBGP reports a running BGP server whose Global the caller controls,
+// so drift can be simulated without a daemon.
+type fakeGlobalGoBGP struct {
+	gobgpapi.GoBgpServiceClient
+	global   *gobgpapi.Global
+	startBgp int
+}
+
+func (f *fakeGlobalGoBGP) GetBgp(_ context.Context, _ *gobgpapi.GetBgpRequest, _ ...grpc.CallOption) (*gobgpapi.GetBgpResponse, error) {
+	return &gobgpapi.GetBgpResponse{Global: f.global}, nil
+}
+
+func (f *fakeGlobalGoBGP) StartBgp(_ context.Context, _ *gobgpapi.StartBgpRequest, _ ...grpc.CallOption) (*gobgpapi.StartBgpResponse, error) {
+	f.startBgp++
+	return &gobgpapi.StartBgpResponse{}, nil
+}
+
+// drainEvents returns every event queued on a fake recorder. reconcileGlobal
+// emits RouterIDResolved as well, so a test that reads only the first event is
+// asserting on emission order it has no reason to rely on.
+func drainEvents(rec *record.FakeRecorder) []string {
+	var out []string
+	for {
+		select {
+		case e := <-rec.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+func eventMatching(events []string, substr string) (string, bool) {
+	for _, e := range events {
+		if strings.Contains(e, substr) {
+			return e, true
+		}
+	}
+	return "", false
+}
+
+// Secondary global drift must NOT abort reconcileGlobal.
+//
+// reconcileGlobal is first in the chain, so returning an error here stops
+// neighbors, peer groups, policies and netlink from being reconciled at all. An
+// earlier version did exactly that, which meant one edit to a secondary global
+// setting froze every other piece of configuration on the node until the pod
+// happened to restart. The drift is reported and the reconcile continues.
+func TestReconcileGlobal_SecondaryDriftDoesNotAbortTheChain(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
+		Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
+			ASN:              64512,
+			RouterID:         "10.0.0.1",
+			UseMultiplePaths: true,
+			BindToDevice:     "eth1",
+		}},
+	}
+	// Running daemon: same identity, every secondary setting different.
+	fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{
+		Asn:              64512,
+		RouterId:         "10.0.0.1",
+		UseMultiplePaths: false,
+		BindToDevice:     "",
+	}}
+
+	// Sized well above the number of events: record.NewFakeRecorder blocks on a
+	// full channel rather than dropping, so an undersized one deadlocks the test
+	// instead of failing it.
+	rec := record.NewFakeRecorder(64)
+	r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: rec, NodeName: "node-1"}
+
+	err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+	require.NoError(t, err, "secondary global drift must not return an error: it would abort the reconcile chain")
+	assert.Zero(t, fake.startBgp, "StartBgp must not be called for a server that is already running")
+
+	got, ok := eventMatching(drainEvents(rec), "GlobalRestartRequired")
+	require.True(t, ok, "expected a GlobalRestartRequired event")
+	assert.Contains(t, got, "useMultiplePaths")
+	assert.Contains(t, got, "bindToDevice")
+}
+
+// Identity drift is different: it DOES stop, because continuing would reconcile
+// neighbors against a speaker that is not the one the CR describes.
+func TestReconcileGlobal_IdentityDriftStops(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
+		Spec:       bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{ASN: 64512, RouterID: "10.0.0.1"}},
+	}
+	fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{Asn: 64599, RouterId: "10.0.0.1"}}
+	r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: record.NewFakeRecorder(64), NodeName: "node-1"}
+
+	err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+	require.Error(t, err, "an ASN change must stop the reconcile")
+	assert.Contains(t, err.Error(), "global identity change")
+}
+
+// A CR that states nothing for the defaulted fields must not report drift against
+// the daemon's defaults. This is the shape that would churn if the guards were
+// dropped: listenAddresses becomes ["0.0.0.0", "::"] and families becomes every
+// supported family, neither of which the CR asked for.
+func TestReconcileGlobal_DefaultedFieldsDoNotDrift(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
+		Spec:       bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{ASN: 64512, RouterID: "10.0.0.1"}},
+	}
+	fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{
+		Asn:             64512,
+		RouterId:        "10.0.0.1",
+		ListenPort:      179,
+		ListenAddresses: []string{"0.0.0.0", "::"},
+		Families:        []uint32{0, 1, 9, 24},
+	}}
+	rec := record.NewFakeRecorder(64)
+	r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: rec, NodeName: "node-1"}
+
+	require.NoError(t, r.reconcileGlobal(context.Background(), fake, cfg, logf.Log))
+	if e, ok := eventMatching(drainEvents(rec), "GlobalRestartRequired"); ok {
+		t.Fatalf("no drift expected for daemon-defaulted fields, got: %s", e)
+	}
 }

@@ -1144,6 +1144,10 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			DeleteRouterIDInfo(routerIDInfoLabels(bgpConfig, entry.routerID, entry.source, r.NodeName))
 			delete(r.localRouterIDCache, cacheKey)
 		}
+		// Same reasoning for the global drift series: SetGlobalRestartRequired
+		// sets 0 rather than deleting, so a departing CR would leave its series
+		// behind at whatever value it last held.
+		DeleteGlobalRestartRequired(bgpConfig.Name, bgpConfig.Namespace, globalDriftFields)
 
 		// Remove finalizer only after successful cleanup
 		controllerutil.RemoveFinalizer(bgpConfig, finalizerName)
@@ -1320,28 +1324,30 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		return startErr
 	}
 
-	// BGP server already running - check whether the immutable fields still match.
+	// BGP server already running - check whether it matches the CR.
 	//
-	// Only ASN, RouterID and UseMultiplePaths are compared, because those are
-	// the only fields GetBgp echoes back. Measured against gobgpd v1.3.0 by
-	// sending a fully-populated Global and reading it back: families,
-	// routeSelectionOptions, defaultRouteDistance, confederation,
-	// gracefulRestart and bindToDevice are ACCEPTED and APPLIED but never
-	// reported. ListenPort and ListenAddresses are echoed but gobgpd defaults
-	// them ("0.0.0.0", "::"), so comparing those churns.
+	// gobgp-netlink v1.3.5 reports every Global field faithfully. Measured by
+	// sending a fully-populated Global and reading it back: asn, routerId,
+	// listenPort, listenAddresses, families, useMultiplePaths,
+	// routeSelectionOptions, confederation, gracefulRestart, bindToDevice,
+	// gracefulRestartInheritToNeighbors, ebgpMaximumPaths and ibgpMaximumPaths all
+	// come back as sent. An earlier version of this comment claimed only three
+	// echoed, which was true of v1.3.0 and is the reason drift went undetected.
 	//
-	// So drift in the write-only fields is undetectable here - the same
-	// limitation as netlink's dampeningInterval. Changing one takes effect on
-	// the next pod restart, silently. Unblocking that needs GetBgp to report
-	// them; see docs. Do NOT "fix" this by comparing them against the CR, which
-	// would compare a set value against a permanent zero and loop forever.
+	// Three fields are defaulted when not sent, measured on a minimal Global:
+	// listenAddresses becomes ["0.0.0.0", "::"], families becomes every supported
+	// family, and listenPort becomes 179. Those are guarded on "the CR stated
+	// something" for the usual reason - comparing an unset CR value against the
+	// daemon's default is permanently unequal. The message-typed fields come back
+	// as empty non-nil objects when unset, so the getters compare correctly.
+	//
 	// ASN and RouterID are the identity of the BGP speaker. gobgpd cannot change
 	// them on a running server, and continuing would reconcile neighbors against
 	// a speaker that is not the one the CR describes, so this stops.
-	if current.Global.Asn != desired.Asn || current.Global.RouterId != desired.RouterId {
+	if current.GetGlobal().GetAsn() != desired.Asn || current.GetGlobal().GetRouterId() != desired.RouterId {
 		log.Info("Global identity changed - pod restart required to apply",
-			"currentASN", current.Global.Asn, "desiredASN", desired.Asn,
-			"currentRouterID", current.Global.RouterId, "desiredRouterID", desired.RouterId)
+			"currentASN", current.GetGlobal().GetAsn(), "desiredASN", desired.Asn,
+			"currentRouterID", current.GetGlobal().GetRouterId(), "desiredRouterID", desired.RouterId)
 		return fmt.Errorf("global identity change detected (ASN or RouterID); pod restart required to apply")
 	}
 
@@ -1352,17 +1358,85 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	// until the pod happened to restart - which is how the first version of this
 	// behaved and is strictly worse than applying what can be applied.
 	//
-	// Only UseMultiplePaths is checked because it is the only one of them GetBgp
-	// echoes back; see the comment on the desired Global above.
-	if current.Global.UseMultiplePaths != desired.UseMultiplePaths {
-		log.Info("Global setting changed - takes effect on next pod restart",
-			"setting", "useMultiplePaths",
-			"current", current.Global.UseMultiplePaths,
-			"desired", desired.UseMultiplePaths)
-		r.Recorder.Event(bgpConfig, corev1.EventTypeWarning, "GlobalRestartRequired",
-			"global.useMultiplePaths changed; restart the k8gobgp pod on this node for it to take effect")
+	cg := current.GetGlobal()
+	drifted := map[string]bool{
+		"useMultiplePaths": cg.GetUseMultiplePaths() != desired.UseMultiplePaths,
+		"bindToDevice":     cg.GetBindToDevice() != desired.BindToDevice,
+		"routeSelectionOptions": !routeSelectionOptionsEqual(
+			desired.GetRouteSelectionOptions(), cg.GetRouteSelectionOptions()),
+		"confederation":   !confederationEqual(desired.GetConfederation(), cg.GetConfederation()),
+		"gracefulRestart": !globalGracefulRestartEqual(desired.GetGracefulRestart(), cg.GetGracefulRestart()),
+		// Guarded: the daemon defaults these when the CR states nothing.
+		"listenPort":      desired.ListenPort != 0 && cg.GetListenPort() != desired.ListenPort,
+		"listenAddresses": len(desired.ListenAddresses) > 0 && !slices.Equal(cg.GetListenAddresses(), desired.ListenAddresses),
+		"families":        len(desired.Families) > 0 && !slices.Equal(cg.GetFamilies(), desired.Families),
 	}
+	UpdateGlobalRestartRequired(bgpConfig, drifted, log, r.Recorder)
 	return nil
+}
+
+// globalDriftFields is every key UpdateGlobalRestartRequired can report, so the
+// series can be cleared on CR deletion without reconstructing the comparison.
+var globalDriftFields = []string{
+	"useMultiplePaths", "bindToDevice", "routeSelectionOptions", "confederation",
+	"gracefulRestart", "listenPort", "listenAddresses", "families",
+}
+
+// UpdateGlobalRestartRequired records secondary global drift and says so once.
+//
+// Secondary drift does NOT abort the reconcile. Returning an error here would
+// stop before neighbors, peer groups and policies are reconciled, so one change
+// to a secondary global setting would freeze all other configuration on the node
+// until the pod happened to restart - which is how the first version of this
+// behaved and is strictly worse than applying what can be applied.
+func UpdateGlobalRestartRequired(bgpConfig *bgpv1.BGPConfiguration, drifted map[string]bool, log logr.Logger, rec record.EventRecorder) {
+	SetGlobalRestartRequired(bgpConfig.Name, bgpConfig.Namespace, drifted)
+
+	var fields []string
+	for _, f := range globalDriftFields {
+		if drifted[f] {
+			fields = append(fields, f)
+		}
+	}
+	if len(fields) == 0 {
+		return
+	}
+	slices.Sort(fields)
+	log.Info("Global settings changed - take effect on next pod restart", "settings", fields)
+	if rec == nil {
+		return
+	}
+	rec.Eventf(bgpConfig, corev1.EventTypeWarning, "GlobalRestartRequired",
+		"These global settings differ from the running gobgpd and need a pod restart on this node to apply: %s",
+		strings.Join(fields, ", "))
+}
+
+// routeSelectionOptionsEqual compares the four fields that survived v1.3.5.
+// advertiseInactiveRoutes, enableAigp and ignoreNextHopIgpMetric were deleted
+// from the API because nothing implemented them, so there is nothing to compare.
+func routeSelectionOptionsEqual(desired, current *gobgpapi.RouteSelectionOptionsConfig) bool {
+	return desired.GetAlwaysCompareMed() == current.GetAlwaysCompareMed() &&
+		desired.GetIgnoreAsPathLength() == current.GetIgnoreAsPathLength() &&
+		desired.GetExternalCompareRouterId() == current.GetExternalCompareRouterId() &&
+		desired.GetDisableBestPathSelection() == current.GetDisableBestPathSelection()
+}
+
+func confederationEqual(desired, current *gobgpapi.Confederation) bool {
+	return desired.GetEnabled() == current.GetEnabled() &&
+		desired.GetIdentifier() == current.GetIdentifier() &&
+		slices.Equal(desired.GetMemberAsList(), current.GetMemberAsList())
+}
+
+// globalGracefulRestartEqual compares the global graceful-restart block.
+//
+// Named to distinguish it from gracefulRestartEqual, which compares a peer's -
+// a different message with different defaulting. This one needs no restartTime
+// guard: the daemon echoes the global block as sent rather than defaulting it
+// from a hold time, measured against v1.3.5.
+func globalGracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
+	return desired.GetEnabled() == current.GetEnabled() &&
+		desired.GetRestartTime() == current.GetRestartTime() &&
+		desired.GetDeferralTime() == current.GetDeferralTime()
 }
 
 // resolveEffectiveRouterID resolves the router ID, respecting immutability.
