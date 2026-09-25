@@ -503,6 +503,33 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 		}
 	})
 
+	t.Run("group sets bfd, member omits it", func(t *testing.T) {
+		// The PeerGroup CRD gained a bfd block in the v1.3.0 work, so this IS an
+		// inheritance path. An earlier comment in peerConfigEqual claimed it was
+		// not, and excluded bfd from the inheritance skip on that basis.
+		const pgBfd = "rt-inherit-bfd"
+		gb := bgpv1.PeerGroup{
+			Config: bgpv1.PeerGroupConfig{PeerGroupName: pgBfd, PeerAsn: 64513},
+			BFD:    &bgpv1.BFD{Enabled: ptr(true), DesiredMinimumTxInterval: 300000},
+		}
+		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: "10.90.0.12"})
+		_, _ = c.DeletePeerGroup(ctx, &gobgpapi.DeletePeerGroupRequest{Name: pgBfd})
+		_, err := c.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{
+			PeerGroup: r.crdToAPIPeerGroupWithPassword(&gb, ""),
+		})
+		require.NoError(t, err, "AddPeerGroup (bfd)")
+
+		desired, current := readBackIn(t, pgBfd, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.12", PeerAsn: 64513, PeerGroup: pgBfd,
+		}})
+		require.True(t, current.GetBfd().GetEnabled(), "member must inherit the group's BFD")
+		if !peerConfigEqual(desired, current) {
+			reportPeerDiff(t, desired, current)
+			t.Error("peerConfigEqual is FALSE for a grouped neighbor that inherits BFD: " +
+				"every reconcile would fire UpdatePeer for a block the CR did not set")
+		}
+	})
+
 	t.Run("as-path options are claimed as one block", func(t *testing.T) {
 		// Stating one of the three claims all three: the other two stop
 		// inheriting and fall back to their defaults. Surprising, documented on

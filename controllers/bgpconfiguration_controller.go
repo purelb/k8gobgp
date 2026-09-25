@@ -318,6 +318,12 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	// Blocks a peer group can supply are skipped when this neighbor is in a group
 	// and its CR did not state the block.
 	//
+	// Written out per block rather than through a helper taking `any`: a typed nil
+	// pointer boxed into an interface is NOT == nil, so a
+	// `func(block any) bool { return block == nil }` version compiled, read
+	// correctly, and never skipped anything. It went unnoticed because the only
+	// block whose comparator does not already tolerate a nil desired is bfd.
+	//
 	// Presence is block-level on the gRPC path: our converters send nil for an
 	// omitted block, which is what lets the group's value apply, and ListPeer then
 	// reports the group's resolved value. Comparing that against nil would fail
@@ -326,34 +332,41 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	//
 	// timersConfigEqual needs no such guard - it already tests each field on
 	// != 0, so an absent block compares equal - and afiSafisConfigEqual returns
-	// true for an empty desired list. bfd and gracefulRestart are not skippable
-	// because our PeerGroup CRD has no such blocks, so there is nothing to
-	// inherit and the comparison is always meaningful.
-	inherits := func(block any) bool {
-		return dc.GetPeerGroup() != "" && block == nil
-	}
-	if !inherits(desired.ApplyPolicy) && !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+	// true for an empty desired list.
+	//
+	// gracefulRestart is not skippable: the PeerGroup CRD has no gracefulRestart
+	// block, so there is nothing to inherit and the comparison is always
+	// meaningful. bfd IS skippable - the PeerGroup CRD gained a bfd block with the
+	// BFD work - and an earlier version of this comment wrongly grouped the two
+	// together, which left grouped members that inherit BFD churning.
+	grouped := dc.GetPeerGroup() != ""
+	if !(grouped && desired.ApplyPolicy == nil) && !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
 		return false
 	}
 	if !timersConfigEqual(desired.Timers, current.Timers) {
 		return false
 	}
-	if !inherits(desired.Transport) && !transportConfigEqual(desired.Transport, current.Transport) {
+	if !(grouped && desired.Transport == nil) && !transportConfigEqual(desired.Transport, current.Transport) {
 		return false
 	}
 	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
 		return false
 	}
-	if !inherits(desired.RouteReflector) && !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
+	if !(grouped && desired.RouteReflector == nil) && !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
 		return false
 	}
-	if !inherits(desired.EbgpMultihop) && !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
+	if !(grouped && desired.EbgpMultihop == nil) && !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
 		return false
 	}
 	// defaulted: addNeighbor runs SetDefaultNeighborConfigValues, so ListPeer
 	// echoes a fully-populated BFD block for every peer - including peers that
 	// have no BFD at all, which is the case that churns if this is skipped.
-	if !bfdEqual(desired.Bfd, current.Bfd, true) {
+	//
+	// inherits() as well, because the PeerGroup CRD has a bfd block too: a member
+	// that omits bfd under a group that sets it reads the group's back, and
+	// comparing that against nil fails on every reconcile. Caught by
+	// TestRoundTripPeerGroupInheritance/group_sets_bfd,_member_omits_it.
+	if !(grouped && desired.Bfd == nil) && !bfdEqual(desired.Bfd, current.Bfd, true) {
 		return false
 	}
 	return true
