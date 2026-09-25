@@ -772,9 +772,12 @@ func TestReconcileGlobal_SecondaryDriftDoesNotAbortTheChain(t *testing.T) {
 	cfg := &bgpv1.BGPConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
 		Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
-			ASN:              64512,
-			RouterID:         "10.0.0.1",
+			ASN:      64512,
+			RouterID: "10.0.0.1",
+			// A valid multipath pair: the validator refuses multipath without a
+			// limit, so drifting useMultiplePaths means drifting the limit too.
 			UseMultiplePaths: true,
+			EbgpMaximumPaths: 4,
 			BindToDevice:     "eth1",
 		}},
 	}
@@ -799,6 +802,7 @@ func TestReconcileGlobal_SecondaryDriftDoesNotAbortTheChain(t *testing.T) {
 	got, ok := eventMatching(drainEvents(rec), "GlobalRestartRequired")
 	require.True(t, ok, "expected a GlobalRestartRequired event")
 	assert.Contains(t, got, "useMultiplePaths")
+	assert.Contains(t, got, "ebgpMaximumPaths")
 	assert.Contains(t, got, "bindToDevice")
 }
 
@@ -879,6 +883,64 @@ func TestReconcileGlobal_RejectsBadListenAddress(t *testing.T) {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), "global.listenAddresses")
 				assert.Zero(t, fake.startBgp, "must not reach StartBgp with a bad address")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// The multipath pair rule, checked before the daemon sees it.
+//
+// gobgp-netlink v1.3.5 refuses both halves at StartBgp, and a StartBgp failure
+// means gobgpd does not start - so getting this wrong takes the node's BGP down
+// entirely rather than degrading. Before ebgpMaximumPaths and ibgpMaximumPaths
+// were exposed there was no way to satisfy the rule at all, which made
+// global.useMultiplePaths unusable on v1.3.5.
+func TestReconcileGlobal_MultipathPairRule(t *testing.T) {
+	cases := []struct {
+		name          string
+		multipath     bool
+		ebgp, ibgp    uint32
+		wantErrSubstr string
+	}{
+		{name: "neither: the common case", multipath: false},
+		{name: "multipath with an ebgp limit", multipath: true, ebgp: 4},
+		{name: "multipath with an ibgp limit", multipath: true, ibgp: 8},
+		{name: "multipath with both", multipath: true, ebgp: 4, ibgp: 8},
+		{
+			name: "multipath with no limit", multipath: true,
+			wantErrSubstr: "neither ebgpMaximumPaths nor ibgpMaximumPaths is set",
+		},
+		{
+			name: "limit with no multipath", multipath: false, ebgp: 4,
+			wantErrSubstr: "useMultiplePaths is not enabled",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &bgpv1.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: "mp", Namespace: "purelb"},
+				Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
+					ASN: 64512, RouterID: "10.0.0.1",
+					UseMultiplePaths: tc.multipath,
+					EbgpMaximumPaths: tc.ebgp,
+					IbgpMaximumPaths: tc.ibgp,
+				}},
+			}
+			fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{
+				Asn: 64512, RouterId: "10.0.0.1",
+				UseMultiplePaths: tc.multipath,
+				EbgpMaximumPaths: tc.ebgp,
+				IbgpMaximumPaths: tc.ibgp,
+			}}
+			r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: record.NewFakeRecorder(64), NodeName: "node-1"}
+
+			err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				assert.Zero(t, fake.startBgp, "must not reach StartBgp with an invalid pair")
 			} else {
 				require.NoError(t, err)
 			}

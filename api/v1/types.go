@@ -144,8 +144,26 @@ type GlobalSpec struct {
 	// +kubebuilder:validation:items:Enum=ipv4-unicast;ipv6-unicast;ipv4-labeled;ipv6-labeled;ipv4-vpn;ipv6-vpn;l2vpn-vpls;l2vpn-evpn
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
-	Families              []string               `json:"families,omitempty"`
-	UseMultiplePaths      bool                   `json:"useMultiplePaths,omitempty"`
+	Families []string `json:"families,omitempty"`
+	// UseMultiplePaths installs more than one path per prefix, so the multipath
+	// set can be exported to the kernel as ECMP.
+	//
+	// It requires at least one of ebgpMaximumPaths or ibgpMaximumPaths, and they
+	// require it: gobgp-netlink v1.3.5 refuses both halves of that pair, because a
+	// limit without multipath was accepted, reported back, and did nothing, while
+	// multipath without a limit selects only the single best path. Both are checked
+	// here before StartBgp so the error names the CRD fields.
+	UseMultiplePaths bool `json:"useMultiplePaths,omitempty"`
+	// EbgpMaximumPaths caps how many eBGP paths the multipath set may hold for one
+	// prefix. Requires useMultiplePaths.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	EbgpMaximumPaths uint32 `json:"ebgpMaximumPaths,omitempty"`
+	// IbgpMaximumPaths caps how many iBGP paths the multipath set may hold for one
+	// prefix. Requires useMultiplePaths.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	IbgpMaximumPaths      uint32                 `json:"ibgpMaximumPaths,omitempty"`
 	RouteSelectionOptions *RouteSelectionOptions `json:"routeSelectionOptions,omitempty"`
 	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
 	// because nothing in the daemon implemented it. Accepted here so existing

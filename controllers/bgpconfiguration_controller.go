@@ -1299,6 +1299,8 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		ListenAddresses:       bgpConfig.Spec.Global.ListenAddresses,
 		Families:              families,
 		UseMultiplePaths:      bgpConfig.Spec.Global.UseMultiplePaths,
+		EbgpMaximumPaths:      bgpConfig.Spec.Global.EbgpMaximumPaths,
+		IbgpMaximumPaths:      bgpConfig.Spec.Global.IbgpMaximumPaths,
 		RouteSelectionOptions: crdToAPIRouteSelectionOptions(bgpConfig.Spec.Global.RouteSelectionOptions),
 		// global.defaultRouteDistance is deliberately not sent: gobgp-netlink
 		// v1.3.5 deleted Global.default_route_distance because nothing in the
@@ -1316,6 +1318,9 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	// rest, and names the offending value.
 	if vErr := validateListenAddresses(bgpConfig.Spec.Global.ListenAddresses); vErr != nil {
 		return fmt.Errorf("global.listenAddresses: %w", vErr)
+	}
+	if vErr := validateMultipath(&bgpConfig.Spec.Global); vErr != nil {
+		return fmt.Errorf("global: %w", vErr)
 	}
 
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
@@ -1370,6 +1375,8 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	cg := current.GetGlobal()
 	drifted := map[string]bool{
 		"useMultiplePaths": cg.GetUseMultiplePaths() != desired.UseMultiplePaths,
+		"ebgpMaximumPaths": cg.GetEbgpMaximumPaths() != desired.EbgpMaximumPaths,
+		"ibgpMaximumPaths": cg.GetIbgpMaximumPaths() != desired.IbgpMaximumPaths,
 		"bindToDevice":     cg.GetBindToDevice() != desired.BindToDevice,
 		"routeSelectionOptions": !routeSelectionOptionsEqual(
 			desired.GetRouteSelectionOptions(), cg.GetRouteSelectionOptions()),
@@ -1387,8 +1394,9 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 // globalDriftFields is every key UpdateGlobalRestartRequired can report, so the
 // series can be cleared on CR deletion without reconstructing the comparison.
 var globalDriftFields = []string{
-	"useMultiplePaths", "bindToDevice", "routeSelectionOptions", "confederation",
-	"gracefulRestart", "listenPort", "listenAddresses", "families",
+	"useMultiplePaths", "ebgpMaximumPaths", "ibgpMaximumPaths", "bindToDevice",
+	"routeSelectionOptions", "confederation", "gracefulRestart", "listenPort",
+	"listenAddresses", "families",
 }
 
 // UpdateGlobalRestartRequired records secondary global drift and says so once.
@@ -1434,6 +1442,32 @@ func validateListenAddresses(addrs []string) error {
 		if _, err := netip.ParseAddr(a); err != nil {
 			return fmt.Errorf("%q is not a valid IP address: %w", a, err)
 		}
+	}
+	return nil
+}
+
+// validateMultipath enforces the pair rule gobgp-netlink v1.3.5 enforces, before
+// the daemon does.
+//
+// The daemon refuses both halves: multipath enabled with no limit selects only the
+// single best path, and a limit without multipath is accepted, reported back, and
+// does nothing. Its errors name the OpenConfig paths, so this reports the CRD
+// fields instead.
+//
+// This matters more than a nicer message. The failure is at StartBgp, which means
+// gobgpd does not start at all - so a CR with useMultiplePaths and no limit takes
+// the node's BGP down entirely rather than degrading. Until ebgpMaximumPaths and
+// ibgpMaximumPaths existed here there was no way to satisfy the rule, which made
+// global.useMultiplePaths unusable on v1.3.5.
+func validateMultipath(g *bgpv1.GlobalSpec) error {
+	hasLimit := g.EbgpMaximumPaths != 0 || g.IbgpMaximumPaths != 0
+	if g.UseMultiplePaths && !hasLimit {
+		return fmt.Errorf("useMultiplePaths is enabled but neither ebgpMaximumPaths nor " +
+			"ibgpMaximumPaths is set; set at least one, or multipath selects only the single best path")
+	}
+	if !g.UseMultiplePaths && hasLimit {
+		return fmt.Errorf("ebgpMaximumPaths or ibgpMaximumPaths is set but useMultiplePaths is not " +
+			"enabled; enable it, or remove the limit")
 	}
 	return nil
 }

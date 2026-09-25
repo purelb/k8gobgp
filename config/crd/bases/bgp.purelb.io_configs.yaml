@@ -154,6 +154,13 @@ spec:
                         format: int32
                         type: integer
                     type: object
+                  ebgpMaximumPaths:
+                    description: |-
+                      EbgpMaximumPaths caps how many eBGP paths the multipath set may hold for one
+                      prefix. Requires useMultiplePaths.
+                    format: int32
+                    maximum: 255
+                    type: integer
                   families:
                     description: |-
                       Families is the global address-family set. Omit it to keep gobgpd's
@@ -195,6 +202,13 @@ spec:
                         maximum: 4095
                         type: integer
                     type: object
+                  ibgpMaximumPaths:
+                    description: |-
+                      IbgpMaximumPaths caps how many iBGP paths the multipath set may hold for one
+                      prefix. Requires useMultiplePaths.
+                    format: int32
+                    maximum: 255
+                    type: integer
                   listenAddresses:
                     description: |-
                       ListenAddresses are the local addresses gobgpd accepts BGP connections on.
@@ -291,6 +305,15 @@ spec:
                       Default: "10.255.0.0/16"
                     type: string
                   useMultiplePaths:
+                    description: |-
+                      UseMultiplePaths installs more than one path per prefix, so the multipath
+                      set can be exported to the kernel as ECMP.
+
+                      It requires at least one of ebgpMaximumPaths or ibgpMaximumPaths, and they
+                      require it: gobgp-netlink v1.3.5 refuses both halves of that pair, because a
+                      limit without multipath was accepted, reported back, and did nothing, while
+                      multipath without a limit selects only the single best path. Both are checked
+                      here before StartBgp so the error names the CRD fields.
                     type: boolean
                 required:
                 - asn
