@@ -11,6 +11,12 @@
 #      below assumes two jobs, one per endpoint - k8gobgp on :7473 and gobgpd on
 #      :7475. Without a job matcher the bgp_* rules will also match any other
 #      gobgp or FRR exporter in the cluster.
+#
+#      docs/monitoring/podmonitors.yaml has two PodMonitors that produce exactly
+#      those two job values, and stamp the `node` label that
+#      K8GoBGPConfiguredPeerMissing needs. If you scrape some other way, the
+#      requirements are: one job per endpoint, and a per-node label shared by
+#      both.
 #   2. `pod`/`instance` labels come from the scrape, not from the metrics. The
 #      annotations here use {{ $labels.instance }}, which every scrape provides;
 #      swap in {{ $labels.pod }} if your service discovery sets it.
@@ -59,14 +65,37 @@ spec:
     - alert: K8GoBGPConfiguredPeerMissing
       # The CR asks for more neighbors than gobgpd holds. Catches the refused
       # peer above even when the error rate has fallen back to zero.
+      #
+      # Joined on `node`, NOT on `instance`. This is the one rule that compares a
+      # k8gobgp metric against a gobgpd one, and the two come from different
+      # scrape targets - :7473 and :7475 - so their `instance` values are
+      # host:7473 and host:7475 and can never match. A binary operator between
+      # two vectors with disjoint label sets produces nothing, so joining on
+      # `instance` made this alert permanently silent rather than wrong.
+      #
+      # Neither metric carries a node label of its own: gobgpd's peer metrics have
+      # only `peer`, and k8gobgp_configured_objects has kind/name/namespace. So
+      # `node` has to come from the scrape. The PodMonitors in
+      # docs/monitoring/podmonitors.yaml stamp it from
+      # __meta_kubernetes_pod_node_name; if your scrape config differs, join on
+      # whatever label it sets per node.
+      #
+      # max, not sum, on the left: with two BGPConfigurations visible on a node
+      # only one owns gobgpd, and summing both would overstate the expected count.
+      #
+      # Under-fires rather than over-fires: bgp_peer_state also counts
+      # dynamically-accepted peers, which have no entry in
+      # k8gobgp_configured_objects, so the right-hand side can exceed the CR's
+      # count and hide a genuinely missing neighbor. The `for` is kept so a
+      # mid-reconcile snapshot does not alert.
       expr: |
-        sum by (instance) (k8gobgp_configured_objects{job="k8gobgp",kind="neighbor"})
-          > count by (instance) (bgp_peer_state{job="gobgpd"})
+        max by (node) (k8gobgp_configured_objects{job="k8gobgp",kind="neighbor"})
+          > count by (node) (bgp_peer_state{job="gobgpd"})
       for: 10m
       labels:
         severity: warning
       annotations:
-        summary: "gobgpd is missing configured neighbors on {{ $labels.instance }}"
+        summary: "gobgpd is missing configured neighbors on {{ $labels.node }}"
         description: "The BGPConfiguration asks for more neighbors than gobgpd has. A peer was probably refused at apply time."
 
     - alert: K8GoBGPReconciliationFailed

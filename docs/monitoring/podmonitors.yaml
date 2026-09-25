@@ -1,0 +1,72 @@
+# Prometheus Operator PodMonitors for k8gobgp.
+#
+# Sample manifests — adjust the namespace and selector to your deployment, the
+# same way docs/alerting/k8gobgp-alerts.yaml is a sample rather than a shipped
+# manifest.
+#
+# Two monitors, not one, because a k8gobgp pod is two processes with two metric
+# namespaces on two ports, and Prometheus Operator derives `job` per PodMonitor.
+# One monitor covering both ports would give both endpoints the same `job` value,
+# and every rule in the alerts file selects on `job="k8gobgp"` or `job="gobgpd"`
+# to avoid matching some other gobgp or FRR exporter in the cluster.
+#
+# Both stamp `node` from __meta_kubernetes_pod_node_name. That is not cosmetic:
+# K8GoBGPConfiguredPeerMissing compares a k8gobgp metric against a gobgpd one, and
+# because the two are separate scrape targets their `instance` labels are
+# host:7473 and host:7475 and can never match. Neither metric carries a node label
+# of its own - gobgpd's peer metrics have only `peer` - so without this relabeling
+# that rule is silent.
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: k8gobgp-manager
+  namespace: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8gobgp
+      app.kubernetes.io/component: bgp-speaker
+  podMetricsEndpoints:
+    # The reconciler's own metrics: k8gobgp_*.
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      relabelings:
+        # Set `job` explicitly. Without this the Operator derives it from the
+        # PodMonitor name and namespace, and the alert rules' job="k8gobgp"
+        # matcher selects nothing.
+        - targetLabel: job
+          replacement: k8gobgp
+          action: replace
+        # The join label. See the header, and K8GoBGPConfiguredPeerMissing.
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+          action: replace
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: k8gobgp-gobgpd
+  namespace: k8gobgp-system
+  labels:
+    app.kubernetes.io/name: k8gobgp
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: k8gobgp
+      app.kubernetes.io/component: bgp-speaker
+  podMetricsEndpoints:
+    # gobgp-netlink's own metrics: bgp_* and fsm_*.
+    - port: gobgp-metrics
+      path: /metrics
+      interval: 30s
+      relabelings:
+        - targetLabel: job
+          replacement: gobgpd
+          action: replace
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+          action: replace
