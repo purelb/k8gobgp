@@ -65,6 +65,18 @@ if [ "$USE_UNIX_SOCKET" = "true" ]; then
     GOBGP_ENDPOINT="unix://${GOBGP_SOCKET}"
 else
     # Use TCP (needed for external access)
+    #
+    # gobgp-netlink v1.3.5 refuses to start when --api-hosts is bound
+    # off-loopback without client-certificate authentication, because the API is
+    # a write interface - it adds peers and paths and installs routes into the
+    # host routing table. So an off-loopback GOBGP_API_HOST needs either
+    # --tls with --tls-client-ca-file, or --api-insecure-allow-remote to accept
+    # the exposure deliberately, passed through GOBGPD_EXTRA_ARGS.
+    #
+    # Deliberately not added automatically: opting out of that guard on the
+    # operator's behalf, for exactly the configuration the guard exists to catch,
+    # is not a decision this script should make silently. USE_UNIX_SOCKET
+    # defaults to true and both shipped manifests set it, so this path is opt-in.
     # shellcheck disable=SC2086
     /usr/local/bin/gobgpd --api-hosts "${GOBGP_API_HOST}" ${GOBGPD_ARGS} &
     GOBGPD_PID=$!
