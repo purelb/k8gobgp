@@ -947,3 +947,63 @@ func TestReconcileGlobal_MultipathPairRule(t *testing.T) {
 		})
 	}
 }
+
+// inheritedBlocks must agree with peerConfigEqual about which blocks a peer group
+// owns. If they disagree, the status tells an operator a block was inherited while
+// the comparator still compares it, or the reverse.
+func TestInheritedBlocks(t *testing.T) {
+	r := &BGPConfigurationReconciler{}
+
+	t.Run("ungrouped neighbor inherits nothing", func(t *testing.T) {
+		d := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.0.0.1", PeerAsn: 64513,
+		}}, nil)
+		assert.Empty(t, inheritedBlocks(d))
+	})
+
+	t.Run("grouped neighbor stating nothing inherits every block", func(t *testing.T) {
+		d := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.0.0.2", PeerAsn: 64513, PeerGroup: "spines",
+		}}, nil)
+		assert.Equal(t, []string{
+			"afiSafis", "applyPolicy", "bfd", "gracefulRestart", "timers", "transport",
+		}, inheritedBlocks(d))
+	})
+
+	t.Run("a stated block is not reported as inherited", func(t *testing.T) {
+		d := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{
+			Config:   bgpv1.NeighborConfig{NeighborAddress: "10.0.0.3", PeerAsn: 64513, PeerGroup: "spines"},
+			Timers:   &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 90}},
+			AfiSafis: []bgpv1.AfiSafi{{Family: "ipv4-unicast", Enabled: true}},
+			BFD:      &bgpv1.BFD{Enabled: ptrTo(true)},
+		}, nil)
+		got := inheritedBlocks(d)
+		assert.NotContains(t, got, "timers")
+		assert.NotContains(t, got, "afiSafis")
+		assert.NotContains(t, got, "bfd")
+		assert.Contains(t, got, "transport")
+	})
+
+	// The invariant: every block inheritedBlocks reports must be one peerConfigEqual
+	// skips, so status and comparator cannot disagree.
+	t.Run("agrees with peerConfigEqual's skip list", func(t *testing.T) {
+		bare := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.0.0.4", PeerAsn: 64513, PeerGroup: "spines",
+		}}, nil)
+		// Current is the group's values folded in: blocks the member never stated.
+		current := proto.CloneOf(bare)
+		current.Timers = &gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 30, KeepaliveInterval: 10}}
+		current.Transport = &gobgpapi.Transport{PassiveMode: true}
+		current.GracefulRestart = &gobgpapi.GracefulRestart{Enabled: true, RestartTime: 120}
+		current.Bfd = &gobgpapi.BfdPeerConfig{Enabled: true}
+		current.AfiSafis = []*gobgpapi.AfiSafi{{Config: &gobgpapi.AfiSafiConfig{
+			Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST}, Enabled: true,
+		}}}
+		require.NotEmpty(t, inheritedBlocks(bare))
+		assert.True(t, peerConfigEqual(bare, current),
+			"every block reported as inherited must also be skipped by peerConfigEqual, "+
+				"or the status and the comparator disagree about who owns it")
+	})
+}
+
+func ptrTo[T any](v T) *T { return &v }

@@ -95,6 +95,10 @@ type BGPNodeStatusReporter struct {
 	routerID         atomic.Pointer[string]
 	routerIDSource   atomic.Pointer[string]
 	asn              atomic.Uint32
+	// Which blocks each neighbor inherited from its peer group, keyed the same way
+	// the reconciler keys neighbors. A whole map behind one pointer, so a write is
+	// atomic and the Start loop never sees a half-updated view.
+	inheritedBlocks atomic.Pointer[map[string][]string]
 
 	// Internal state (single-goroutine access in Start loop, no lock needed)
 	lastWrittenStatus   *bgpv1.BGPNodeStatusData
@@ -117,6 +121,25 @@ func (r *BGPNodeStatusReporter) UpdateConfig(enabled bool, heartbeat int32, rout
 	r.routerID.Store(&routerID)
 	r.routerIDSource.Store(&routerIDSource)
 	r.asn.Store(asn)
+}
+
+// UpdateInheritedBlocks records, per neighbor key, which configuration blocks came
+// from a peer group rather than from the neighbor itself.
+//
+// Supplied by the reconciler because only it can know: ListPeer reports the
+// resolved configuration, so the reporter cannot distinguish a value the neighbor
+// stated from one it inherited. Stored whole rather than merged, so a neighbor that
+// stops inheriting does not keep a stale entry.
+func (r *BGPNodeStatusReporter) UpdateInheritedBlocks(m map[string][]string) {
+	r.inheritedBlocks.Store(&m)
+}
+
+func (r *BGPNodeStatusReporter) inheritedFor(key string) []string {
+	m := r.inheritedBlocks.Load()
+	if m == nil {
+		return nil
+	}
+	return (*m)[key]
 }
 
 // Start implements manager.Runnable. It runs in its own goroutine.
@@ -391,10 +414,13 @@ func (r *BGPNodeStatusReporter) collectNeighborStatus(ctx context.Context, clien
 		}
 
 		ns := bgpv1.NeighborStatus{
-			Address:  peer.State.NeighborAddress,
-			State:    peerStateToString(peer.State.SessionState),
-			LocalASN: peer.Conf.GetLocalAsn(),
-			PeerASN:  peer.Conf.GetPeerAsn(),
+			// neighborKey, the same helper the reconciler uses, so an unnumbered
+			// peer's "iface:" key matches on both sides.
+			InheritedBlocks: r.inheritedFor(neighborKey(peer.GetConf())),
+			Address:         peer.State.NeighborAddress,
+			State:           peerStateToString(peer.State.SessionState),
+			LocalASN:        peer.Conf.GetLocalAsn(),
+			PeerASN:         peer.Conf.GetPeerAsn(),
 		}
 
 		// GetDescription(), not the field: Description gained explicit presence

@@ -983,6 +983,11 @@ func (in *NeighborStatus) DeepCopyInto(out *NeighborStatus) {
 		in, out := &in.SessionUpSince, &out.SessionUpSince
 		*out = (*in).DeepCopy()
 	}
+	if in.InheritedBlocks != nil {
+		in, out := &in.InheritedBlocks, &out.InheritedBlocks
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.BFD != nil {
 		in, out := &in.BFD, &out.BFD
 		*out = new(BFDStatus)

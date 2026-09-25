@@ -1992,6 +1992,7 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 
 	// 2. Get desired neighbors (with nodeSelector filtering and password resolution)
 	desiredNeighbors := make(map[string]*gobgpapi.Peer)
+	inherited := make(map[string][]string)
 	for _, n := range bgpConfig.Spec.Neighbors {
 		key := neighborKeyFromCRD(&n.Config)
 
@@ -2024,7 +2025,11 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 		if err != nil {
 			return fmt.Errorf("neighbor %q: %w", key, err)
 		}
-		desiredNeighbors[key] = r.crdToAPINeighborWithPassword(&n, authPassword)
+		desired := r.crdToAPINeighborWithPassword(&n, authPassword)
+		desiredNeighbors[key] = desired
+		if blocks := inheritedBlocks(desired); len(blocks) > 0 {
+			inherited[key] = blocks
+		}
 	}
 
 	// Emit warning if all neighbors were filtered out by nodeSelector
@@ -2088,6 +2093,13 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 				}
 			}
 		}
+	}
+
+	// Hand the reporter what only this function knows. Set unconditionally, so a
+	// neighbor that stops inheriting - or leaves its group - loses its entry rather
+	// than keeping a stale one.
+	if r.NodeStatusReporter != nil {
+		r.NodeStatusReporter.UpdateInheritedBlocks(inherited)
 	}
 	return nil
 }
@@ -2194,6 +2206,43 @@ func (r *BGPConfigurationReconciler) authPasswordDrifted(bgpConfig *bgpv1.BGPCon
 		"Neighbor %s: CR specifies TCP-MD5 authentication=%t but gobgpd reports %t; re-sending the configuration.",
 		key, want, have)
 	return true
+}
+
+// inheritedBlocks names the blocks this neighbor will take from its peer group.
+//
+// Derived from what the CR stated, which is the only place that knows: ListPeer
+// reports the resolved configuration, so a value the neighbor set and one it
+// inherited are indistinguishable there. Exactly the predicate peerConfigEqual uses
+// to decide what not to compare, so the two cannot disagree about which blocks a
+// group owns.
+//
+// Kept in sync with the skip list in peerConfigEqual. Re-derive both from the
+// PeerGroup type in api/v1/types.go rather than from either comment.
+func inheritedBlocks(desired *gobgpapi.Peer) []string {
+	if desired.GetConf().GetPeerGroup() == "" {
+		return nil
+	}
+	var blocks []string
+	if len(desired.GetAfiSafis()) == 0 {
+		blocks = append(blocks, "afiSafis")
+	}
+	if desired.ApplyPolicy == nil {
+		blocks = append(blocks, "applyPolicy")
+	}
+	if desired.Timers == nil {
+		blocks = append(blocks, "timers")
+	}
+	if desired.Transport == nil {
+		blocks = append(blocks, "transport")
+	}
+	if desired.GracefulRestart == nil {
+		blocks = append(blocks, "gracefulRestart")
+	}
+	if desired.Bfd == nil {
+		blocks = append(blocks, "bfd")
+	}
+	slices.Sort(blocks)
+	return blocks
 }
 
 // reportPeerAsnOverridden says so when a peer group has discarded a grouped

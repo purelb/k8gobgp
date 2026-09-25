@@ -124,6 +124,22 @@ type NeighborStatus struct {
 	Description string `json:"description,omitempty"`
 	// LastError is the BGP notification code/subcode for non-Established neighbors
 	LastError string `json:"lastError,omitempty"`
+	// InheritedBlocks names the configuration blocks this neighbor took from its
+	// peer group rather than stating itself, sorted.
+	//
+	// ListPeer reports the *resolved* configuration, so a value the neighbor set
+	// and a value it inherited look identical - which is what made every
+	// peer-group defect in this controller hard to see. This answers "why does
+	// this peer have this value" without an operator having to diff the CR
+	// against a group by hand.
+	//
+	// Derived from the CR, not from gobgpd's GetRunningConfig provenance: the CR
+	// is authoritative about what the operator actually stated, and the daemon's
+	// version is a human-readable comment block appended to a 30 KB config
+	// document, which is neither cheap to fetch per reconcile nor a stable format
+	// to parse.
+	// +optional
+	InheritedBlocks []string `json:"inheritedBlocks,omitempty"`
 	// BFD reports the BFD session, when BFD is enabled for this neighbor.
 	// +optional
 	BFD *BFDStatus `json:"bfd,omitempty"`
