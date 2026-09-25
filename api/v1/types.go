@@ -281,6 +281,15 @@ type PeerGroup struct {
 	ApplyPolicy  *ApplyPolicy          `json:"applyPolicy,omitempty"`
 	Timers       *Timers               `json:"timers,omitempty"`
 	Transport    *Transport            `json:"transport,omitempty"`
+	// GracefulRestart applies to every member that does not state its own.
+	//
+	// Editing it reaches members already in the group, verified against
+	// gobgp-netlink v1.3.5: a member picked up restartTime 120 -> 240 from a
+	// group edit. That was not true before v1.3.5, where
+	// SetDefaultNeighborConfigValues returned early once a member had resolved,
+	// so a group edit silently applied to new members only.
+	// +optional
+	GracefulRestart *GracefulRestart `json:"gracefulRestart,omitempty"`
 	// BFD applies to every member that does not specify its own.
 	// +optional
 	BFD *BFD `json:"bfd,omitempty"`
@@ -534,7 +543,16 @@ type GracefulRestart struct {
 	// +kubebuilder:validation:Maximum=4095
 	// +optional
 	RestartTime uint32 `json:"restartTime,omitempty"`
-	HelperOnly  bool   `json:"helperOnly,omitempty"`
+	// StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+	// marked stale before purging them, in seconds. 0 disables the timer, which is
+	// gobgpd's default.
+	//
+	// Only families that have not sent End-of-RIB are purged when it fires, so a
+	// family that finished its refresh keeps its adj-RIB-in - checked in
+	// staleRoutesExpiredFunc.
+	// +optional
+	StaleRoutesTime uint32 `json:"staleRoutesTime,omitempty"`
+	HelperOnly      bool   `json:"helperOnly,omitempty"`
 }
 
 // +kubebuilder:object:generate=true

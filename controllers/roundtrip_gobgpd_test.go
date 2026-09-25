@@ -373,7 +373,7 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 	// while it still has members, so the peers go first - otherwise DeletePeerGroup
 	// fails silently and AddPeerGroup reports "can't overwrite the existing
 	// peer-group", which looks like a daemon bug rather than leftover state.
-	for i := 1; i <= 9; i++ {
+	for i := 1; i <= 14; i++ {
 		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{
 			Address: fmt.Sprintf("10.90.0.%d", i),
 		})
@@ -527,6 +527,49 @@ func TestRoundTripPeerGroupInheritance(t *testing.T) {
 			reportPeerDiff(t, desired, current)
 			t.Error("peerConfigEqual is FALSE for a grouped neighbor that inherits BFD: " +
 				"every reconcile would fire UpdatePeer for a block the CR did not set")
+		}
+	})
+
+	t.Run("group sets gracefulRestart, member omits it", func(t *testing.T) {
+		// Verified against v1.3.5 that a group's graceful restart reaches a member
+		// that states none, and that editing the group reaches members already in
+		// it - which was not true before v1.3.5, where SetDefaultNeighborConfigValues
+		// returned early once a member had resolved.
+		const pgGR = "rt-inherit-gr"
+		gg := bgpv1.PeerGroup{
+			Config:          bgpv1.PeerGroupConfig{PeerGroupName: pgGR, PeerAsn: 64513},
+			GracefulRestart: &bgpv1.GracefulRestart{Enabled: true, RestartTime: 120, StaleRoutesTime: 300},
+		}
+		_, _ = c.DeletePeer(ctx, &gobgpapi.DeletePeerRequest{Address: "10.90.0.13"})
+		_, _ = c.DeletePeerGroup(ctx, &gobgpapi.DeletePeerGroupRequest{Name: pgGR})
+		_, err := c.AddPeerGroup(ctx, &gobgpapi.AddPeerGroupRequest{
+			PeerGroup: r.crdToAPIPeerGroupWithPassword(&gg, ""),
+		})
+		require.NoError(t, err, "AddPeerGroup (gr)")
+
+		desired, current := readBackIn(t, pgGR, bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.90.0.13", PeerAsn: 64513, PeerGroup: pgGR,
+		}})
+		got := current.GetGracefulRestart()
+		require.True(t, got.GetEnabled(), "member must inherit the group's graceful restart")
+		require.Equal(t, uint32(120), got.GetRestartTime(), "restartTime must inherit")
+		require.Equal(t, uint32(300), got.GetStaleRoutesTime(), "staleRoutesTime must inherit")
+		if !peerConfigEqual(desired, current) {
+			reportPeerDiff(t, desired, current)
+			t.Error("peerConfigEqual is FALSE for a grouped neighbor that inherits graceful restart")
+		}
+	})
+
+	t.Run("staleRoutesTime round-trips on a peer that states it", func(t *testing.T) {
+		desired, current := readBack(t, bgpv1.Neighbor{
+			Config:          bgpv1.NeighborConfig{NeighborAddress: "10.90.0.14", PeerAsn: 64513},
+			GracefulRestart: &bgpv1.GracefulRestart{Enabled: true, RestartTime: 90, StaleRoutesTime: 450},
+		})
+		require.Equal(t, uint32(450), current.GetGracefulRestart().GetStaleRoutesTime())
+		if !gracefulRestartEqual(desired.GetGracefulRestart(), current.GetGracefulRestart()) {
+			t.Errorf("gracefulRestartEqual is FALSE: sent staleRoutesTime %d, got %d",
+				desired.GetGracefulRestart().GetStaleRoutesTime(),
+				current.GetGracefulRestart().GetStaleRoutesTime())
 		}
 	})
 

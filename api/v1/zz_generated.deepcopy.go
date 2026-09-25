@@ -1193,6 +1193,11 @@ func (in *PeerGroup) DeepCopyInto(out *PeerGroup) {
 		*out = new(Transport)
 		**out = **in
 	}
+	if in.GracefulRestart != nil {
+		in, out := &in.GracefulRestart, &out.GracefulRestart
+		*out = new(GracefulRestart)
+		**out = **in
+	}
 	if in.BFD != nil {
 		in, out := &in.BFD, &out.BFD
 		*out = new(BFD)

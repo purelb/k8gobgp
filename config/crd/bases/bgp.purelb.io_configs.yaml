@@ -201,6 +201,17 @@ spec:
                         format: int32
                         maximum: 4095
                         type: integer
+                      staleRoutesTime:
+                        description: |-
+                          StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+                          marked stale before purging them, in seconds. 0 disables the timer, which is
+                          gobgpd's default.
+
+                          Only families that have not sent End-of-RIB are purged when it fires, so a
+                          family that finished its refresh keeps its adj-RIB-in - checked in
+                          staleRoutesExpiredFunc.
+                        format: int32
+                        type: integer
                     type: object
                   ibgpMaximumPaths:
                     description: |-
@@ -641,6 +652,17 @@ spec:
                             this is not a Go type limit and 65535 would be the wrong bound.
                           format: int32
                           maximum: 4095
+                          type: integer
+                        staleRoutesTime:
+                          description: |-
+                            StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+                            marked stale before purging them, in seconds. 0 disables the timer, which is
+                            gobgpd's default.
+
+                            Only families that have not sent End-of-RIB are purged when it fires, so a
+                            family that finished its refresh keeps its adj-RIB-in - checked in
+                            staleRoutesExpiredFunc.
+                          format: int32
                           type: integer
                       type: object
                     nodeSelector:
@@ -1089,6 +1111,45 @@ spec:
                           type: boolean
                       required:
                       - peerGroupName
+                      type: object
+                    gracefulRestart:
+                      description: |-
+                        GracefulRestart applies to every member that does not state its own.
+
+                        Editing it reaches members already in the group, verified against
+                        gobgp-netlink v1.3.5: a member picked up restartTime 120 -> 240 from a
+                        group edit. That was not true before v1.3.5, where
+                        SetDefaultNeighborConfigValues returned early once a member had resolved,
+                        so a group edit silently applied to new members only.
+                      properties:
+                        enabled:
+                          type: boolean
+                        helperOnly:
+                          type: boolean
+                        restartTime:
+                          description: |-
+                            RestartTime is how long a peer should hold this speaker's routes while it
+                            restarts, in seconds. Omit it to take gobgpd's default, which is the
+                            session's hold time.
+
+                            Bounded at 4095 because RFC 4724 section 3 gives Restart Time 12 bits,
+                            sharing a 16-bit word with a 4-bit flags nibble. A larger value does not
+                            fail - it silently overflows into the flags and corrupts the capability, so
+                            this is not a Go type limit and 65535 would be the wrong bound.
+                          format: int32
+                          maximum: 4095
+                          type: integer
+                        staleRoutesTime:
+                          description: |-
+                            StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+                            marked stale before purging them, in seconds. 0 disables the timer, which is
+                            gobgpd's default.
+
+                            Only families that have not sent End-of-RIB are purged when it fires, so a
+                            family that finished its refresh keeps its adj-RIB-in - checked in
+                            staleRoutesExpiredFunc.
+                          format: int32
+                          type: integer
                       type: object
                     nodeSelector:
                       description: |-

@@ -334,11 +334,11 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	// != 0, so an absent block compares equal - and afiSafisConfigEqual returns
 	// true for an empty desired list.
 	//
-	// gracefulRestart is not skippable: the PeerGroup CRD has no gracefulRestart
-	// block, so there is nothing to inherit and the comparison is always
-	// meaningful. bfd IS skippable - the PeerGroup CRD gained a bfd block with the
-	// BFD work - and an earlier version of this comment wrongly grouped the two
-	// together, which left grouped members that inherit BFD churning.
+	// Every block a peer group can state is in the skip: afiSafis, applyPolicy,
+	// timers, transport, gracefulRestart and bfd. Two earlier versions of this
+	// comment named a shorter list from a stale reading of the PeerGroup CRD, and
+	// each omission left grouped members churning on a block they had inherited.
+	// Re-derive it from api/v1/types.go rather than trusting this sentence.
 	grouped := dc.GetPeerGroup() != ""
 	if !(grouped && desired.ApplyPolicy == nil) && !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
 		return false
@@ -349,7 +349,8 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if !(grouped && desired.Transport == nil) && !transportConfigEqual(desired.Transport, current.Transport) {
 		return false
 	}
-	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
+	if !(grouped && desired.GracefulRestart == nil) &&
+		!gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
 		return false
 	}
 	if !(grouped && desired.RouteReflector == nil) && !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
@@ -615,6 +616,12 @@ func gracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
 	// gap, as timersConfigEqual's siblings: clearing restartTime to return to the
 	// default is not detected as a change.
 	if desired.GetRestartTime() != 0 && desired.GetRestartTime() != current.GetRestartTime() {
+		return false
+	}
+	// staleRoutesTime needs no guard: 0 disables the timer rather than asking for a
+	// default, so the daemon echoes it as sent. Measured against v1.3.5, including
+	// through peer-group inheritance.
+	if desired.GetStaleRoutesTime() != current.GetStaleRoutesTime() {
 		return false
 	}
 	return true
@@ -1510,6 +1517,7 @@ func confederationEqual(desired, current *gobgpapi.Confederation) bool {
 func globalGracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
 	return desired.GetEnabled() == current.GetEnabled() &&
 		desired.GetRestartTime() == current.GetRestartTime() &&
+		desired.GetStaleRoutesTime() == current.GetStaleRoutesTime() &&
 		desired.GetDeferralTime() == current.GetDeferralTime()
 }
 
@@ -2831,11 +2839,12 @@ func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.Pe
 			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
-		AfiSafis:    crdToAPIAfiSafis(crd.AfiSafis),
-		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
-		Timers:      crdToAPITimers(crd.Timers),
-		Transport:   crdToAPITransport(crd.Transport),
-		Bfd:         crdToAPIBfd(crd.BFD),
+		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
+		ApplyPolicy:     crdToAPIApplyPolicy(crd.ApplyPolicy),
+		Timers:          crdToAPITimers(crd.Timers),
+		Transport:       crdToAPITransport(crd.Transport),
+		GracefulRestart: crdToAPIGracefulRestart(crd.GracefulRestart),
+		Bfd:             crdToAPIBfd(crd.BFD),
 	}
 }
 
@@ -3170,9 +3179,10 @@ func crdToAPIGracefulRestart(crd *bgpv1.GracefulRestart) *gobgpapi.GracefulResta
 		return nil
 	}
 	return &gobgpapi.GracefulRestart{
-		Enabled:     crd.Enabled,
-		RestartTime: crd.RestartTime,
-		HelperOnly:  crd.HelperOnly,
+		Enabled:         crd.Enabled,
+		RestartTime:     crd.RestartTime,
+		StaleRoutesTime: crd.StaleRoutesTime,
+		HelperOnly:      crd.HelperOnly,
 	}
 }
 
