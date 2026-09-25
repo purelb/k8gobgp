@@ -212,6 +212,25 @@ spec:
                     description:
                       description: Description is the configured neighbor description
                       type: string
+                    inheritedBlocks:
+                      description: |-
+                        InheritedBlocks names the configuration blocks this neighbor took from its
+                        peer group rather than stating itself, sorted.
+
+                        ListPeer reports the *resolved* configuration, so a value the neighbor set
+                        and a value it inherited look identical - which is what made every
+                        peer-group defect in this controller hard to see. This answers "why does
+                        this peer have this value" without an operator having to diff the CR
+                        against a group by hand.
+
+                        Derived from the CR, not from gobgpd's GetRunningConfig provenance: the CR
+                        is authoritative about what the operator actually stated, and the daemon's
+                        version is a human-readable comment block appended to a 30 KB config
+                        document, which is neither cheap to fetch per reconcile nor a stable format
+                        to parse.
+                      items:
+                        type: string
+                      type: array
                     lastError:
                       description: LastError is the BGP notification code/subcode
                         for non-Established neighbors

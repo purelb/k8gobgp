@@ -183,6 +183,26 @@ var (
 		[]string{"router_id", "source", "node", "asn", "name", "namespace"},
 	)
 
+	// globalRestartRequired is 1 for each global setting whose value in the CR
+	// differs from what gobgpd is running.
+	//
+	// A gauge rather than an event because the event is reconcile-gated and
+	// ephemeral: Reconcile fires on spec generation changes, so a drift that
+	// nobody edits again produces one event that then ages out, while the daemon
+	// keeps running the old value until the pod restarts. The gauge stays up for
+	// as long as the drift does.
+	//
+	// The field label is bounded to the known Global field names - it is derived
+	// from a fixed comparison list, never from CR content - so this cannot grow
+	// unboundedly.
+	globalRestartRequired = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8gobgp_global_restart_required",
+			Help: "1 when a global setting in the CR differs from the running gobgpd and needs a pod restart to apply",
+		},
+		[]string{"field", "name", "namespace"},
+	)
+
 	// === BGPNodeStatus Reporter Metrics ===
 
 	nodeStatusWriteTotal = prometheus.NewCounterVec(
@@ -251,6 +271,7 @@ func init() {
 		routerIDResolutionTotal,
 		routerIDResolutionDuration,
 		routerIDInfo,
+		globalRestartRequired,
 		// BGPNodeStatus reporter metrics
 		nodeStatusWriteTotal,
 		nodeStatusCollectionDuration,
@@ -370,6 +391,31 @@ func UpdateRouterIDInfo(oldLabels, newLabels prometheus.Labels) {
 		routerIDInfo.Delete(oldLabels)
 	}
 	routerIDInfo.With(newLabels).Set(1)
+}
+
+// SetGlobalRestartRequired records which global settings have drifted, and
+// clears the ones that have not.
+//
+// Every field in the comparison is passed every time, drifted or not, so a
+// setting that stops drifting has its series set back to 0 rather than left at 1
+// for ever. Setting 0 rather than deleting keeps the series present, which is
+// what lets an alert use a plain `> 0` without worrying about absent series.
+func SetGlobalRestartRequired(name, namespace string, drifted map[string]bool) {
+	for field, isDrifted := range drifted {
+		v := 0.0
+		if isDrifted {
+			v = 1.0
+		}
+		globalRestartRequired.WithLabelValues(field, name, namespace).Set(v)
+	}
+}
+
+// DeleteGlobalRestartRequired removes one CR's drift series. Required on CR
+// deletion, for the same reason as DeleteRouterIDInfo: nothing else clears them.
+func DeleteGlobalRestartRequired(name, namespace string, fields []string) {
+	for _, f := range fields {
+		globalRestartRequired.DeleteLabelValues(f, name, namespace)
+	}
 }
 
 // DeleteRouterIDInfo removes one CR's router ID series. Required on CR

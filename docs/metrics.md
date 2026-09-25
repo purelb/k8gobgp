@@ -1,8 +1,13 @@
 # k8gobgp metrics reference
 
-> **Status: describes the target state after the gobgp-netlink v1.3.1 update.** Metrics marked
-> **(new)** do not exist yet; metrics listed under [Removed metrics](#removed-metrics) still exist
-> today and go away with that change. Everything about gobgp-netlink describes v1.3.1 as released.
+> **Status: current as of gobgp-netlink v1.3.5.** The metrics below are what the two endpoints
+> emit today. Anything still marked **(new)** shipped with v1.3.1 and exists now; anything under
+> [Removed metrics](#removed-metrics) is gone.
+>
+> This document described a *target state* for a release that has since shipped, and the
+> "(new)"/"removed" markers were read the wrong way round for three releases. If you are updating
+> it, re-measure against a running daemon rather than editing the prose - see the family counts
+> below for how.
 
 A k8gobgp pod runs two processes, and each exposes its own metrics on its own port. They are not
 merged, proxied or consolidated — they are two scrape targets with two distinct metric
@@ -91,7 +96,20 @@ busy because it is churning".
 
 ## BGP daemon metrics (port 7475)
 
-72 metric families. Everything here is emitted by gobgp-netlink v1.3.1.
+**36 metric families** are emitted by gobgp-netlink itself: 27 `bgp_*` and 9 `fsm_*`. Measured
+against v1.3.5 by scraping the endpoint directly:
+
+```
+curl -s http://127.0.0.1:7475/metrics | grep '^# HELP' | awk '{print $3}' | sed 's/_.*//' \
+  | sort | uniq -c | sort -rn
+```
+
+The endpoint serves 75 families in total; the other 39 are the standard Go runtime (29),
+`process_*` (9) and `promhttp_*` (1) collectors that come with any Go Prometheus client.
+
+The total is **configuration-dependent** - per-peer families only appear once peers exist, so the
+same daemon served 75 with no peers and 79 with one peer and one peer group. Quote the 36 if you
+need a fixed number; do not assert a total.
 
 ### Session state, per peer
 
@@ -293,6 +311,13 @@ not follow RFC 5880 §6.8.1, so read the name, not the value.
 
 ---
 
+## Scrape configuration
+
+Two endpoints means two scrape targets, and every cross-endpoint query below depends on them
+sharing a per-node label. `docs/monitoring/podmonitors.yaml` has Prometheus Operator PodMonitors
+that set `job` explicitly per endpoint and stamp `node` from the pod's node name;
+`docs/alerting/k8gobgp-alerts.yaml` has rules that assume exactly that shape.
+
 ## Common queries
 
 ```promql
@@ -304,8 +329,19 @@ count by (instance, job) (bgp_peer_state{session_state="SESSION_STATE_ESTABLISHE
 
 # The CR asked for more neighbours than gobgpd has. Catches a peer gobgpd refused,
 # which no bgp_* metric can describe because it never enters ListPeer.
-sum by (instance, job) (k8gobgp_configured_objects{kind="neighbor"})
-  > count by (instance, job) (bgp_peer_state)
+#
+# Grouped by `node`, and that is not a style choice. This is the only query here
+# that compares a k8gobgp metric against a gobgpd one, and the two are separate
+# scrape targets - :7473 and :7475 - so `instance` is host:7473 on one side and
+# host:7475 on the other, and `job` differs by construction. A binary operator
+# between two vectors with disjoint labels returns nothing, so grouping by either
+# makes this silent rather than wrong. Neither metric carries a node label of its
+# own; docs/monitoring/podmonitors.yaml stamps one from the pod's node name.
+#
+# max, not sum: with two BGPConfigurations visible on a node only one owns gobgpd,
+# and summing both overstates the expected count.
+max by (node) (k8gobgp_configured_objects{kind="neighbor"})
+  > count by (node) (bgp_peer_state)
 
 # Flapping peers.
 delta(bgp_peer_flop_count[15m]) > 2

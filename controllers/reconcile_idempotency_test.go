@@ -17,6 +17,7 @@ package controllers
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,6 +28,7 @@ import (
 	gobgpapi "github.com/osrg/gobgp/v4/api"
 	bgpv1 "github.com/purelb/k8gobgp/api/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -448,12 +450,12 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 				Config: bgpv1.NeighborConfig{
 					NeighborAddress:      "10.0.0.20",
 					PeerAsn:              64513,
-					AllowOwnAsn:          3,
-					ReplacePeerAsn:       true,
-					AllowAspathLoopLocal: true,
+					AllowOwnAsn:          proto.Uint32(3),
+					ReplacePeerAsn:       proto.Bool(true),
+					AllowAspathLoopLocal: proto.Bool(true),
 					RemovePrivate:        "replace",
 					RouteFlapDamping:     true,
-					SendSoftwareVersion:  true,
+					SendSoftwareVersion:  proto.Bool(true),
 					SendCommunity:        "both",
 				},
 			},
@@ -487,7 +489,7 @@ func TestReconcileNeighbors_Idempotent(t *testing.T) {
 				Config: bgpv1.NeighborConfig{
 					NeighborAddress: "10.0.0.8",
 					PeerAsn:         64513,
-					AuthPassword:    "correct horse battery staple",
+					AuthPassword:    proto.String("correct horse battery staple"),
 				},
 			},
 		},
@@ -550,7 +552,7 @@ func TestReconcileNeighbors_DetectsRealChange(t *testing.T) {
 	}
 
 	r := &BGPConfigurationReconciler{Log: logf.Log}
-	fake := &fakeGoBGP{peers: []*gobgpapi.Peer{gobgpdEcho(r.crdToAPINeighborWithPassword(&existing, ""))}}
+	fake := &fakeGoBGP{peers: []*gobgpapi.Peer{gobgpdEcho(r.crdToAPINeighborWithPassword(&existing, nil))}}
 
 	require.NoError(t, r.reconcileNeighbors(context.Background(), fake, cfg, map[string]*gobgpapi.PeerGroup{}, logf.Log))
 	assert.Equal(t, 1, fake.updatePeer, "a changed hold time must produce exactly one UpdatePeer")
@@ -665,7 +667,7 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 		Config: bgpv1.NeighborConfig{
 			NeighborAddress: "2001:470:b8f3:251::1",
 			PeerAsn:         64514,
-			Description:     "Gateway router on subnet-251 (IPv6)",
+			Description:     proto.String("Gateway router on subnet-251 (IPv6)"),
 		},
 		AfiSafis: []bgpv1.AfiSafi{
 			{Family: "ipv4-unicast", Enabled: true},
@@ -673,7 +675,7 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 		},
 		Timers: &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 90, KeepaliveInterval: 30}},
 	}
-	desired := r.crdToAPINeighborWithPassword(crd, "")
+	desired := r.crdToAPINeighborWithPassword(crd, nil)
 
 	// Verbatim from `gobgp --target unix://... -j neighbor 2001:470:b8f3:251::1`
 	// against gobgpd v1.3.0 (commit 8b99965), session established.
@@ -715,3 +717,293 @@ func TestPeerConfigEqual_AgainstProductionPayload(t *testing.T) {
 	assert.True(t, peerConfigEqual(desired, current),
 		"this exact pair fired UpdatePeer on every reconcile in production")
 }
+
+// --- global drift ------------------------------------------------------------
+
+// fakeGlobalGoBGP reports a running BGP server whose Global the caller controls,
+// so drift can be simulated without a daemon.
+type fakeGlobalGoBGP struct {
+	gobgpapi.GoBgpServiceClient
+	global   *gobgpapi.Global
+	startBgp int
+}
+
+func (f *fakeGlobalGoBGP) GetBgp(_ context.Context, _ *gobgpapi.GetBgpRequest, _ ...grpc.CallOption) (*gobgpapi.GetBgpResponse, error) {
+	return &gobgpapi.GetBgpResponse{Global: f.global}, nil
+}
+
+func (f *fakeGlobalGoBGP) StartBgp(_ context.Context, _ *gobgpapi.StartBgpRequest, _ ...grpc.CallOption) (*gobgpapi.StartBgpResponse, error) {
+	f.startBgp++
+	return &gobgpapi.StartBgpResponse{}, nil
+}
+
+// drainEvents returns every event queued on a fake recorder. reconcileGlobal
+// emits RouterIDResolved as well, so a test that reads only the first event is
+// asserting on emission order it has no reason to rely on.
+func drainEvents(rec *record.FakeRecorder) []string {
+	var out []string
+	for {
+		select {
+		case e := <-rec.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+func eventMatching(events []string, substr string) (string, bool) {
+	for _, e := range events {
+		if strings.Contains(e, substr) {
+			return e, true
+		}
+	}
+	return "", false
+}
+
+// Secondary global drift must NOT abort reconcileGlobal.
+//
+// reconcileGlobal is first in the chain, so returning an error here stops
+// neighbors, peer groups, policies and netlink from being reconciled at all. An
+// earlier version did exactly that, which meant one edit to a secondary global
+// setting froze every other piece of configuration on the node until the pod
+// happened to restart. The drift is reported and the reconcile continues.
+func TestReconcileGlobal_SecondaryDriftDoesNotAbortTheChain(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
+		Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
+			ASN:      64512,
+			RouterID: "10.0.0.1",
+			// A valid multipath pair: the validator refuses multipath without a
+			// limit, so drifting useMultiplePaths means drifting the limit too.
+			UseMultiplePaths: true,
+			EbgpMaximumPaths: 4,
+			BindToDevice:     "eth1",
+		}},
+	}
+	// Running daemon: same identity, every secondary setting different.
+	fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{
+		Asn:              64512,
+		RouterId:         "10.0.0.1",
+		UseMultiplePaths: false,
+		BindToDevice:     "",
+	}}
+
+	// Sized well above the number of events: record.NewFakeRecorder blocks on a
+	// full channel rather than dropping, so an undersized one deadlocks the test
+	// instead of failing it.
+	rec := record.NewFakeRecorder(64)
+	r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: rec, NodeName: "node-1"}
+
+	err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+	require.NoError(t, err, "secondary global drift must not return an error: it would abort the reconcile chain")
+	assert.Zero(t, fake.startBgp, "StartBgp must not be called for a server that is already running")
+
+	got, ok := eventMatching(drainEvents(rec), "GlobalRestartRequired")
+	require.True(t, ok, "expected a GlobalRestartRequired event")
+	assert.Contains(t, got, "useMultiplePaths")
+	assert.Contains(t, got, "ebgpMaximumPaths")
+	assert.Contains(t, got, "bindToDevice")
+}
+
+// Identity drift is different: it DOES stop, because continuing would reconcile
+// neighbors against a speaker that is not the one the CR describes.
+func TestReconcileGlobal_IdentityDriftStops(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
+		Spec:       bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{ASN: 64512, RouterID: "10.0.0.1"}},
+	}
+	fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{Asn: 64599, RouterId: "10.0.0.1"}}
+	r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: record.NewFakeRecorder(64), NodeName: "node-1"}
+
+	err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+	require.Error(t, err, "an ASN change must stop the reconcile")
+	assert.Contains(t, err.Error(), "global identity change")
+}
+
+// A CR that states nothing for the defaulted fields must not report drift against
+// the daemon's defaults. This is the shape that would churn if the guards were
+// dropped: listenAddresses becomes ["0.0.0.0", "::"] and families becomes every
+// supported family, neither of which the CR asked for.
+func TestReconcileGlobal_DefaultedFieldsDoNotDrift(t *testing.T) {
+	cfg := &bgpv1.BGPConfiguration{
+		ObjectMeta: metav1.ObjectMeta{Name: "drift", Namespace: "purelb"},
+		Spec:       bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{ASN: 64512, RouterID: "10.0.0.1"}},
+	}
+	fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{
+		Asn:             64512,
+		RouterId:        "10.0.0.1",
+		ListenPort:      179,
+		ListenAddresses: []string{"0.0.0.0", "::"},
+		Families:        []uint32{0, 1, 9, 24},
+	}}
+	rec := record.NewFakeRecorder(64)
+	r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: rec, NodeName: "node-1"}
+
+	require.NoError(t, r.reconcileGlobal(context.Background(), fake, cfg, logf.Log))
+	if e, ok := eventMatching(drainEvents(rec), "GlobalRestartRequired"); ok {
+		t.Fatalf("no drift expected for daemon-defaulted fields, got: %s", e)
+	}
+}
+
+// A bad listen address must be reported before StartBgp, not after.
+//
+// gobgpd parses these with netip.ParseAddr and fails the whole StartBgp when one
+// is bad, which surfaces as "BGP server not running" on every reconcile with the
+// real cause buried in the daemon's error.
+func TestReconcileGlobal_RejectsBadListenAddress(t *testing.T) {
+	cases := []struct {
+		name    string
+		addrs   []string
+		wantErr bool
+	}{
+		{name: "valid v4 and v6", addrs: []string{"10.0.0.1", "2001:db8::1"}},
+		{name: "link-local with zone", addrs: []string{"fe80::1%eth0"}},
+		{name: "omitted entirely", addrs: nil},
+		{name: "not an address", addrs: []string{"not-an-address"}, wantErr: true},
+		{name: "empty string", addrs: []string{""}, wantErr: true},
+		// net.ParseIP accepts a bare prefix's text in some forms; netip does not,
+		// and netip is what the daemon uses.
+		{name: "a prefix, not an address", addrs: []string{"10.0.0.0/24"}, wantErr: true},
+		{name: "one bad among good", addrs: []string{"10.0.0.1", "10.0.0.256"}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &bgpv1.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: "listen", Namespace: "purelb"},
+				Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
+					ASN: 64512, RouterID: "10.0.0.1", ListenAddresses: tc.addrs,
+				}},
+			}
+			fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{Asn: 64512, RouterId: "10.0.0.1"}}
+			r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: record.NewFakeRecorder(64), NodeName: "node-1"}
+
+			err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "global.listenAddresses")
+				assert.Zero(t, fake.startBgp, "must not reach StartBgp with a bad address")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// The multipath pair rule, checked before the daemon sees it.
+//
+// gobgp-netlink v1.3.5 refuses both halves at StartBgp, and a StartBgp failure
+// means gobgpd does not start - so getting this wrong takes the node's BGP down
+// entirely rather than degrading. Before ebgpMaximumPaths and ibgpMaximumPaths
+// were exposed there was no way to satisfy the rule at all, which made
+// global.useMultiplePaths unusable on v1.3.5.
+func TestReconcileGlobal_MultipathPairRule(t *testing.T) {
+	cases := []struct {
+		name          string
+		multipath     bool
+		ebgp, ibgp    uint32
+		wantErrSubstr string
+	}{
+		{name: "neither: the common case", multipath: false},
+		{name: "multipath with an ebgp limit", multipath: true, ebgp: 4},
+		{name: "multipath with an ibgp limit", multipath: true, ibgp: 8},
+		{name: "multipath with both", multipath: true, ebgp: 4, ibgp: 8},
+		{
+			name: "multipath with no limit", multipath: true,
+			wantErrSubstr: "neither ebgpMaximumPaths nor ibgpMaximumPaths is set",
+		},
+		{
+			name: "limit with no multipath", multipath: false, ebgp: 4,
+			wantErrSubstr: "useMultiplePaths is not enabled",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &bgpv1.BGPConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: "mp", Namespace: "purelb"},
+				Spec: bgpv1.BGPConfigurationSpec{Global: bgpv1.GlobalSpec{
+					ASN: 64512, RouterID: "10.0.0.1",
+					UseMultiplePaths: tc.multipath,
+					EbgpMaximumPaths: tc.ebgp,
+					IbgpMaximumPaths: tc.ibgp,
+				}},
+			}
+			fake := &fakeGlobalGoBGP{global: &gobgpapi.Global{
+				Asn: 64512, RouterId: "10.0.0.1",
+				UseMultiplePaths: tc.multipath,
+				EbgpMaximumPaths: tc.ebgp,
+				IbgpMaximumPaths: tc.ibgp,
+			}}
+			r := &BGPConfigurationReconciler{Log: logf.Log, Recorder: record.NewFakeRecorder(64), NodeName: "node-1"}
+
+			err := r.reconcileGlobal(context.Background(), fake, cfg, logf.Log)
+			if tc.wantErrSubstr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.wantErrSubstr)
+				assert.Zero(t, fake.startBgp, "must not reach StartBgp with an invalid pair")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// inheritedBlocks must agree with peerConfigEqual about which blocks a peer group
+// owns. If they disagree, the status tells an operator a block was inherited while
+// the comparator still compares it, or the reverse.
+func TestInheritedBlocks(t *testing.T) {
+	r := &BGPConfigurationReconciler{}
+
+	t.Run("ungrouped neighbor inherits nothing", func(t *testing.T) {
+		d := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.0.0.1", PeerAsn: 64513,
+		}}, nil)
+		assert.Empty(t, inheritedBlocks(d))
+	})
+
+	t.Run("grouped neighbor stating nothing inherits every block", func(t *testing.T) {
+		d := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.0.0.2", PeerAsn: 64513, PeerGroup: "spines",
+		}}, nil)
+		assert.Equal(t, []string{
+			"afiSafis", "applyPolicy", "bfd", "gracefulRestart", "timers", "transport",
+		}, inheritedBlocks(d))
+	})
+
+	t.Run("a stated block is not reported as inherited", func(t *testing.T) {
+		d := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{
+			Config:   bgpv1.NeighborConfig{NeighborAddress: "10.0.0.3", PeerAsn: 64513, PeerGroup: "spines"},
+			Timers:   &bgpv1.Timers{Config: bgpv1.TimersConfig{HoldTime: 90}},
+			AfiSafis: []bgpv1.AfiSafi{{Family: "ipv4-unicast", Enabled: true}},
+			BFD:      &bgpv1.BFD{Enabled: ptrTo(true)},
+		}, nil)
+		got := inheritedBlocks(d)
+		assert.NotContains(t, got, "timers")
+		assert.NotContains(t, got, "afiSafis")
+		assert.NotContains(t, got, "bfd")
+		assert.Contains(t, got, "transport")
+	})
+
+	// The invariant: every block inheritedBlocks reports must be one peerConfigEqual
+	// skips, so status and comparator cannot disagree.
+	t.Run("agrees with peerConfigEqual's skip list", func(t *testing.T) {
+		bare := r.crdToAPINeighborWithPassword(&bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+			NeighborAddress: "10.0.0.4", PeerAsn: 64513, PeerGroup: "spines",
+		}}, nil)
+		// Current is the group's values folded in: blocks the member never stated.
+		current := proto.CloneOf(bare)
+		current.Timers = &gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 30, KeepaliveInterval: 10}}
+		current.Transport = &gobgpapi.Transport{PassiveMode: true}
+		current.GracefulRestart = &gobgpapi.GracefulRestart{Enabled: true, RestartTime: 120}
+		current.Bfd = &gobgpapi.BfdPeerConfig{Enabled: true}
+		current.AfiSafis = []*gobgpapi.AfiSafi{{Config: &gobgpapi.AfiSafiConfig{
+			Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST}, Enabled: true,
+		}}}
+		require.NotEmpty(t, inheritedBlocks(bare))
+		assert.True(t, peerConfigEqual(bare, current),
+			"every block reported as inherited must also be skipped by peerConfigEqual, "+
+				"or the status and the comparator disagree about who owns it")
+	})
+}
+
+func ptrTo[T any](v T) *T { return &v }

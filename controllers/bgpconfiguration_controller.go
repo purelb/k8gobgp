@@ -256,12 +256,15 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	if dc.PeerGroup == "" && dc.PeerAsn != cc.PeerAsn {
 		return false
 	}
-	// Description is compared only when the CR sets one, for the same reason as
-	// LocalAsn above: the converter sends nil for an unset description so the
-	// peer group can still supply one, and gobgpd echoes the resolved value.
-	// Comparing unconditionally would be "" against the group's description,
-	// permanently unequal for every grouped peer that does not set its own.
-	if dc.GetDescription() != "" && dc.GetDescription() != cc.GetDescription() {
+	// Description is compared only when the CR states one. The converter sends
+	// nil for an omitted description so the peer group can still supply it, and
+	// gobgpd echoes the resolved value - comparing that against nil would be
+	// permanently unequal for every grouped peer without its own.
+	//
+	// Presence, not emptiness: description is a *string in the CRD, so
+	// `description: ""` is a deliberate override of a group's value and must be
+	// compared. A GetDescription() != "" test would silently skip exactly that.
+	if dc.Description != nil && dc.GetDescription() != cc.GetDescription() {
 		return false
 	}
 	if dc.PeerGroup != cc.PeerGroup ||
@@ -315,6 +318,12 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	// Blocks a peer group can supply are skipped when this neighbor is in a group
 	// and its CR did not state the block.
 	//
+	// Written out per block rather than through a helper taking `any`: a typed nil
+	// pointer boxed into an interface is NOT == nil, so a
+	// `func(block any) bool { return block == nil }` version compiled, read
+	// correctly, and never skipped anything. It went unnoticed because the only
+	// block whose comparator does not already tolerate a nil desired is bfd.
+	//
 	// Presence is block-level on the gRPC path: our converters send nil for an
 	// omitted block, which is what lets the group's value apply, and ListPeer then
 	// reports the group's resolved value. Comparing that against nil would fail
@@ -323,34 +332,42 @@ func peerConfigEqual(desired, current *gobgpapi.Peer) bool {
 	//
 	// timersConfigEqual needs no such guard - it already tests each field on
 	// != 0, so an absent block compares equal - and afiSafisConfigEqual returns
-	// true for an empty desired list. bfd and gracefulRestart are not skippable
-	// because our PeerGroup CRD has no such blocks, so there is nothing to
-	// inherit and the comparison is always meaningful.
-	inherits := func(block any) bool {
-		return dc.GetPeerGroup() != "" && block == nil
-	}
-	if !inherits(desired.ApplyPolicy) && !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
+	// true for an empty desired list.
+	//
+	// Every block a peer group can state is in the skip: afiSafis, applyPolicy,
+	// timers, transport, gracefulRestart and bfd. Two earlier versions of this
+	// comment named a shorter list from a stale reading of the PeerGroup CRD, and
+	// each omission left grouped members churning on a block they had inherited.
+	// Re-derive it from api/v1/types.go rather than trusting this sentence.
+	grouped := dc.GetPeerGroup() != ""
+	if !(grouped && desired.ApplyPolicy == nil) && !applyPolicyEqual(desired.ApplyPolicy, current.ApplyPolicy) {
 		return false
 	}
 	if !timersConfigEqual(desired.Timers, current.Timers) {
 		return false
 	}
-	if !inherits(desired.Transport) && !transportConfigEqual(desired.Transport, current.Transport) {
+	if !(grouped && desired.Transport == nil) && !transportConfigEqual(desired.Transport, current.Transport) {
 		return false
 	}
-	if !gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
+	if !(grouped && desired.GracefulRestart == nil) &&
+		!gracefulRestartEqual(desired.GracefulRestart, current.GracefulRestart) {
 		return false
 	}
-	if !inherits(desired.RouteReflector) && !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
+	if !(grouped && desired.RouteReflector == nil) && !routeReflectorEqual(desired.RouteReflector, current.RouteReflector) {
 		return false
 	}
-	if !inherits(desired.EbgpMultihop) && !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
+	if !(grouped && desired.EbgpMultihop == nil) && !ebgpMultihopEqual(desired.EbgpMultihop, current.EbgpMultihop) {
 		return false
 	}
 	// defaulted: addNeighbor runs SetDefaultNeighborConfigValues, so ListPeer
 	// echoes a fully-populated BFD block for every peer - including peers that
 	// have no BFD at all, which is the case that churns if this is skipped.
-	if !bfdEqual(desired.Bfd, current.Bfd, true) {
+	//
+	// inherits() as well, because the PeerGroup CRD has a bfd block too: a member
+	// that omits bfd under a group that sets it reads the group's back, and
+	// comparing that against nil fails on every reconcile. Caught by
+	// TestRoundTripPeerGroupInheritance/group_sets_bfd,_member_omits_it.
+	if !(grouped && desired.Bfd == nil) && !bfdEqual(desired.Bfd, current.Bfd, true) {
 		return false
 	}
 	return true
@@ -599,6 +616,12 @@ func gracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
 	// gap, as timersConfigEqual's siblings: clearing restartTime to return to the
 	// default is not detected as a change.
 	if desired.GetRestartTime() != 0 && desired.GetRestartTime() != current.GetRestartTime() {
+		return false
+	}
+	// staleRoutesTime needs no guard: 0 disables the timer rather than asking for a
+	// default, so the daemon echoes it as sent. Measured against v1.3.5, including
+	// through peer-group inheritance.
+	if desired.GetStaleRoutesTime() != current.GetStaleRoutesTime() {
 		return false
 	}
 	return true
@@ -1141,6 +1164,10 @@ func (r *BGPConfigurationReconciler) reconcileDelete(ctx context.Context, bgpCon
 			DeleteRouterIDInfo(routerIDInfoLabels(bgpConfig, entry.routerID, entry.source, r.NodeName))
 			delete(r.localRouterIDCache, cacheKey)
 		}
+		// Same reasoning for the global drift series: SetGlobalRestartRequired
+		// sets 0 rather than deleting, so a departing CR would leave its series
+		// behind at whatever value it last held.
+		DeleteGlobalRestartRequired(bgpConfig.Name, bgpConfig.Namespace, globalDriftFields)
 
 		// Remove finalizer only after successful cleanup
 		controllerutil.RemoveFinalizer(bgpConfig, finalizerName)
@@ -1292,6 +1319,8 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		ListenAddresses:       bgpConfig.Spec.Global.ListenAddresses,
 		Families:              families,
 		UseMultiplePaths:      bgpConfig.Spec.Global.UseMultiplePaths,
+		EbgpMaximumPaths:      bgpConfig.Spec.Global.EbgpMaximumPaths,
+		IbgpMaximumPaths:      bgpConfig.Spec.Global.IbgpMaximumPaths,
 		RouteSelectionOptions: crdToAPIRouteSelectionOptions(bgpConfig.Spec.Global.RouteSelectionOptions),
 		// global.defaultRouteDistance is deliberately not sent: gobgp-netlink
 		// v1.3.5 deleted Global.default_route_distance because nothing in the
@@ -1300,6 +1329,18 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		Confederation:   crdToAPIConfederation(bgpConfig.Spec.Global.Confederation),
 		GracefulRestart: crdToAPIGracefulRestart(bgpConfig.Spec.Global.GracefulRestart),
 		BindToDevice:    bgpConfig.Spec.Global.BindToDevice,
+	}
+
+	// Checked before either StartBgp below, not after. gobgpd parses these with
+	// netip.ParseAddr and fails the whole StartBgp if one is bad, which surfaces as
+	// "BGP server not running" on every reconcile with the real cause buried in the
+	// daemon's error. The CRD pattern catches obvious nonsense; this catches the
+	// rest, and names the offending value.
+	if vErr := validateListenAddresses(bgpConfig.Spec.Global.ListenAddresses); vErr != nil {
+		return fmt.Errorf("global.listenAddresses: %w", vErr)
+	}
+	if vErr := validateMultipath(&bgpConfig.Spec.Global); vErr != nil {
+		return fmt.Errorf("global: %w", vErr)
 	}
 
 	current, err := apiClient.GetBgp(ctx, &gobgpapi.GetBgpRequest{})
@@ -1317,28 +1358,30 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 		return startErr
 	}
 
-	// BGP server already running - check whether the immutable fields still match.
+	// BGP server already running - check whether it matches the CR.
 	//
-	// Only ASN, RouterID and UseMultiplePaths are compared, because those are
-	// the only fields GetBgp echoes back. Measured against gobgpd v1.3.0 by
-	// sending a fully-populated Global and reading it back: families,
-	// routeSelectionOptions, defaultRouteDistance, confederation,
-	// gracefulRestart and bindToDevice are ACCEPTED and APPLIED but never
-	// reported. ListenPort and ListenAddresses are echoed but gobgpd defaults
-	// them ("0.0.0.0", "::"), so comparing those churns.
+	// gobgp-netlink v1.3.5 reports every Global field faithfully. Measured by
+	// sending a fully-populated Global and reading it back: asn, routerId,
+	// listenPort, listenAddresses, families, useMultiplePaths,
+	// routeSelectionOptions, confederation, gracefulRestart, bindToDevice,
+	// gracefulRestartInheritToNeighbors, ebgpMaximumPaths and ibgpMaximumPaths all
+	// come back as sent. An earlier version of this comment claimed only three
+	// echoed, which was true of v1.3.0 and is the reason drift went undetected.
 	//
-	// So drift in the write-only fields is undetectable here - the same
-	// limitation as netlink's dampeningInterval. Changing one takes effect on
-	// the next pod restart, silently. Unblocking that needs GetBgp to report
-	// them; see docs. Do NOT "fix" this by comparing them against the CR, which
-	// would compare a set value against a permanent zero and loop forever.
+	// Three fields are defaulted when not sent, measured on a minimal Global:
+	// listenAddresses becomes ["0.0.0.0", "::"], families becomes every supported
+	// family, and listenPort becomes 179. Those are guarded on "the CR stated
+	// something" for the usual reason - comparing an unset CR value against the
+	// daemon's default is permanently unequal. The message-typed fields come back
+	// as empty non-nil objects when unset, so the getters compare correctly.
+	//
 	// ASN and RouterID are the identity of the BGP speaker. gobgpd cannot change
 	// them on a running server, and continuing would reconcile neighbors against
 	// a speaker that is not the one the CR describes, so this stops.
-	if current.Global.Asn != desired.Asn || current.Global.RouterId != desired.RouterId {
+	if current.GetGlobal().GetAsn() != desired.Asn || current.GetGlobal().GetRouterId() != desired.RouterId {
 		log.Info("Global identity changed - pod restart required to apply",
-			"currentASN", current.Global.Asn, "desiredASN", desired.Asn,
-			"currentRouterID", current.Global.RouterId, "desiredRouterID", desired.RouterId)
+			"currentASN", current.GetGlobal().GetAsn(), "desiredASN", desired.Asn,
+			"currentRouterID", current.GetGlobal().GetRouterId(), "desiredRouterID", desired.RouterId)
 		return fmt.Errorf("global identity change detected (ASN or RouterID); pod restart required to apply")
 	}
 
@@ -1349,17 +1392,133 @@ func (r *BGPConfigurationReconciler) reconcileGlobal(ctx context.Context, apiCli
 	// until the pod happened to restart - which is how the first version of this
 	// behaved and is strictly worse than applying what can be applied.
 	//
-	// Only UseMultiplePaths is checked because it is the only one of them GetBgp
-	// echoes back; see the comment on the desired Global above.
-	if current.Global.UseMultiplePaths != desired.UseMultiplePaths {
-		log.Info("Global setting changed - takes effect on next pod restart",
-			"setting", "useMultiplePaths",
-			"current", current.Global.UseMultiplePaths,
-			"desired", desired.UseMultiplePaths)
-		r.Recorder.Event(bgpConfig, corev1.EventTypeWarning, "GlobalRestartRequired",
-			"global.useMultiplePaths changed; restart the k8gobgp pod on this node for it to take effect")
+	cg := current.GetGlobal()
+	drifted := map[string]bool{
+		"useMultiplePaths": cg.GetUseMultiplePaths() != desired.UseMultiplePaths,
+		"ebgpMaximumPaths": cg.GetEbgpMaximumPaths() != desired.EbgpMaximumPaths,
+		"ibgpMaximumPaths": cg.GetIbgpMaximumPaths() != desired.IbgpMaximumPaths,
+		"bindToDevice":     cg.GetBindToDevice() != desired.BindToDevice,
+		"routeSelectionOptions": !routeSelectionOptionsEqual(
+			desired.GetRouteSelectionOptions(), cg.GetRouteSelectionOptions()),
+		"confederation":   !confederationEqual(desired.GetConfederation(), cg.GetConfederation()),
+		"gracefulRestart": !globalGracefulRestartEqual(desired.GetGracefulRestart(), cg.GetGracefulRestart()),
+		// Guarded: the daemon defaults these when the CR states nothing.
+		"listenPort":      desired.ListenPort != 0 && cg.GetListenPort() != desired.ListenPort,
+		"listenAddresses": len(desired.ListenAddresses) > 0 && !slices.Equal(cg.GetListenAddresses(), desired.ListenAddresses),
+		"families":        len(desired.Families) > 0 && !slices.Equal(cg.GetFamilies(), desired.Families),
+	}
+	UpdateGlobalRestartRequired(bgpConfig, drifted, log, r.Recorder)
+	return nil
+}
+
+// globalDriftFields is every key UpdateGlobalRestartRequired can report, so the
+// series can be cleared on CR deletion without reconstructing the comparison.
+var globalDriftFields = []string{
+	"useMultiplePaths", "ebgpMaximumPaths", "ibgpMaximumPaths", "bindToDevice",
+	"routeSelectionOptions", "confederation", "gracefulRestart", "listenPort",
+	"listenAddresses", "families",
+}
+
+// UpdateGlobalRestartRequired records secondary global drift and says so once.
+//
+// Secondary drift does NOT abort the reconcile. Returning an error here would
+// stop before neighbors, peer groups and policies are reconciled, so one change
+// to a secondary global setting would freeze all other configuration on the node
+// until the pod happened to restart - which is how the first version of this
+// behaved and is strictly worse than applying what can be applied.
+func UpdateGlobalRestartRequired(bgpConfig *bgpv1.BGPConfiguration, drifted map[string]bool, log logr.Logger, rec record.EventRecorder) {
+	SetGlobalRestartRequired(bgpConfig.Name, bgpConfig.Namespace, drifted)
+
+	var fields []string
+	for _, f := range globalDriftFields {
+		if drifted[f] {
+			fields = append(fields, f)
+		}
+	}
+	if len(fields) == 0 {
+		return
+	}
+	slices.Sort(fields)
+	log.Info("Global settings changed - take effect on next pod restart", "settings", fields)
+	if rec == nil {
+		return
+	}
+	rec.Eventf(bgpConfig, corev1.EventTypeWarning, "GlobalRestartRequired",
+		"These global settings differ from the running gobgpd and need a pod restart on this node to apply: %s",
+		strings.Join(fields, ", "))
+}
+
+// validateListenAddresses rejects a listen address gobgpd would reject.
+//
+// netip.ParseAddr, matching the daemon, rather than net.ParseIP: the two disagree
+// on enough inputs that validating with one and running the other is how a value
+// passes here and fails at StartBgp. net.ParseIP also accepts a CIDR-looking
+// string's address half in some forms, and a listen address is not a prefix.
+func validateListenAddresses(addrs []string) error {
+	for _, a := range addrs {
+		if a == "" {
+			return fmt.Errorf("empty address")
+		}
+		if _, err := netip.ParseAddr(a); err != nil {
+			return fmt.Errorf("%q is not a valid IP address: %w", a, err)
+		}
 	}
 	return nil
+}
+
+// validateMultipath enforces the pair rule gobgp-netlink v1.3.5 enforces, before
+// the daemon does.
+//
+// The daemon refuses both halves: multipath enabled with no limit selects only the
+// single best path, and a limit without multipath is accepted, reported back, and
+// does nothing. Its errors name the OpenConfig paths, so this reports the CRD
+// fields instead.
+//
+// This matters more than a nicer message. The failure is at StartBgp, which means
+// gobgpd does not start at all - so a CR with useMultiplePaths and no limit takes
+// the node's BGP down entirely rather than degrading. Until ebgpMaximumPaths and
+// ibgpMaximumPaths existed here there was no way to satisfy the rule, which made
+// global.useMultiplePaths unusable on v1.3.5.
+func validateMultipath(g *bgpv1.GlobalSpec) error {
+	hasLimit := g.EbgpMaximumPaths != 0 || g.IbgpMaximumPaths != 0
+	if g.UseMultiplePaths && !hasLimit {
+		return fmt.Errorf("useMultiplePaths is enabled but neither ebgpMaximumPaths nor " +
+			"ibgpMaximumPaths is set; set at least one, or multipath selects only the single best path")
+	}
+	if !g.UseMultiplePaths && hasLimit {
+		return fmt.Errorf("ebgpMaximumPaths or ibgpMaximumPaths is set but useMultiplePaths is not " +
+			"enabled; enable it, or remove the limit")
+	}
+	return nil
+}
+
+// routeSelectionOptionsEqual compares the four fields that survived v1.3.5.
+// advertiseInactiveRoutes, enableAigp and ignoreNextHopIgpMetric were deleted
+// from the API because nothing implemented them, so there is nothing to compare.
+func routeSelectionOptionsEqual(desired, current *gobgpapi.RouteSelectionOptionsConfig) bool {
+	return desired.GetAlwaysCompareMed() == current.GetAlwaysCompareMed() &&
+		desired.GetIgnoreAsPathLength() == current.GetIgnoreAsPathLength() &&
+		desired.GetExternalCompareRouterId() == current.GetExternalCompareRouterId() &&
+		desired.GetDisableBestPathSelection() == current.GetDisableBestPathSelection()
+}
+
+func confederationEqual(desired, current *gobgpapi.Confederation) bool {
+	return desired.GetEnabled() == current.GetEnabled() &&
+		desired.GetIdentifier() == current.GetIdentifier() &&
+		slices.Equal(desired.GetMemberAsList(), current.GetMemberAsList())
+}
+
+// globalGracefulRestartEqual compares the global graceful-restart block.
+//
+// Named to distinguish it from gracefulRestartEqual, which compares a peer's -
+// a different message with different defaulting. This one needs no restartTime
+// guard: the daemon echoes the global block as sent rather than defaulting it
+// from a hold time, measured against v1.3.5.
+func globalGracefulRestartEqual(desired, current *gobgpapi.GracefulRestart) bool {
+	return desired.GetEnabled() == current.GetEnabled() &&
+		desired.GetRestartTime() == current.GetRestartTime() &&
+		desired.GetStaleRoutesTime() == current.GetStaleRoutesTime() &&
+		desired.GetDeferralTime() == current.GetDeferralTime()
 }
 
 // resolveEffectiveRouterID resolves the router ID, respecting immutability.
@@ -1765,12 +1924,17 @@ func (r *BGPConfigurationReconciler) reconcilePeerGroups(ctx context.Context, ap
 			}
 		}
 
-		// Resolve auth password from Secret or inline value
-		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
+		// Resolve auth password from Secret or inline value.
+		//
+		// A peer group is only ever a source of values and never inherits, so
+		// api.PeerGroupConf carries no explicit presence and the CRD field stays a
+		// plain string. The resolver is shared with the neighbor path, which does
+		// need presence, so adapt at the boundary rather than forking it.
+		authPassword, err := r.resolveAuthPassword(ctx, bgpConfig.Namespace, &pg.Config.AuthPassword, pg.Config.AuthPasswordSecretRef, log)
 		if err != nil {
 			return nil, fmt.Errorf("peer group %q: %w", pg.Config.PeerGroupName, err)
 		}
-		desiredPeerGroups[pg.Config.PeerGroupName] = r.crdToAPIPeerGroupWithPassword(&pg, authPassword)
+		desiredPeerGroups[pg.Config.PeerGroupName] = r.crdToAPIPeerGroupWithPassword(&pg, ptrDeref(authPassword))
 	}
 
 	// 3. Delete unwanted peer groups
@@ -1828,6 +1992,7 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 
 	// 2. Get desired neighbors (with nodeSelector filtering and password resolution)
 	desiredNeighbors := make(map[string]*gobgpapi.Peer)
+	inherited := make(map[string][]string)
 	for _, n := range bgpConfig.Spec.Neighbors {
 		key := neighborKeyFromCRD(&n.Config)
 
@@ -1860,7 +2025,11 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 		if err != nil {
 			return fmt.Errorf("neighbor %q: %w", key, err)
 		}
-		desiredNeighbors[key] = r.crdToAPINeighborWithPassword(&n, authPassword)
+		desired := r.crdToAPINeighborWithPassword(&n, authPassword)
+		desiredNeighbors[key] = desired
+		if blocks := inheritedBlocks(desired); len(blocks) > 0 {
+			inherited[key] = blocks
+		}
 	}
 
 	// Emit warning if all neighbors were filtered out by nodeSelector
@@ -1924,6 +2093,13 @@ func (r *BGPConfigurationReconciler) reconcileNeighbors(ctx context.Context, api
 				}
 			}
 		}
+	}
+
+	// Hand the reporter what only this function knows. Set unconditionally, so a
+	// neighbor that stops inheriting - or leaves its group - loses its entry rather
+	// than keeping a stale one.
+	if r.NodeStatusReporter != nil {
+		r.NodeStatusReporter.UpdateInheritedBlocks(inherited)
 	}
 	return nil
 }
@@ -2009,6 +2185,13 @@ func (r *BGPConfigurationReconciler) reportInertFields(bgpConfig *bgpv1.BGPConfi
 // grouped peer whose only owned field is its password nothing else would ever
 // trigger a correction.
 func (r *BGPConfigurationReconciler) authPasswordDrifted(bgpConfig *bgpv1.BGPConfiguration, key string, desired, current *gobgpapi.Peer, log logr.Logger) bool {
+	// Nil means the CR stated nothing, so the peer group's password - if any -
+	// applies and there is nothing here to compare against. A non-nil empty string
+	// is different: it is a deliberate opt-out, and the daemon should report no
+	// password set.
+	if desired.GetConf().AuthPassword == nil {
+		return false
+	}
 	want := desired.GetConf().GetAuthPassword() != ""
 	have := current.GetState().GetAuthPasswordSet()
 	if want == have {
@@ -2023,6 +2206,43 @@ func (r *BGPConfigurationReconciler) authPasswordDrifted(bgpConfig *bgpv1.BGPCon
 		"Neighbor %s: CR specifies TCP-MD5 authentication=%t but gobgpd reports %t; re-sending the configuration.",
 		key, want, have)
 	return true
+}
+
+// inheritedBlocks names the blocks this neighbor will take from its peer group.
+//
+// Derived from what the CR stated, which is the only place that knows: ListPeer
+// reports the resolved configuration, so a value the neighbor set and one it
+// inherited are indistinguishable there. Exactly the predicate peerConfigEqual uses
+// to decide what not to compare, so the two cannot disagree about which blocks a
+// group owns.
+//
+// Kept in sync with the skip list in peerConfigEqual. Re-derive both from the
+// PeerGroup type in api/v1/types.go rather than from either comment.
+func inheritedBlocks(desired *gobgpapi.Peer) []string {
+	if desired.GetConf().GetPeerGroup() == "" {
+		return nil
+	}
+	var blocks []string
+	if len(desired.GetAfiSafis()) == 0 {
+		blocks = append(blocks, "afiSafis")
+	}
+	if desired.ApplyPolicy == nil {
+		blocks = append(blocks, "applyPolicy")
+	}
+	if desired.Timers == nil {
+		blocks = append(blocks, "timers")
+	}
+	if desired.Transport == nil {
+		blocks = append(blocks, "transport")
+	}
+	if desired.GracefulRestart == nil {
+		blocks = append(blocks, "gracefulRestart")
+	}
+	if desired.Bfd == nil {
+		blocks = append(blocks, "bfd")
+	}
+	slices.Sort(blocks)
+	return blocks
 }
 
 // reportPeerAsnOverridden says so when a peer group has discarded a grouped
@@ -2668,16 +2888,17 @@ func (r *BGPConfigurationReconciler) crdToAPIPeerGroupWithPassword(crd *bgpv1.Pe
 			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
-		AfiSafis:    crdToAPIAfiSafis(crd.AfiSafis),
-		ApplyPolicy: crdToAPIApplyPolicy(crd.ApplyPolicy),
-		Timers:      crdToAPITimers(crd.Timers),
-		Transport:   crdToAPITransport(crd.Transport),
-		Bfd:         crdToAPIBfd(crd.BFD),
+		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
+		ApplyPolicy:     crdToAPIApplyPolicy(crd.ApplyPolicy),
+		Timers:          crdToAPITimers(crd.Timers),
+		Transport:       crdToAPITransport(crd.Transport),
+		GracefulRestart: crdToAPIGracefulRestart(crd.GracefulRestart),
+		Bfd:             crdToAPIBfd(crd.BFD),
 	}
 }
 
 // crdToAPINeighborWithPassword converts a CRD Neighbor to API Peer with resolved password
-func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Neighbor, authPassword string) *gobgpapi.Peer {
+func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Neighbor, authPassword *string) *gobgpapi.Peer {
 	return &gobgpapi.Peer{
 		Conf: &gobgpapi.PeerConf{
 			NeighborAddress:   crd.Config.NeighborAddress,
@@ -2692,14 +2913,19 @@ func (r *BGPConfigurationReconciler) crdToAPINeighborWithPassword(crd *bgpv1.Nei
 			// AllowOwnAsn, ReplacePeerAsn and AllowAspathLoopLocal share one
 			// block-level presence guard on the daemon side, so stating any one
 			// of them claims all three and the other two stop inheriting.
+			// Passed straight through: these CRD fields are pointers, so the CR
+			// itself carries the presence the daemon reads. Omitted means nil
+			// means inherit; stated - including stated as the zero value - claims
+			// the field. localAsn stays a zero test because 0 already means "use
+			// the global ASN", so unset and explicit zero are the same request.
 			LocalAsn:             ptrIfSet(crd.Config.LocalAsn),
-			Description:          ptrIfSet(crd.Config.Description),
-			AuthPassword:         ptrIfSet(authPassword),
-			AllowOwnAsn:          ptrIfSet(crd.Config.AllowOwnAsn),
-			ReplacePeerAsn:       ptrIfSet(crd.Config.ReplacePeerAsn),
-			AllowAspathLoopLocal: ptrIfSet(crd.Config.AllowAspathLoopLocal),
+			Description:          crd.Config.Description,
+			AuthPassword:         authPassword,
+			AllowOwnAsn:          crd.Config.AllowOwnAsn,
+			ReplacePeerAsn:       crd.Config.ReplacePeerAsn,
+			AllowAspathLoopLocal: crd.Config.AllowAspathLoopLocal,
 			RemovePrivate:        crdToAPIRemovePrivatePtr(crd.Config.RemovePrivate),
-			SendSoftwareVersion:  ptrIfSet(crd.Config.SendSoftwareVersion),
+			SendSoftwareVersion:  crd.Config.SendSoftwareVersion,
 			SendCommunity:        crdToAPISendCommunity(crd.Config.SendCommunity),
 		},
 		AfiSafis:        crdToAPIAfiSafis(crd.AfiSafis),
@@ -2803,7 +3029,14 @@ func bfdEqual(desired, current *gobgpapi.BfdPeerConfig, defaulted bool) bool {
 
 // resolveAuthPassword resolves the authentication password from either inline value or Secret reference.
 // Returns an error if a SecretRef is specified but the Secret or key cannot be found.
-func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, namespace string, authPassword string, secretRef *corev1.SecretKeySelector, log logr.Logger) (string, error) {
+// resolveAuthPassword returns the password to send, or nil when the CR states
+// none.
+//
+// The nil is load-bearing: api.PeerConf.auth_password carries explicit presence,
+// so nil lets a peer group supply the password while a non-nil empty string is an
+// explicit opt-out from it. A plain "" could not express that difference, which is
+// why authPassword became a *string in the CRD.
+func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, namespace string, authPassword *string, secretRef *corev1.SecretKeySelector, log logr.Logger) (*string, error) {
 	// If SecretRef is specified, prefer it over inline password
 	if secretRef != nil && secretRef.Name != "" {
 		secret := &corev1.Secret{}
@@ -2812,14 +3045,16 @@ func (r *BGPConfigurationReconciler) resolveAuthPassword(ctx context.Context, na
 			Name:      secretRef.Name,
 		}
 		if err := r.Get(ctx, secretName, secret); err != nil {
-			return "", fmt.Errorf("failed to get Secret %q for auth password: %w", secretRef.Name, err)
+			return nil, fmt.Errorf("failed to get Secret %q for auth password: %w", secretRef.Name, err)
 		}
 		if password, ok := secret.Data[secretRef.Key]; ok {
-			return string(password), nil
+			p := string(password)
+			return &p, nil
 		}
-		return "", fmt.Errorf("key %q not found in Secret %q", secretRef.Key, secretRef.Name)
+		return nil, fmt.Errorf("key %q not found in Secret %q", secretRef.Key, secretRef.Name)
 	}
-	// Fall back to inline password (deprecated)
+	// Fall back to inline password (deprecated). Passed through as-is, nil
+	// included, so "stated nothing" stays distinguishable from "stated empty".
 	return authPassword, nil
 }
 
@@ -2993,9 +3228,10 @@ func crdToAPIGracefulRestart(crd *bgpv1.GracefulRestart) *gobgpapi.GracefulResta
 		return nil
 	}
 	return &gobgpapi.GracefulRestart{
-		Enabled:     crd.Enabled,
-		RestartTime: crd.RestartTime,
-		HelperOnly:  crd.HelperOnly,
+		Enabled:         crd.Enabled,
+		RestartTime:     crd.RestartTime,
+		StaleRoutesTime: crd.StaleRoutesTime,
+		HelperOnly:      crd.HelperOnly,
 	}
 }
 
@@ -3168,6 +3404,16 @@ func ptrIfSet[T comparable](v T) *T {
 		return nil
 	}
 	return &v
+}
+
+// ptrDeref returns *p, or the zero value when p is nil. The inverse of ptrIfSet,
+// for the paths that genuinely have no presence to carry.
+func ptrDeref[T any](p *T) T {
+	if p == nil {
+		var zero T
+		return zero
+	}
+	return *p
 }
 
 // crdToAPIRemovePrivatePtr is the api.PeerConf form of crdToAPIRemovePrivate.

@@ -154,6 +154,13 @@ spec:
                         format: int32
                         type: integer
                     type: object
+                  ebgpMaximumPaths:
+                    description: |-
+                      EbgpMaximumPaths caps how many eBGP paths the multipath set may hold for one
+                      prefix. Requires useMultiplePaths.
+                    format: int32
+                    maximum: 255
+                    type: integer
                   families:
                     description: |-
                       Families is the global address-family set. Omit it to keep gobgpd's
@@ -182,12 +189,56 @@ spec:
                       helperOnly:
                         type: boolean
                       restartTime:
+                        description: |-
+                          RestartTime is how long a peer should hold this speaker's routes while it
+                          restarts, in seconds. Omit it to take gobgpd's default, which is the
+                          session's hold time.
+
+                          Bounded at 4095 because RFC 4724 section 3 gives Restart Time 12 bits,
+                          sharing a 16-bit word with a 4-bit flags nibble. A larger value does not
+                          fail - it silently overflows into the flags and corrupts the capability, so
+                          this is not a Go type limit and 65535 would be the wrong bound.
+                        format: int32
+                        maximum: 4095
+                        type: integer
+                      staleRoutesTime:
+                        description: |-
+                          StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+                          marked stale before purging them, in seconds. 0 disables the timer, which is
+                          gobgpd's default.
+
+                          Only families that have not sent End-of-RIB are purged when it fires, so a
+                          family that finished its refresh keeps its adj-RIB-in - checked in
+                          staleRoutesExpiredFunc.
                         format: int32
                         type: integer
                     type: object
+                  ibgpMaximumPaths:
+                    description: |-
+                      IbgpMaximumPaths caps how many iBGP paths the multipath set may hold for one
+                      prefix. Requires useMultiplePaths.
+                    format: int32
+                    maximum: 255
+                    type: integer
                   listenAddresses:
+                    description: |-
+                      ListenAddresses are the local addresses gobgpd accepts BGP connections on.
+                      Omit it to take gobgpd's default, which is every interface ("0.0.0.0" and
+                      "::").
+
+                      The pattern rejects obvious nonsense early, with a message that names the
+                      field. It is deliberately not a complete IP grammar - the authoritative
+                      check is netip.ParseAddr in the controller, which is what gobgpd itself
+                      uses, so a value that passes here and fails there is reported before
+                      StartBgp rather than after.
+
+                      CEL isIP() would be stricter but needs apiserver 1.31+, and a CEL rule that
+                      cannot compile makes the whole CRD unapplyable rather than degrading.
                     items:
+                      maxLength: 45
+                      pattern: ^[0-9a-fA-F:.]+(%[0-9a-zA-Z._-]+)?$
                       type: string
+                    maxItems: 16
                     type: array
                   listenPort:
                     format: int32
@@ -265,6 +316,15 @@ spec:
                       Default: "10.255.0.0/16"
                     type: string
                   useMultiplePaths:
+                    description: |-
+                      UseMultiplePaths installs more than one path per prefix, so the multipath
+                      set can be exported to the kernel as ECMP.
+
+                      It requires at least one of ebgpMaximumPaths or ibgpMaximumPaths, and they
+                      require it: gobgp-netlink v1.3.5 refuses both halves of that pair, because a
+                      limit without multipath was accepted, reported back, and did nothing, while
+                      multipath without a limit selects only the single best path. Both are checked
+                      here before StartBgp so the error names the CRD fields.
                     type: boolean
                 required:
                 - asn
@@ -424,10 +484,12 @@ spec:
 
                         Two consequences worth knowing:
 
-                          - A member cannot override a group's true with an explicit false, or opt out
-                            of a group's authPassword, because these are plain fields and the API
-                            server cannot distinguish "unset" from "set to the zero value". Omit the
-                            setting from the group instead, or do not put the neighbor in the group.
+                          - A member CAN override a group's value with a zero one. description,
+                            authPassword, allowOwnAsn, replacePeerAsn, allowAspathLoopLocal and
+                            sendSoftwareVersion carry explicit presence, so `authPassword: ""` opts a
+                            member out of its group's TCP-MD5 password and `replacePeerAsn: false`
+                            overrides a group that sets it true. Omitting the field inherits; setting
+                            it - to anything, including the zero value - claims it.
 
                           - allowOwnAsn, replacePeerAsn and allowAspathLoopLocal share one presence
                             signal in gobgpd. Stating any one of them claims all three, so the other
@@ -579,6 +641,27 @@ spec:
                         helperOnly:
                           type: boolean
                         restartTime:
+                          description: |-
+                            RestartTime is how long a peer should hold this speaker's routes while it
+                            restarts, in seconds. Omit it to take gobgpd's default, which is the
+                            session's hold time.
+
+                            Bounded at 4095 because RFC 4724 section 3 gives Restart Time 12 bits,
+                            sharing a 16-bit word with a 4-bit flags nibble. A larger value does not
+                            fail - it silently overflows into the flags and corrupts the capability, so
+                            this is not a Go type limit and 65535 would be the wrong bound.
+                          format: int32
+                          maximum: 4095
+                          type: integer
+                        staleRoutesTime:
+                          description: |-
+                            StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+                            marked stale before purging them, in seconds. 0 disables the timer, which is
+                            gobgpd's default.
+
+                            Only families that have not sent End-of-RIB are purged when it fires, so a
+                            family that finished its refresh keeps its adj-RIB-in - checked in
+                            staleRoutesExpiredFunc.
                           format: int32
                           type: integer
                       type: object
@@ -1028,6 +1111,45 @@ spec:
                           type: boolean
                       required:
                       - peerGroupName
+                      type: object
+                    gracefulRestart:
+                      description: |-
+                        GracefulRestart applies to every member that does not state its own.
+
+                        Editing it reaches members already in the group, verified against
+                        gobgp-netlink v1.3.5: a member picked up restartTime 120 -> 240 from a
+                        group edit. That was not true before v1.3.5, where
+                        SetDefaultNeighborConfigValues returned early once a member had resolved,
+                        so a group edit silently applied to new members only.
+                      properties:
+                        enabled:
+                          type: boolean
+                        helperOnly:
+                          type: boolean
+                        restartTime:
+                          description: |-
+                            RestartTime is how long a peer should hold this speaker's routes while it
+                            restarts, in seconds. Omit it to take gobgpd's default, which is the
+                            session's hold time.
+
+                            Bounded at 4095 because RFC 4724 section 3 gives Restart Time 12 bits,
+                            sharing a 16-bit word with a 4-bit flags nibble. A larger value does not
+                            fail - it silently overflows into the flags and corrupts the capability, so
+                            this is not a Go type limit and 65535 would be the wrong bound.
+                          format: int32
+                          maximum: 4095
+                          type: integer
+                        staleRoutesTime:
+                          description: |-
+                            StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+                            marked stale before purging them, in seconds. 0 disables the timer, which is
+                            gobgpd's default.
+
+                            Only families that have not sent End-of-RIB are purged when it fires, so a
+                            family that finished its refresh keeps its adj-RIB-in - checked in
+                            staleRoutesExpiredFunc.
+                          format: int32
+                          type: integer
                       type: object
                     nodeSelector:
                       description: |-

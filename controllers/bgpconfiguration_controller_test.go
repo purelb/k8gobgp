@@ -341,12 +341,16 @@ func TestResolveAuthPassword(t *testing.T) {
 				Scheme: scheme,
 			}
 
-			result, err := r.resolveAuthPassword(context.Background(), tt.namespace, tt.inlinePassword, tt.secretRef, r.Log)
+			result, err := r.resolveAuthPassword(context.Background(), tt.namespace, proto.String(tt.inlinePassword), tt.secretRef, r.Log)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
 				assert.NoError(t, err)
-				assert.Equal(t, tt.expected, result)
+				// The resolver returns a pointer so an explicitly empty password
+				// stays distinguishable from an absent one. Every case here passes
+				// a non-nil inline value, so a non-nil result is expected.
+				require.NotNil(t, result)
+				assert.Equal(t, tt.expected, *result)
 			}
 		})
 	}
@@ -569,14 +573,14 @@ func TestCrdToAPINeighborWithPassword(t *testing.T) {
 		Config: bgpv1.NeighborConfig{
 			NeighborAddress: "192.168.1.254",
 			PeerAsn:         64513,
-			Description:     "Test peer",
+			Description:     proto.String("Test peer"),
 		},
 		AfiSafis: []bgpv1.AfiSafi{
 			{Family: "ipv4-unicast", Enabled: true},
 		},
 	}
 
-	result := r.crdToAPINeighborWithPassword(neighbor, "test-password")
+	result := r.crdToAPINeighborWithPassword(neighbor, proto.String("test-password"))
 
 	assert.Equal(t, "192.168.1.254", result.Conf.NeighborAddress)
 	assert.Equal(t, uint32(64513), result.Conf.PeerAsn)
@@ -607,7 +611,7 @@ func TestCrdToAPINeighborSendsNilForUnstatedFields(t *testing.T) {
 		PeerAsn:         64513,
 		PeerGroup:       "spines",
 	}}
-	conf := r.crdToAPINeighborWithPassword(bare, "").GetConf()
+	conf := r.crdToAPINeighborWithPassword(bare, nil).GetConf()
 	assert.Nil(t, conf.Description, "unstated description must inherit")
 	assert.Nil(t, conf.LocalAsn, "unstated localAsn must inherit")
 	assert.Nil(t, conf.AuthPassword, "unresolved password must inherit")
@@ -623,16 +627,16 @@ func TestCrdToAPINeighborSendsNilForUnstatedFields(t *testing.T) {
 		NeighborAddress:      "10.0.0.2",
 		PeerAsn:              64513,
 		PeerGroup:            "spines",
-		Description:          "spine-1",
+		Description:          proto.String("spine-1"),
 		LocalAsn:             64512,
-		AllowOwnAsn:          2,
-		ReplacePeerAsn:       true,
-		AllowAspathLoopLocal: true,
+		AllowOwnAsn:          proto.Uint32(2),
+		ReplacePeerAsn:       proto.Bool(true),
+		AllowAspathLoopLocal: proto.Bool(true),
 		RemovePrivate:        "all",
-		SendSoftwareVersion:  true,
+		SendSoftwareVersion:  proto.Bool(true),
 		SendCommunity:        "standard",
 	}}
-	conf = r.crdToAPINeighborWithPassword(stated, "pw").GetConf()
+	conf = r.crdToAPINeighborWithPassword(stated, proto.String("pw")).GetConf()
 	assert.Equal(t, "spine-1", conf.GetDescription())
 	assert.Equal(t, uint32(64512), conf.GetLocalAsn())
 	assert.Equal(t, "pw", conf.GetAuthPassword())

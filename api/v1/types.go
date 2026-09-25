@@ -116,8 +116,24 @@ type GlobalSpec struct {
 	// Must be at least /24 (256 addresses). Each cluster should use a unique pool.
 	// Default: "10.255.0.0/16"
 	// +optional
-	RouterIDPool    string   `json:"routerIDPool,omitempty"`
-	ListenPort      int32    `json:"listenPort,omitempty"`
+	RouterIDPool string `json:"routerIDPool,omitempty"`
+	ListenPort   int32  `json:"listenPort,omitempty"`
+	// ListenAddresses are the local addresses gobgpd accepts BGP connections on.
+	// Omit it to take gobgpd's default, which is every interface ("0.0.0.0" and
+	// "::").
+	//
+	// The pattern rejects obvious nonsense early, with a message that names the
+	// field. It is deliberately not a complete IP grammar - the authoritative
+	// check is netip.ParseAddr in the controller, which is what gobgpd itself
+	// uses, so a value that passes here and fails there is reported before
+	// StartBgp rather than after.
+	//
+	// CEL isIP() would be stricter but needs apiserver 1.31+, and a CEL rule that
+	// cannot compile makes the whole CRD unapplyable rather than degrading.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:items:MaxLength=45
+	// +kubebuilder:validation:items:Pattern=`^[0-9a-fA-F:.]+(%[0-9a-zA-Z._-]+)?$`
+	// +optional
 	ListenAddresses []string `json:"listenAddresses,omitempty"`
 	// Families is the global address-family set. Omit it to keep gobgpd's
 	// default of ipv4-unicast and ipv6-unicast.
@@ -128,8 +144,26 @@ type GlobalSpec struct {
 	// +kubebuilder:validation:items:Enum=ipv4-unicast;ipv6-unicast;ipv4-labeled;ipv6-labeled;ipv4-vpn;ipv6-vpn;l2vpn-vpls;l2vpn-evpn
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
-	Families              []string               `json:"families,omitempty"`
-	UseMultiplePaths      bool                   `json:"useMultiplePaths,omitempty"`
+	Families []string `json:"families,omitempty"`
+	// UseMultiplePaths installs more than one path per prefix, so the multipath
+	// set can be exported to the kernel as ECMP.
+	//
+	// It requires at least one of ebgpMaximumPaths or ibgpMaximumPaths, and they
+	// require it: gobgp-netlink v1.3.5 refuses both halves of that pair, because a
+	// limit without multipath was accepted, reported back, and did nothing, while
+	// multipath without a limit selects only the single best path. Both are checked
+	// here before StartBgp so the error names the CRD fields.
+	UseMultiplePaths bool `json:"useMultiplePaths,omitempty"`
+	// EbgpMaximumPaths caps how many eBGP paths the multipath set may hold for one
+	// prefix. Requires useMultiplePaths.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	EbgpMaximumPaths uint32 `json:"ebgpMaximumPaths,omitempty"`
+	// IbgpMaximumPaths caps how many iBGP paths the multipath set may hold for one
+	// prefix. Requires useMultiplePaths.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	IbgpMaximumPaths      uint32                 `json:"ibgpMaximumPaths,omitempty"`
 	RouteSelectionOptions *RouteSelectionOptions `json:"routeSelectionOptions,omitempty"`
 	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
 	// because nothing in the daemon implemented it. Accepted here so existing
@@ -247,6 +281,15 @@ type PeerGroup struct {
 	ApplyPolicy  *ApplyPolicy          `json:"applyPolicy,omitempty"`
 	Timers       *Timers               `json:"timers,omitempty"`
 	Transport    *Transport            `json:"transport,omitempty"`
+	// GracefulRestart applies to every member that does not state its own.
+	//
+	// Editing it reaches members already in the group, verified against
+	// gobgp-netlink v1.3.5: a member picked up restartTime 120 -> 240 from a
+	// group edit. That was not true before v1.3.5, where
+	// SetDefaultNeighborConfigValues returned early once a member had resolved,
+	// so a group edit silently applied to new members only.
+	// +optional
+	GracefulRestart *GracefulRestart `json:"gracefulRestart,omitempty"`
 	// BFD applies to every member that does not specify its own.
 	// +optional
 	BFD *BFD `json:"bfd,omitempty"`
@@ -263,10 +306,12 @@ type PeerGroup struct {
 //
 // Two consequences worth knowing:
 //
-//   - A member cannot override a group's true with an explicit false, or opt out
-//     of a group's authPassword, because these are plain fields and the API
-//     server cannot distinguish "unset" from "set to the zero value". Omit the
-//     setting from the group instead, or do not put the neighbor in the group.
+//   - A member CAN override a group's value with a zero one. description,
+//     authPassword, allowOwnAsn, replacePeerAsn, allowAspathLoopLocal and
+//     sendSoftwareVersion carry explicit presence, so `authPassword: ""` opts a
+//     member out of its group's TCP-MD5 password and `replacePeerAsn: false`
+//     overrides a group that sets it true. Omitting the field inherits; setting
+//     it - to anything, including the zero value - claims it.
 //
 //   - allowOwnAsn, replacePeerAsn and allowAspathLoopLocal share one presence
 //     signal in gobgpd. Stating any one of them claims all three, so the other
@@ -281,12 +326,12 @@ type PeerGroup struct {
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
 	// +optional
-	AuthPassword string `json:"authPassword,omitempty"`
+	AuthPassword *string `json:"authPassword,omitempty"`
 	// AuthPasswordSecretRef references a Secret containing the BGP authentication password
 	// The Secret must contain a key matching the neighbor address or a default key "password"
 	// +optional
 	AuthPasswordSecretRef *corev1.SecretKeySelector `json:"authPasswordSecretRef,omitempty"`
-	Description           string                    `json:"description,omitempty"`
+	Description           *string                   `json:"description,omitempty"`
 	LocalAsn              uint32                    `json:"localAsn,omitempty"`
 	// NeighborAddress is the peer's IP address. For a link-local IPv6 peer,
 	// include the scope zone: fe80::1%eth0.
@@ -314,13 +359,13 @@ type NeighborConfig struct {
 	// truncate to 0 - the opposite of what was asked for.
 	// +kubebuilder:validation:Maximum=255
 	// +optional
-	AllowOwnAsn uint32 `json:"allowOwnAsn,omitempty"`
+	AllowOwnAsn *uint32 `json:"allowOwnAsn,omitempty"`
 	// ReplacePeerAsn rewrites the peer's ASN with ours in advertised AS paths.
 	// +optional
-	ReplacePeerAsn bool `json:"replacePeerAsn,omitempty"`
+	ReplacePeerAsn *bool `json:"replacePeerAsn,omitempty"`
 	// AllowAspathLoopLocal permits a local AS-path loop.
 	// +optional
-	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
+	AllowAspathLoopLocal *bool `json:"allowAspathLoopLocal,omitempty"`
 	// SendCommunity filters which community attributes are advertised to this
 	// peer, applied AFTER the export policy - so a policy that adds a community
 	// cannot walk past it.
@@ -353,7 +398,7 @@ type NeighborConfig struct {
 	RouteFlapDamping bool `json:"routeFlapDamping,omitempty"`
 	// SendSoftwareVersion advertises the software-version capability (RFC 9384).
 	// +optional
-	SendSoftwareVersion bool `json:"sendSoftwareVersion,omitempty"`
+	SendSoftwareVersion *bool `json:"sendSoftwareVersion,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -486,9 +531,28 @@ type Transport struct {
 
 // +kubebuilder:object:generate=true
 type GracefulRestart struct {
-	Enabled     bool   `json:"enabled,omitempty"`
+	Enabled bool `json:"enabled,omitempty"`
+	// RestartTime is how long a peer should hold this speaker's routes while it
+	// restarts, in seconds. Omit it to take gobgpd's default, which is the
+	// session's hold time.
+	//
+	// Bounded at 4095 because RFC 4724 section 3 gives Restart Time 12 bits,
+	// sharing a 16-bit word with a 4-bit flags nibble. A larger value does not
+	// fail - it silently overflows into the flags and corrupts the capability, so
+	// this is not a Go type limit and 65535 would be the wrong bound.
+	// +kubebuilder:validation:Maximum=4095
+	// +optional
 	RestartTime uint32 `json:"restartTime,omitempty"`
-	HelperOnly  bool   `json:"helperOnly,omitempty"`
+	// StaleRoutesTime is how long this speaker keeps a restarting peer's routes
+	// marked stale before purging them, in seconds. 0 disables the timer, which is
+	// gobgpd's default.
+	//
+	// Only families that have not sent End-of-RIB are purged when it fires, so a
+	// family that finished its refresh keeps its adj-RIB-in - checked in
+	// staleRoutesExpiredFunc.
+	// +optional
+	StaleRoutesTime uint32 `json:"staleRoutesTime,omitempty"`
+	HelperOnly      bool   `json:"helperOnly,omitempty"`
 }
 
 // +kubebuilder:object:generate=true

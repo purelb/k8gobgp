@@ -50,6 +50,43 @@ jobs:
           version: v2.13.2
           args: --timeout=5m
 
+      # The alert rules are a sample operators import, so a typo in them fails at
+      # their Prometheus rather than ours. promtool parses and type-checks the
+      # expressions, which catches a malformed selector or an aggregation over a
+      # label that cannot exist.
+      #
+      # The file is a PrometheusRule, so .spec is extracted first - promtool wants
+      # the bare `groups:` form. Both are checked: the PodMonitors only need to be
+      # valid YAML with the fields the Operator reads, which yq covers.
+      - name: Check the alert rules and monitoring samples
+        run: |
+          set -euo pipefail
+          PROM_VERSION=3.6.0
+          curl -sSfL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
+            | tar xz --strip-components=1 -C /usr/local/bin "prometheus-${PROM_VERSION}.linux-amd64/promtool"
+          python3 -c "
+          import yaml, sys
+          docs = [d for d in yaml.safe_load_all(open('docs/alerting/k8gobgp-alerts.yaml')) if d]
+          assert len(docs) == 1 and docs[0]['kind'] == 'PrometheusRule', 'unexpected shape'
+          yaml.safe_dump(docs[0]['spec'], open('/tmp/rules.yaml', 'w'))
+          "
+          promtool check rules /tmp/rules.yaml
+          python3 -c "
+          import yaml
+          docs = [d for d in yaml.safe_load_all(open('docs/monitoring/podmonitors.yaml')) if d]
+          assert len(docs) == 2, f'expected two PodMonitors, got {len(docs)}'
+          for d in docs:
+              assert d['kind'] == 'PodMonitor', d['kind']
+              ep = d['spec']['podMetricsEndpoints'][0]
+              rl = ep['relabelings']
+              # Both are load-bearing: without an explicit job the alert rules'
+              # matchers select nothing, and without node the one cross-endpoint
+              # rule can never match.
+              assert any(r.get('targetLabel') == 'job' for r in rl), d['metadata']['name'] + ': no job relabeling'
+              assert any(r.get('targetLabel') == 'node' for r in rl), d['metadata']['name'] + ': no node relabeling'
+          print('podmonitors ok')
+          "
+
   test:
     name: Test
     runs-on: ubuntu-latest
