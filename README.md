@@ -304,7 +304,25 @@ spec:
 
 ### Using Peer Groups
 
-Peer groups allow you to define common settings that are inherited by multiple neighbors:
+Peer groups allow you to define common settings that are inherited by multiple neighbors.
+
+**A neighbor inherits any field it does not state.** Stating a field — to anything, including the
+zero value — claims it, and the group no longer supplies it. That is what makes `authPassword: ""`
+meaningful: it opts a member out of its group's TCP-MD5 password rather than meaning "unset".
+
+Four rules are worth knowing before you rely on this, because each one has a shape that looks like
+a bug if you have not met it:
+
+| Rule | Consequence |
+|---|---|
+| `peerAsn` is always the group's, where the group states one | A member naming a different ASN has it discarded. The controller emits a `PeerAsnOverridden` warning event |
+| `allowOwnAsn`, `replacePeerAsn` and `allowAspathLoopLocal` share one presence signal | Stating **any** of the three claims all three, so the other two fall back to their defaults instead of inheriting. State all three together, or none |
+| Supplying a `timers` block claims **every** timer in it | A member that sets only `connectRetry` stops inheriting the group's `holdTime` and `keepaliveInterval` |
+| `bfd`, `gracefulRestart`, `transport`, `applyPolicy` and `afiSafis` are whole-block | Omit the block to inherit it; supply it to own all of it |
+
+`BGPNodeStatus` reports which blocks each neighbor inherited, in
+`status.neighbors[].inheritedBlocks` — worth checking first when a peer has a value you did not
+set, because `gobgp neighbor` shows the *resolved* configuration and cannot tell the two apart.
 
 ```yaml
 apiVersion: bgp.purelb.io/v1
@@ -544,6 +562,9 @@ kubectl get bgpns node-a -o yaml
 
 The status includes:
 - **Neighbor sessions**: state, uptime, prefixes sent/received, last error for non-Established peers
+- **Inherited blocks**: `inheritedBlocks` per neighbor names what came from its peer group rather
+  than from the neighbor itself. `gobgp neighbor` reports the resolved configuration, so a value the
+  neighbor set and one it inherited look identical there
 - **Netlink import pipeline**: interface exists/operState, imported addresses with RIB membership
 - **BGP RIB**: local and received routes with next-hop and communities
 - **Netlink export pipeline**: export rules, exported routes with kernel installation status
@@ -604,7 +625,30 @@ See the [config/samples/](config/samples/) directory for comprehensive examples 
 - **BFD changes reset the session**: enabling, disabling or retuning BFD on a
   neighbor tears the BGP session down and rebuilds it. Apply in a maintenance
   window. See [BFD](#bfd-bidirectional-forwarding-detection).
-- **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod restart to take effect. These are immutable at runtime in GoBGP.
+- **Global Configuration Changes**: Changes to `global.asn` or `global.routerID` require a pod
+  restart to take effect. These are immutable at runtime in GoBGP, and the reconcile stops with an
+  error rather than continuing against a speaker that is not the one the CR describes.
+
+  Every other `global.*` setting also needs a restart, but does **not** stop the reconcile — the rest
+  of the configuration still applies. Drift is reported as a `GlobalRestartRequired` event and as
+  `k8gobgp_global_restart_required{field}`, which stays up for as long as the drift does.
+- **Multipath requires a limit, and a limit requires multipath**: `global.useMultiplePaths` must be
+  paired with at least one of `global.ebgpMaximumPaths` or `global.ibgpMaximumPaths`, and neither
+  limit is accepted without it. gobgpd refuses both halves inside `StartBgp`, which means the daemon
+  does not start at all — so this is validated before it is sent, with an error naming the CRD
+  fields. Multipath with no limit selects only the single best path; a limit with no multipath does
+  nothing.
+- **Timer changes reset the session**: editing `holdTime` or `keepaliveInterval` on a neighbor tears
+  its BGP session down and rebuilds it. Editing them on a **peer group** does that to every member of
+  the group at once, and nothing staggers it — enable graceful restart first. `connectRetry` and
+  `idleHoldTimeAfterReset` are applied in place and do not reset.
+- **Settings accepted but not implemented**: `global.defaultRouteDistance`,
+  `global.routeSelectionOptions.advertiseInactiveRoutes`, `.enableAigp`, `.ignoreNextHopIgpMetric`,
+  `timers.minimumAdvertisementInterval` and `routeFlapDamping` are retained in the CRD but no longer
+  sent to gobgpd — gobgp-netlink removed them in v1.3.5 because nothing implemented them, so they
+  never had an effect. Setting one logs an `InertSettings` warning event. They are kept rather than
+  removed because the CRD is a structural schema: deleting a field makes the API server prune it
+  silently, so `kubectl apply` would succeed and the value would simply vanish.
 - **Neighbor/Peer Group Changes**: Neighbors, peer groups, policies, and other settings can be updated dynamically without pod restart.
 - **Netlink Import/Export**: Can be enabled or disabled dynamically without pod restart. When disabled, imported routes are withdrawn from the RIB.
 
@@ -685,6 +729,7 @@ The controller's own metrics on `:7473/metrics`:
 | `k8gobgp_router_id_resolution_total` | Counter | `result` | Router ID resolution attempts |
 | `k8gobgp_router_id_resolution_duration_seconds` | Histogram | — | Resolution duration. Buckets top out at 2.048s |
 | `k8gobgp_router_id_info` | Gauge | `router_id`, `source`, `node`, `asn`, `name`, `namespace` | Always 1; read the labels |
+| `k8gobgp_global_restart_required` | Gauge | `field`, `name`, `namespace` | 1 when a `global.*` setting in the CR differs from the running gobgpd and needs a pod restart to apply. Every compared field gets a series, set to 0 rather than deleted when it stops drifting, so an alert can use a plain `> 0`. Prefer this to the `GlobalRestartRequired` event, which fires on the write and then ages out |
 | `k8gobgp_nodestatus_write_total` | Counter | `result` | BGPNodeStatus writes |
 | `k8gobgp_nodestatus_collection_duration_seconds` | Histogram | — | Time to collect node status |
 | `k8gobgp_nodestatus_last_successful_write_timestamp_seconds` | Gauge | — | Alert on staleness, do not gate readiness on it |

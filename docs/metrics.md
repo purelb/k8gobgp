@@ -77,6 +77,7 @@ becomes visible.
 | `k8gobgp_router_id_resolution_total` | Counter | `result` | `success` or `failure` |
 | `k8gobgp_router_id_resolution_duration_seconds` | Histogram | — | `ExponentialBuckets(0.001, 2, 12)` → **highest finite bound 2.048s**. A `histogram_quantile` alert threshold above 2.048 can never fire |
 | `k8gobgp_router_id_info` | Gauge | `router_id`, `source`, `node`, `asn`, `name`, `namespace` | Always 1; read the labels. `source` is `explicit`, `template`, `node-ipv4` or `hash-from-node-name` |
+| `k8gobgp_global_restart_required` | Gauge | `field`, `name`, `namespace` | 1 when a `global.*` setting in the CR differs from the running gobgpd. Every compared field gets a series, set to 0 rather than deleted when it stops drifting, so an alert can use `> 0` without worrying about absent series. `field` is bounded to the known `Global` field names. Cleared on CR deletion |
 
 ### BGPNodeStatus reporter
 
