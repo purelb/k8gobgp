@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  GO_VERSION: "1.25"
+  GO_VERSION: "1.26"
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -147,6 +147,51 @@ jobs:
           docker run --rm --entrypoint gobgpd "$IMG" --version | grep -q "commit: ${sha:0:7}"
           docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --metrics-host
           docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --pprof-disable
+
+      # Round-trip the converters against the real daemon.
+      #
+      # This is the check that catches the bug class nothing else does: a field
+      # the CR omits, that gobgpd defaults or normalises and echoes back
+      # differently, so the comparator says "changed" on every reconcile and
+      # UpdatePeer fires forever. Two of those reached production (connectRetry,
+      # localAsn) with the unit suite green, because the fake it compares
+      # against encodes what its author believed the daemon does.
+      #
+      # It needs a real gobgpd, which is why it lives in this job rather than
+      # `test` - the image is already built and loaded here.
+      - name: Round-trip the converters against a real gobgpd
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}"
+          # --api-insecure-allow-remote is required from gobgp-netlink v1.3.5.
+          # The daemon refuses to start when --api-hosts is off-loopback without
+          # client-certificate authentication, because the API is a write
+          # interface - it adds peers and paths and installs routes into the host
+          # routing table. Binding the wildcard is unavoidable here: the test
+          # runs on the host and reaches the daemon through the published port,
+          # so a loopback bind inside the container would be unreachable.
+          #
+          # This is the exposure the flag exists to accept deliberately: a
+          # throwaway container on the runner's bridge network, reachable only
+          # from the runner, deleted in the next step. The alternative -
+          # --network host with a loopback bind - keeps the guard but binds the
+          # runner's own port 179 and shares its network namespace, which is a
+          # larger change than the isolation is worth here.
+          #
+          # The shipped image does NOT hit this: entrypoint.sh binds a unix
+          # socket by default, and USE_UNIX_SOCKET defaults to true.
+          docker run -d --name gobgpd-rt -p 50051:50051 --entrypoint gobgpd "$IMG" \
+            --api-hosts 0.0.0.0:50051 --pprof-disable --api-insecure-allow-remote
+          for i in $(seq 1 30); do
+            docker exec gobgpd-rt gobgp -u 127.0.0.1 global 2>/dev/null && break || sleep 1
+          done
+          go test -tags=gobgpd -count=1 -v ./controllers/ -run TestRoundTrip
+        env:
+          GOBGPD_ADDR: 127.0.0.1:50051
+
+      - name: gobgpd logs on failure
+        if: failure()
+        run: docker logs gobgpd-rt 2>&1 | tail -50
 
   # Static analysis of our own source. Deterministic for a pinned gosec version,
   # so this is a genuine property of the diff and stays a required check.

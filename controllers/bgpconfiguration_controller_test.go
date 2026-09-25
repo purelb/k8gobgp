@@ -22,6 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -579,9 +580,68 @@ func TestCrdToAPINeighborWithPassword(t *testing.T) {
 
 	assert.Equal(t, "192.168.1.254", result.Conf.NeighborAddress)
 	assert.Equal(t, uint32(64513), result.Conf.PeerAsn)
-	assert.Equal(t, "Test peer", result.Conf.Description)
-	assert.Equal(t, "test-password", result.Conf.AuthPassword)
+	assert.Equal(t, "Test peer", result.Conf.GetDescription())
+	assert.Equal(t, "test-password", result.Conf.GetAuthPassword())
+	// Both are stated by the CR, so both must be sent as pointers - a nil here
+	// would hand the field to the peer group instead.
+	assert.NotNil(t, result.Conf.Description)
+	assert.NotNil(t, result.Conf.AuthPassword)
 	assert.Len(t, result.AfiSafis, 1)
+}
+
+// A CR that does not state an inheritable field must send nil for it, so the
+// peer group can still supply the value.
+//
+// gobgp-netlink v1.3.5 treats a non-nil api.PeerConf field as "the client owns
+// this, do not inherit it". Sending an explicit zero instead of nil therefore
+// switches off peer-group inheritance silently: no churn, no error, the group's
+// setting simply stops applying. Nothing else in the suite would notice, because
+// the daemon echoes the zero straight back and every comparison agrees.
+func TestCrdToAPINeighborSendsNilForUnstatedFields(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, bgpv1.AddToScheme(scheme))
+	r := &BGPConfigurationReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).Build()}
+
+	bare := &bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+		NeighborAddress: "10.0.0.1",
+		PeerAsn:         64513,
+		PeerGroup:       "spines",
+	}}
+	conf := r.crdToAPINeighborWithPassword(bare, "").GetConf()
+	assert.Nil(t, conf.Description, "unstated description must inherit")
+	assert.Nil(t, conf.LocalAsn, "unstated localAsn must inherit")
+	assert.Nil(t, conf.AuthPassword, "unresolved password must inherit")
+	assert.Nil(t, conf.AllowOwnAsn, "unstated allowOwnAsn must inherit")
+	assert.Nil(t, conf.ReplacePeerAsn, "unstated replacePeerAsn must inherit")
+	assert.Nil(t, conf.AllowAspathLoopLocal, "unstated allowAspathLoopLocal must inherit")
+	assert.Nil(t, conf.RemovePrivate, "unstated removePrivate must inherit")
+	assert.Nil(t, conf.SendSoftwareVersion, "unstated sendSoftwareVersion must inherit")
+	assert.Nil(t, conf.SendCommunity, "unstated sendCommunity must inherit")
+
+	// And a CR that does state them must claim them.
+	stated := &bgpv1.Neighbor{Config: bgpv1.NeighborConfig{
+		NeighborAddress:      "10.0.0.2",
+		PeerAsn:              64513,
+		PeerGroup:            "spines",
+		Description:          "spine-1",
+		LocalAsn:             64512,
+		AllowOwnAsn:          2,
+		ReplacePeerAsn:       true,
+		AllowAspathLoopLocal: true,
+		RemovePrivate:        "all",
+		SendSoftwareVersion:  true,
+		SendCommunity:        "standard",
+	}}
+	conf = r.crdToAPINeighborWithPassword(stated, "pw").GetConf()
+	assert.Equal(t, "spine-1", conf.GetDescription())
+	assert.Equal(t, uint32(64512), conf.GetLocalAsn())
+	assert.Equal(t, "pw", conf.GetAuthPassword())
+	assert.Equal(t, uint32(2), conf.GetAllowOwnAsn())
+	assert.True(t, conf.GetReplacePeerAsn())
+	assert.True(t, conf.GetAllowAspathLoopLocal())
+	assert.Equal(t, gobgpapi.RemovePrivate_REMOVE_PRIVATE_ALL, conf.GetRemovePrivate())
+	assert.True(t, conf.GetSendSoftwareVersion())
+	assert.NotNil(t, conf.SendCommunity)
 }
 
 // Test helper function for peer group password resolution
@@ -925,13 +985,18 @@ func TestPeerConfigEqual(t *testing.T) {
 			Conf: &gobgpapi.PeerConf{
 				NeighborAddress:   "10.0.0.1",
 				PeerAsn:           64513,
-				LocalAsn:          64512,
-				Description:       "test",
-				AuthPassword:      "secret",
+				LocalAsn:          proto.Uint32(64512),
+				Description:       proto.String("test"),
+				AuthPassword:      proto.String("secret"),
 				PeerGroup:         "group1",
 				NeighborInterface: "",
 				Vrf:               "",
 			},
+			// The daemon computes AuthPasswordSet from the resolved config and
+			// reports it on every ListPeer, so a fixture that sets a password must
+			// set this too or peerConfigEqual's presence check sees a peer whose
+			// password gobgpd is not using.
+			State: &gobgpapi.PeerState{AuthPasswordSet: true},
 			AfiSafis: []*gobgpapi.AfiSafi{
 				{Config: &gobgpapi.AfiSafiConfig{
 					Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
@@ -1000,10 +1065,29 @@ func TestPeerConfigEqual(t *testing.T) {
 			expected: true,
 		},
 		{
-			name:    "different PeerAsn",
+			// basePeer is in a peer group, and oc's forcedOverwrittenConfig makes
+			// the group own peer-as wherever the group states one. UpdatePeer
+			// cannot change it, so peerConfigEqual deliberately does not look.
+			name:    "grouped peer: differing PeerAsn is the group's to own",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
+				p.Conf.PeerAsn = 64514
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			// Ungrouped, nothing can overwrite it, so a difference is real drift.
+			name: "ungrouped peer: differing PeerAsn is a real change",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.PeerGroup = ""
+				return p
+			}(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.PeerGroup = ""
 				p.Conf.PeerAsn = 64514
 				return p
 			}(),
@@ -1014,12 +1098,13 @@ func TestPeerConfigEqual(t *testing.T) {
 			// peer leaves the server, so "the passwords differ" is indistinguishable
 			// from "gobgpd redacted it" - and treating that as a difference means an
 			// UpdatePeer every reconcile for every authenticated peer. A password
-			// change still reaches gobgpd via the Secret watch re-entering Reconcile.
+			// change is not detected here at all: the Secret is not watched, and the
+			// value is redacted on read. Presence is compared instead.
 			name:    "differing AuthPassword is ignored: gobgpd redacts it",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
-				p.Conf.AuthPassword = ""
+				p.Conf.AuthPassword = proto.String("")
 				return p
 			}(),
 			expected: true,
@@ -1040,15 +1125,58 @@ func TestPeerConfigEqual(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:    "current has auto-populated Type and SendCommunity (should be ignored)",
+			// Type is still auto-populated by gobgpd and still ignored.
+			// SendCommunity is NOT in here any more: as of gobgp-netlink v1.3.1
+			// it has explicit presence and is nil when unconfigured, so gobgpd
+			// no longer fabricates a value and a difference is a real one.
+			name:    "current has auto-populated Type (should be ignored)",
 			desired: basePeer(),
 			current: func() *gobgpapi.Peer {
 				p := basePeer()
 				p.Conf.Type = 1
-				p.Conf.SendCommunity = 3
 				return p
 			}(),
 			expected: true,
+		},
+		{
+			// Both unconfigured. This is the case that would churn if the
+			// comparator used GetSendCommunity(), which dereferences to 0.
+			name:    "sendCommunity unset on both sides",
+			desired: basePeer(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = nil
+				return p
+			}(),
+			expected: true,
+		},
+		{
+			// nil vs "standard" (0). Under implicit presence these were the
+			// same value on the wire; the whole point of the v1.3.1 proto change
+			// is that they are now distinguishable, and this is the assertion
+			// that proves we read the distinction.
+			name: "sendCommunity unset vs explicitly standard",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = ptrU32(0)
+				return p
+			}(),
+			current:  basePeer(),
+			expected: false,
+		},
+		{
+			name: "sendCommunity differs",
+			desired: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = ptrU32(2) // both
+				return p
+			}(),
+			current: func() *gobgpapi.Peer {
+				p := basePeer()
+				p.Conf.SendCommunity = ptrU32(3) // none
+				return p
+			}(),
+			expected: false,
 		},
 		{
 			name:    "current has extra Transport runtime fields (should be ignored)",
@@ -1320,12 +1448,13 @@ func TestTimersConfigEqual(t *testing.T) {
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}, State: &gobgpapi.TimersState{}},
 	), "Timers.State is ignored")
 
-	// gobgpd defaults IdleHoldTimeAfterReset and never echoes
-	// MinimumAdvertisementInterval; comparing either guarantees churn.
+	// gobgpd defaults IdleHoldTimeAfterReset, so comparing it guarantees churn.
+	// MinimumAdvertisementInterval used to be tested here too; gobgp-netlink
+	// v1.3.5 deleted the field because nothing read it.
 	assert.True(t, timersConfigEqual(
-		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90, MinimumAdvertisementInterval: 5}},
+		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90, IdleHoldTimeAfterReset: 30}},
-	), "gobgpd-defaulted and never-echoed timer fields are ignored")
+	), "gobgpd-defaulted timer fields are ignored")
 
 	assert.False(t, timersConfigEqual(
 		&gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: 90}},
@@ -1607,4 +1736,125 @@ func TestReconcile_NotFoundClearsConfigGauges(t *testing.T) {
 
 	assert.Zero(t, testutil.CollectAndCount(bgpConfigurationReady),
 		"gauge for a deleted config must not linger")
+}
+
+// --- global configuration -----------------------------------------------------
+
+// TestGlobalFamilyOrdinals pins the Global.Families wire encoding.
+//
+// These are measured values, not derived ones. Global.Families is []uint32 and
+// the obvious reading - gobgp's own bgp.RouteFamily constant, afi<<16|safi,
+// making ipv4-unicast 65537 - is wrong. Verified against a live gobgpd v1.3.0
+// by starting one daemon per candidate value and asking GetTable which families
+// existed:
+//
+//	65537 -> no families at all (does NOT error)
+//	    0 -> ipv4-unicast        5 -> ipv6-vpn
+//	    1 -> ipv6-unicast        7 -> StartBgp rejects it
+//	    2 -> ipv4-labeled       8 -> l2vpn-vpls
+//	    3 -> ipv6-labeled       9 -> l2vpn-evpn
+//	    4 -> ipv4-vpn
+//
+// This matters more than a normal constant, because a wrong value here does not
+// fail - it brings the node up carrying no routes. If a fork bump reorders the
+// family list these ordinals all shift meaning silently, and this test is the
+// only thing standing between that and a fleet-wide outage. Re-run the probe
+// when bumping, do not "fix" this by editing the numbers.
+func TestGlobalFamilyOrdinals(t *testing.T) {
+	want := map[string]uint32{
+		"ipv4-unicast": 0, "ipv6-unicast": 1,
+		"ipv4-labeled": 2, "ipv6-labeled": 3,
+		"ipv4-vpn": 4, "ipv6-vpn": 5,
+		"l2vpn-vpls": 8, "l2vpn-evpn": 9,
+	}
+	got := map[string]uint32{}
+	for name, f := range bgpFamilies {
+		if f.hasGlobalOrdinal {
+			got[name] = f.globalOrdinal
+		}
+	}
+	assert.Equal(t, want, got)
+
+	// 65537 is the value a reasonable person would reach for - gobgp's own
+	// RouteFamily constant for ipv4-unicast. It must not appear anywhere.
+	for name, ord := range got {
+		assert.Less(t, ord, uint32(16), "%s: ordinals are small; %d looks like a packed afi/safi", name, ord)
+	}
+
+	// Every family must convert to a real afi/safi pair, or afiSafis[].family
+	// silently produces a peer with no usable family.
+	for name := range bgpFamilies {
+		f := crdToAPIFamily(name)
+		assert.NotEqual(t, gobgpapi.Family_AFI_UNSPECIFIED, f.GetAfi(), "family %q has no afi", name)
+		assert.NotEqual(t, gobgpapi.Family_SAFI_UNSPECIFIED, f.GetSafi(), "family %q has no safi", name)
+	}
+}
+
+func TestCrdToAPIGlobalFamilies(t *testing.T) {
+	// Omitted means "keep gobgpd's default", which is nil, not an empty slice.
+	got, err := crdToAPIGlobalFamilies(nil)
+	require.NoError(t, err)
+	assert.Nil(t, got)
+
+	got, err = crdToAPIGlobalFamilies([]string{"ipv6-unicast", "l2vpn-evpn"})
+	require.NoError(t, err)
+	assert.Equal(t, []uint32{1, 9}, got)
+
+	// An unknown name must be an error, never a silent zero: zero is
+	// ipv4-unicast, so falling back would quietly substitute the wrong family.
+	_, err = crdToAPIGlobalFamilies([]string{"ipv4-unicast", "not-a-family"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not-a-family")
+
+	// A family that is valid per-neighbor but has no Global.Families ordinal
+	// must be rejected rather than mapped to ordinal 0 (= ipv4-unicast).
+	_, err = crdToAPIGlobalFamilies([]string{"ipv4-flowspec"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "afiSafis")
+}
+
+// The global sub-messages the daemon still implements.
+//
+// This test used to cover defaultRouteDistance and three routeSelectionOptions
+// booleans as well. gobgp-netlink v1.3.5 deleted all four from the API because
+// nothing implemented them, so the converters no longer send them and there is
+// nothing to assert; reportInertFields covers the CRD side.
+func TestCrdToAPIGlobalSubMessages(t *testing.T) {
+	assert.Nil(t, crdToAPIRouteSelectionOptions(nil))
+	assert.Nil(t, crdToAPIConfederation(nil))
+
+	rso := crdToAPIRouteSelectionOptions(&bgpv1.RouteSelectionOptions{
+		AlwaysCompareMed: true, IgnoreAsPathLength: true, ExternalCompareRouterID: true,
+		DisableBestPathSelection: true,
+	})
+	assert.True(t, rso.GetAlwaysCompareMed() && rso.GetIgnoreAsPathLength() &&
+		rso.GetExternalCompareRouterId() && rso.GetDisableBestPathSelection())
+
+	cf := crdToAPIConfederation(&bgpv1.Confederation{Enabled: true, Identifier: 65000, MemberAsList: []uint32{65001, 65002}})
+	assert.True(t, cf.GetEnabled())
+	assert.Equal(t, uint32(65000), cf.GetIdentifier())
+	assert.Equal(t, []uint32{65001, 65002}, cf.GetMemberAsList())
+}
+
+func ptrU32(v uint32) *uint32 { return &v }
+
+// TestSendCommunityOrdinals pins the CRD names to oc.CommunityTypeToIntMap,
+// read from gobgp-netlink at the pinned commit rather than inferred.
+//
+// 0 is STANDARD, not none. A previous revision of this code guessed a bitmask
+// (standard 1, extended 2, both 3) which was wrong in every position and would
+// have mapped "both" onto none - silently disabling community advertisement on
+// every peer configured that way.
+func TestSendCommunityOrdinals(t *testing.T) {
+	assert.Equal(t, map[string]uint32{
+		"standard": 0, "extended": 1, "both": 2, "none": 3,
+	}, sendCommunityOrdinals)
+
+	// Unknown or empty means "not configured", which must be nil - never a
+	// pointer to 0, which would mean "standard".
+	assert.Nil(t, crdToAPISendCommunity(""))
+	assert.Nil(t, crdToAPISendCommunity("large"))
+	require.NotNil(t, crdToAPISendCommunity("standard"))
+	assert.Equal(t, uint32(0), *crdToAPISendCommunity("standard"))
+	assert.Equal(t, uint32(3), *crdToAPISendCommunity("none"))
 }

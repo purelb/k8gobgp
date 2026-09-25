@@ -80,9 +80,11 @@ type NetlinkExportRule struct {
 	Name string `json:"name"`
 	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE" where AS and VALUE are 0-65535)
 	// +kubebuilder:validation:items:Pattern=`^\d{1,5}:\d{1,5}$`
+	// +kubebuilder:validation:MaxItems=128
 	CommunityList []string `json:"communityList,omitempty"`
 	// LargeCommunityList filters routes by large BGP communities (format: "ASN:LocalData1:LocalData2")
 	// +kubebuilder:validation:items:Pattern=`^\d+:\d+:\d+$`
+	// +kubebuilder:validation:MaxItems=128
 	LargeCommunityList []string `json:"largeCommunityList,omitempty"`
 	// Vrf is the target VRF name (empty = global routing table)
 	Vrf string `json:"vrf,omitempty"`
@@ -114,17 +116,29 @@ type GlobalSpec struct {
 	// Must be at least /24 (256 addresses). Each cluster should use a unique pool.
 	// Default: "10.255.0.0/16"
 	// +optional
-	RouterIDPool          string                 `json:"routerIDPool,omitempty"`
-	ListenPort            int32                  `json:"listenPort,omitempty"`
-	ListenAddresses       []string               `json:"listenAddresses,omitempty"`
+	RouterIDPool    string   `json:"routerIDPool,omitempty"`
+	ListenPort      int32    `json:"listenPort,omitempty"`
+	ListenAddresses []string `json:"listenAddresses,omitempty"`
+	// Families is the global address-family set. Omit it to keep gobgpd's
+	// default of ipv4-unicast and ipv6-unicast.
+	//
+	// The enum is enforced because the wire encoding is a bare ordinal: an
+	// unrecognized name cannot be passed through, and a wrong value does not
+	// error - it enables no families at all. See globalFamilyOrdinals.
+	// +kubebuilder:validation:items:Enum=ipv4-unicast;ipv6-unicast;ipv4-labeled;ipv6-labeled;ipv4-vpn;ipv6-vpn;l2vpn-vpls;l2vpn-evpn
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
 	Families              []string               `json:"families,omitempty"`
 	UseMultiplePaths      bool                   `json:"useMultiplePaths,omitempty"`
 	RouteSelectionOptions *RouteSelectionOptions `json:"routeSelectionOptions,omitempty"`
-	DefaultRouteDistance  *DefaultRouteDistance  `json:"defaultRouteDistance,omitempty"`
-	Confederation         *Confederation         `json:"confederation,omitempty"`
-	GracefulRestart       *GracefulRestart       `json:"gracefulRestart,omitempty"`
-	ApplyPolicy           *ApplyPolicy           `json:"applyPolicy,omitempty"`
-	BindToDevice          string                 `json:"bindToDevice,omitempty"`
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
+	DefaultRouteDistance *DefaultRouteDistance `json:"defaultRouteDistance,omitempty"`
+	Confederation        *Confederation        `json:"confederation,omitempty"`
+	GracefulRestart      *GracefulRestart      `json:"gracefulRestart,omitempty"`
+	ApplyPolicy          *ApplyPolicy          `json:"applyPolicy,omitempty"`
+	BindToDevice         string                `json:"bindToDevice,omitempty"`
 	// NodeStatus configures per-node BGPNodeStatus reporting
 	// +optional
 	NodeStatus *NodeStatusConfig `json:"nodeStatus,omitempty"`
@@ -240,6 +254,29 @@ type PeerGroup struct {
 
 // --- Detailed Sub-structs ---
 
+// NeighborConfig is a neighbor's own settings.
+//
+// Peer-group inheritance: for a neighbor that names a peerGroup, any field left
+// unset here takes the group's value. That is why an omitted field is sent to
+// gobgpd as absent rather than as a zero - stating a field claims it and stops
+// the group supplying it.
+//
+// Two consequences worth knowing:
+//
+//   - A member cannot override a group's true with an explicit false, or opt out
+//     of a group's authPassword, because these are plain fields and the API
+//     server cannot distinguish "unset" from "set to the zero value". Omit the
+//     setting from the group instead, or do not put the neighbor in the group.
+//
+//   - allowOwnAsn, replacePeerAsn and allowAspathLoopLocal share one presence
+//     signal in gobgpd. Stating any one of them claims all three, so the other
+//     two fall back to their defaults instead of inheriting from the group.
+//     State all three together, or none.
+//
+//   - peerAsn is the exception: where a peer group states one, the group's value
+//     always wins and a differing value here is discarded. The controller emits a
+//     PeerAsnOverridden warning event when that happens.
+//
 // +kubebuilder:object:generate=true
 type NeighborConfig struct {
 	// AuthPassword is the BGP authentication password (DEPRECATED: use AuthPasswordSecretRef instead)
@@ -267,6 +304,56 @@ type NeighborConfig struct {
 	AdminDown         bool   `json:"adminDown,omitempty"`
 	NeighborInterface string `json:"neighborInterface,omitempty"`
 	Vrf               string `json:"vrf,omitempty"`
+
+	// AllowOwnAsn permits our own ASN to appear this many times in a received
+	// AS path.
+	//
+	// The bound is load-bearing, not cosmetic. gobgpd's peer-group path errors
+	// above MaxUint8, but its neighbor path does a bare uint8() cast with no
+	// check (grpc_server.go, newNeighborFromAPIStruct), so 256 would silently
+	// truncate to 0 - the opposite of what was asked for.
+	// +kubebuilder:validation:Maximum=255
+	// +optional
+	AllowOwnAsn uint32 `json:"allowOwnAsn,omitempty"`
+	// ReplacePeerAsn rewrites the peer's ASN with ours in advertised AS paths.
+	// +optional
+	ReplacePeerAsn bool `json:"replacePeerAsn,omitempty"`
+	// AllowAspathLoopLocal permits a local AS-path loop.
+	// +optional
+	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
+	// SendCommunity filters which community attributes are advertised to this
+	// peer, applied AFTER the export policy - so a policy that adds a community
+	// cannot walk past it.
+	//
+	// Dead in every gobgp release before gobgp-netlink v1.3.1: accepted by the
+	// config loader, dropped by the gRPC converters, read by nothing. Omit it to
+	// leave gobgpd's behavior alone.
+	//
+	// "none" is not literal. Large communities, LLGR_STALE/NO_LLGR, and every
+	// family except IPv4/IPv6 unicast and labeled unicast survive every
+	// setting, and it is ignored entirely for route-server clients. See the BGP
+	// section of README.md.
+	//
+	// Note "none" and "extended" strip NO_EXPORT, NO_ADVERTISE and
+	// NO_EXPORT_SUBCONFED, so the receiving AS loses the signal not to
+	// re-export. That is a route-leak vector, not just a filter.
+	// +kubebuilder:validation:Enum=standard;extended;both;none
+	// +optional
+	SendCommunity string `json:"sendCommunity,omitempty"`
+	// RemovePrivate strips private ASNs from advertised AS paths:
+	// "all" removes them, "replace" substitutes our own ASN.
+	// +kubebuilder:validation:Enum=all;replace
+	// +optional
+	RemovePrivate string `json:"removePrivate,omitempty"`
+	// RouteFlapDamping enables RFC 2439 damping for this peer.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
+	// +optional
+	RouteFlapDamping bool `json:"routeFlapDamping,omitempty"`
+	// SendSoftwareVersion advertises the software-version capability (RFC 9384).
+	// +optional
+	SendSoftwareVersion bool `json:"sendSoftwareVersion,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -293,10 +380,50 @@ type PeerGroupConfig struct {
 	// AllowAspathLoopLocal permits our own ASN in locally originated paths.
 	// +optional
 	AllowAspathLoopLocal bool `json:"allowAspathLoopLocal,omitempty"`
+	// SendCommunity filters which community attributes are advertised to this
+	// peer, applied AFTER the export policy - so a policy that adds a community
+	// cannot walk past it.
+	//
+	// Dead in every gobgp release before gobgp-netlink v1.3.1: accepted by the
+	// config loader, dropped by the gRPC converters, read by nothing. Omit it to
+	// leave gobgpd's behavior alone.
+	//
+	// "none" is not literal. Large communities, LLGR_STALE/NO_LLGR, and every
+	// family except IPv4/IPv6 unicast and labeled unicast survive every
+	// setting, and it is ignored entirely for route-server clients. See the BGP
+	// section of README.md.
+	//
+	// Note "none" and "extended" strip NO_EXPORT, NO_ADVERTISE and
+	// NO_EXPORT_SUBCONFED, so the receiving AS loses the signal not to
+	// re-export. That is a route-leak vector, not just a filter.
+	// +kubebuilder:validation:Enum=standard;extended;both;none
+	// +optional
+	SendCommunity string `json:"sendCommunity,omitempty"`
+	// RemovePrivate strips private ASNs from advertised AS paths:
+	// "all" removes them, "replace" substitutes our own ASN.
+	// +kubebuilder:validation:Enum=all;replace
+	// +optional
+	RemovePrivate string `json:"removePrivate,omitempty"`
+	// RouteFlapDamping enables RFC 2439 damping for members of this group.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
+	// +optional
+	RouteFlapDamping bool `json:"routeFlapDamping,omitempty"`
+	// SendSoftwareVersion advertises the software-version capability (RFC 9384).
+	// +optional
+	SendSoftwareVersion bool `json:"sendSoftwareVersion,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
 type AfiSafi struct {
+	// Family is the address family, e.g. ipv4-unicast.
+	//
+	// Enforced as an enum because the converter previously recognized only
+	// three names and sent AFI_UNSPECIFIED for anything else - so a typo, or a
+	// perfectly valid family it did not know, was accepted by the CRD and
+	// silently produced a peer with no usable family.
+	// +kubebuilder:validation:Enum=ipv4-unicast;ipv6-unicast;ipv4-labeled;ipv6-labeled;ipv4-vpn;ipv6-vpn;l2vpn-vpls;l2vpn-evpn;ipv4-flowspec;ipv6-flowspec;rtc
 	Family      string       `json:"family"` // e.g., "ipv4-unicast", "l2vpn-evpn"
 	Enabled     bool         `json:"enabled"`
 	PrefixLimit *PrefixLimit `json:"prefixLimit,omitempty"`
@@ -316,15 +443,29 @@ type AddPaths struct {
 }
 
 // +kubebuilder:object:generate=true
+// Timers holds session timers.
+//
+// Whole-block inheritance: for a neighbor in a peer group, supplying this block
+// at all claims every timer in it. A neighbor that sets only connectRetry
+// therefore stops inheriting the group's holdTime and keepaliveInterval and falls
+// back to gobgpd's defaults. Repeat the group's values here, or omit the block.
+//
+// Editing holdTime or keepaliveInterval rebuilds the BGP session as of
+// gobgp-netlink v1.3.5; connectRetry and idleHoldTimeAfterReset do not. Editing
+// them on a peer group rebuilds every member's session at once, so enable
+// graceful restart first.
 type Timers struct {
 	Config TimersConfig `json:"config"`
 }
 
 // +kubebuilder:object:generate=true
 type TimersConfig struct {
-	ConnectRetry                 uint64 `json:"connectRetry,omitempty"`
-	HoldTime                     uint64 `json:"holdTime,omitempty"`
-	KeepaliveInterval            uint64 `json:"keepaliveInterval,omitempty"`
+	ConnectRetry      uint64 `json:"connectRetry,omitempty"`
+	HoldTime          uint64 `json:"holdTime,omitempty"`
+	KeepaliveInterval uint64 `json:"keepaliveInterval,omitempty"`
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	MinimumAdvertisementInterval uint64 `json:"minimumAdvertisementInterval,omitempty"`
 }
 
@@ -402,16 +543,39 @@ type VrfNetlinkExport struct {
 	ValidateNexthop *bool `json:"validateNexthop,omitempty"`
 	// CommunityList filters routes by standard BGP communities (format: "AS:VALUE" where AS and VALUE are 0-65535)
 	// +kubebuilder:validation:items:Pattern=`^\d{1,5}:\d{1,5}$`
+	// +kubebuilder:validation:MaxItems=128
 	CommunityList []string `json:"communityList,omitempty"`
 	// LargeCommunityList filters routes by large BGP communities (format: "ASN:LocalData1:LocalData2")
 	// +kubebuilder:validation:items:Pattern=`^\d+:\d+:\d+$`
+	// +kubebuilder:validation:MaxItems=128
 	LargeCommunityList []string `json:"largeCommunityList,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
 type RouteSelectionOptions struct {
-	AlwaysCompareMed        bool `json:"alwaysCompareMed,omitempty"`
+	// AlwaysCompareMed compares MED across paths from different ASes.
+	AlwaysCompareMed bool `json:"alwaysCompareMed,omitempty"`
+	// IgnoreAsPathLength skips AS-path length in best-path selection.
+	IgnoreAsPathLength bool `json:"ignoreAsPathLength,omitempty"`
+	// ExternalCompareRouterID compares router IDs for external paths.
+	ExternalCompareRouterID bool `json:"externalCompareRouterID,omitempty"`
+	// AdvertiseInactiveRoutes advertises routes not installed in the FIB.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
 	AdvertiseInactiveRoutes bool `json:"advertiseInactiveRoutes,omitempty"`
+	// EnableAigp enables AIGP metric comparison.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
+	EnableAigp bool `json:"enableAigp,omitempty"`
+	// IgnoreNextHopIgpMetric skips the next-hop IGP metric.
+	// INERT as of gobgp-netlink v1.3.5, which removed the field from its API
+	// because nothing in the daemon implemented it. Accepted here so existing
+	// manifests keep applying; setting it has no effect and logs a warning event.
+	IgnoreNextHopIgpMetric bool `json:"ignoreNextHopIgpMetric,omitempty"`
+	// DisableBestPathSelection turns off best-path selection entirely.
+	DisableBestPathSelection bool `json:"disableBestPathSelection,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
@@ -444,7 +608,13 @@ type PolicyAssignment struct {
 
 // +kubebuilder:object:generate=true
 type PolicyDefinition struct {
-	Name       string      `json:"name"`
+	Name string `json:"name"`
+	// Statements are evaluated in order.
+	//
+	// Bounded because CEL rules nested below here are costed statically
+	// against this bound; unbounded, the estimator assumes the maximum and
+	// pushed the whole CRD over the apiserver budget, rejecting it outright.
+	// +kubebuilder:validation:MaxItems=128
 	Statements []Statement `json:"statements"`
 }
 
@@ -462,33 +632,143 @@ type Conditions struct {
 	AsPathSet    *MatchSet `json:"asPathSet,omitempty"`
 	CommunitySet *MatchSet `json:"communitySet,omitempty"`
 	RpkiResult   string    `json:"rpkiResult,omitempty"` // "valid", "invalid", "not-found"
+
+	// ExtCommunitySet matches extended communities.
+	// +optional
+	ExtCommunitySet *MatchSet `json:"extCommunitySet,omitempty"`
+	// LargeCommunitySet matches large communities. Note NetlinkExportRule
+	// already supported large communities; BGP policy did not.
+	// +optional
+	LargeCommunitySet *MatchSet `json:"largeCommunitySet,omitempty"`
+	// AsPathLength matches on the number of ASes in the AS path.
+	// +optional
+	AsPathLength *AsPathLengthCondition `json:"asPathLength,omitempty"`
+	// CommunityCount matches on how many communities a route carries.
+	// +optional
+	CommunityCount *CommunityCountCondition `json:"communityCount,omitempty"`
+	// RouteType matches the route's origin relative to this speaker.
+	// +kubebuilder:validation:Enum=internal;external;local
+	// +optional
+	RouteType string `json:"routeType,omitempty"`
+	// Origin matches the ORIGIN attribute.
+	// +kubebuilder:validation:Enum=igp;egp;incomplete
+	// +optional
+	Origin string `json:"origin,omitempty"`
+	// NextHopInList matches when the next hop is one of these addresses.
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	NextHopInList []string `json:"nextHopInList,omitempty"`
+	// AfiSafiIn matches when the route belongs to one of these families.
+	// +kubebuilder:validation:items:Enum=ipv4-unicast;ipv6-unicast;ipv4-labeled;ipv6-labeled;ipv4-vpn;ipv6-vpn;l2vpn-vpls;l2vpn-evpn;ipv4-flowspec;ipv6-flowspec;rtc
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	AfiSafiIn []string `json:"afiSafiIn,omitempty"`
+	// LocalPrefEq matches an exact LOCAL_PREF. A pointer because 0 is a valid
+	// local preference and must be distinguishable from "not matching on it".
+	// +optional
+	LocalPrefEq *uint32 `json:"localPrefEq,omitempty"`
+	// MedEq matches an exact MED. A pointer for the same reason as LocalPrefEq.
+	// +optional
+	MedEq *uint32 `json:"medEq,omitempty"`
 }
 
+// AsPathLengthCondition matches on AS-path length.
+// +kubebuilder:object:generate=true
+type AsPathLengthCondition struct {
+	// Operator is "eq", "ge" or "le".
+	// +kubebuilder:validation:Enum=eq;ge;le
+	Operator string `json:"operator"`
+	// Length is the number of ASes to compare against.
+	Length uint32 `json:"length"`
+}
+
+// CommunityCountCondition matches on how many communities a route carries.
+// +kubebuilder:object:generate=true
+type CommunityCountCondition struct {
+	// Operator is "eq", "ge" or "le".
+	// +kubebuilder:validation:Enum=eq;ge;le
+	Operator string `json:"operator"`
+	// Count is the number of communities to compare against.
+	Count uint32 `json:"count"`
+}
+
+// NexthopAction rewrites a route's next hop.
+//
+// The four fields are mutually exclusive in practice: set an explicit address,
+// or exactly one of the booleans.
+// +kubebuilder:object:generate=true
+// +kubebuilder:validation:XValidation:rule="[has(self.address), has(self.self) && self.self, has(self.unchanged) && self.unchanged, has(self.peerAddress) && self.peerAddress].filter(x, x).size() <= 1",message="set at most one of address, self, unchanged, peerAddress"
+type NexthopAction struct {
+	// Address sets an explicit next hop.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	Address string `json:"address,omitempty"`
+	// Self rewrites the next hop to this speaker's address.
+	// +optional
+	Self bool `json:"self,omitempty"`
+	// Unchanged preserves the received next hop.
+	// +optional
+	Unchanged bool `json:"unchanged,omitempty"`
+	// PeerAddress rewrites the next hop to the peer's address.
+	// +optional
+	PeerAddress bool `json:"peerAddress,omitempty"`
+}
+
+// MatchSet references a DefinedSet and says how its members must match.
+//
+// match was previously accepted and dropped: crdToAPIMatchSet set only Name, so
+// "all" and "invert" were both sent as TYPE_UNSPECIFIED and the policy matched
+// differently than it read. That is a silent change of routing policy, not an
+// inert no-op, which is why the values are now an enforced enum.
 // +kubebuilder:object:generate=true
 type MatchSet struct {
-	Name  string `json:"name"`
-	Match string `json:"match,omitempty"` // "any", "all", "invert"
+	// Name of the DefinedSet to match against.
+	Name string `json:"name"`
+	// Match is "any" (default), "all", or "invert".
+	// +kubebuilder:validation:Enum=any;all;invert
+	// +optional
+	Match string `json:"match,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
 type Actions struct {
 	RouteAction string           `json:"routeAction"` // "accept" or "reject"
 	Community   *CommunityAction `json:"community,omitempty"`
-	Med         *MedAction       `json:"med,omitempty"`
-	AsPrepend   *AsPrependAction `json:"asPrepend,omitempty"`
-	LocalPref   uint32           `json:"localPref,omitempty"`
+	// ExtCommunity manipulates extended communities.
+	// +optional
+	ExtCommunity *CommunityAction `json:"extCommunity,omitempty"`
+	// LargeCommunity manipulates large communities.
+	// +optional
+	LargeCommunity *CommunityAction `json:"largeCommunity,omitempty"`
+	// Nexthop rewrites the route's next hop.
+	// +optional
+	Nexthop *NexthopAction `json:"nexthop,omitempty"`
+	// Origin sets the ORIGIN attribute.
+	// +kubebuilder:validation:Enum=igp;egp;incomplete
+	// +optional
+	Origin    string           `json:"origin,omitempty"`
+	Med       *MedAction       `json:"med,omitempty"`
+	AsPrepend *AsPrependAction `json:"asPrepend,omitempty"`
+	LocalPref uint32           `json:"localPref,omitempty"`
 }
 
 // +kubebuilder:object:generate=true
 type CommunityAction struct {
-	Type        string   `json:"type"` // "add", "remove", "replace"
+	// Type is "add", "remove" or "replace".
+	// +kubebuilder:validation:Enum=add;remove;replace
+	Type string `json:"type"`
+	// Communities are the values to act on.
+	// +kubebuilder:validation:MaxItems=64
 	Communities []string `json:"communities"`
 }
 
 // +kubebuilder:object:generate=true
 type MedAction struct {
-	Type  string `json:"type"` // "mod" or "replace"
-	Value int64  `json:"value"`
+	// Type is "mod" (adjust relative to the current MED) or "replace".
+	// +kubebuilder:validation:Enum=mod;replace
+	Type string `json:"type"`
+	// Value is the amount to add, or the value to set.
+	Value int64 `json:"value"`
 }
 
 // +kubebuilder:object:generate=true

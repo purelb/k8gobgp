@@ -1,8 +1,8 @@
 # k8gobgp metrics reference
 
-> **Status: describes the target state after the gobgp-netlink v1.3.0 update.** Metrics marked
+> **Status: describes the target state after the gobgp-netlink v1.3.1 update.** Metrics marked
 > **(new)** do not exist yet; metrics listed under [Removed metrics](#removed-metrics) still exist
-> today and go away with that change. Everything about gobgp-netlink describes v1.3.0 as released.
+> today and go away with that change. Everything about gobgp-netlink describes v1.3.1 as released.
 
 A k8gobgp pod runs two processes, and each exposes its own metrics on its own port. They are not
 merged, proxied or consolidated — they are two scrape targets with two distinct metric
@@ -91,7 +91,7 @@ busy because it is churning".
 
 ## BGP daemon metrics (port 7475)
 
-72 metric families. Everything here is emitted by gobgp-netlink v1.3.0.
+72 metric families. Everything here is emitted by gobgp-netlink v1.3.1.
 
 ### Session state, per peer
 
@@ -105,8 +105,19 @@ busy because it is churning".
 | `bgp_peer_flop_count` | Gauge | `peer` |
 | `bgp_peer_out_queue_count` | Gauge | `peer` |
 | `bgp_peer_password_set` | Gauge | `peer` — 1 when TCP-MD5 is configured |
-| `bgp_peer_send_community` | Gauge | `peer` |
+| `bgp_peer_send_community` | Gauge | `peer` — **absent when unconfigured**, see below |
 | `bgp_peer_remove_private_as` | Gauge | `peer` |
+
+**`bgp_peer_send_community` is absent for peers that do not set it**, as of gobgp-netlink
+v1.3.1. Before that it read a constant `0` for every peer in every deployment, because nothing
+ever wrote the underlying state — and `0` means *standard*, so a dashboard built on the old
+value was reporting the entire fleet as filtering down to standard communities. Those panels go
+to no-data rather than silently changing meaning, which is the intended outcome.
+
+Treat it as reporting **configuration, not effect**. The setting is inert for a peer whose
+families are all VPN/EVPN/FlowSpec/MUP/VPLS, and for route-server clients; the metric still
+reports what was configured. See [`sendCommunity`](../README.md#send-community) for what
+survives each setting.
 
 `bgp_peer_state` is an info-style metric: one series per peer, value always 1, with the current
 state carried in the `session_state` label. **It does not emit a zero series for states the peer
