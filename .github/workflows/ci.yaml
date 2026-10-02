@@ -132,6 +132,20 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      # The image's gobgpd is built from the Dockerfile's GOBGP_COMMIT, while
+      # the api package the controller compiles against comes from go.mod's
+      # replace. Nothing else ties the two, so a bump that moves one and not the
+      # other ships a controller and a daemon from different commits. Resolving
+      # the go.mod version to its commit works for a tag and a pseudo-version.
+      - name: Verify gobgp-netlink pins name the same commit
+        run: |
+          set -euo pipefail
+          sha=$(grep -oPm1 '(?<=^ARG GOBGP_COMMIT=)[0-9a-f]{40}$' Dockerfile)
+          [ -n "$sha" ] || { echo "no GOBGP_COMMIT in Dockerfile"; exit 1; }
+          ver=$(go list -m -f '{{.Replace.Version}}' github.com/osrg/gobgp/v4)
+          hash=$(go mod download -json "github.com/purelb/gobgp-netlink/v4@${ver}" | jq -r .Origin.Hash)
+          [ "$hash" = "$sha" ] || { echo "go.mod ${ver} is ${hash}, Dockerfile GOBGP_COMMIT is ${sha}"; exit 1; }
+
       # Nothing else checks that the committed CRDs and RBAC still match the Go
       # types they are generated from, and release.yaml builds dist/crds.yaml by
       # concatenating the committed YAML — so a change to api/v1/types.go with no

@@ -4,18 +4,18 @@
 # multi-arch release build take ~28 minutes. Only the final stage is
 # target-native, because "apk add" has to run in the target rootfs.
 
-# gobgp-netlink v1.3.0. Pinned by commit, not by tag: a git tag is mutable, and
+# gobgp-netlink v1.3.6. Pinned by commit, not by tag: a git tag is mutable, and
 # the fork inherited upstream's whole v1.x tag history - so "v1.2" is a
 # lightweight tag on GoBGP 1.2 from 2015, one typo away from "v1.2.0". The
-# commit is also the only identifier go.mod can use, because the fork keeps
-# upstream's module path (github.com/osrg/gobgp/v4) while living at
-# purelb/gobgp-netlink, so no tag there is a resolvable module version. CI
-# asserts this SHA and the go.mod pseudo-version name the same commit.
+# fork keeps upstream's module path (github.com/osrg/gobgp/v4), so its v1.x
+# release tags are not module versions; go.mod uses the matching v4.900.x
+# module tag instead. CI resolves that go.mod version to its commit and
+# asserts it is this SHA.
 #
 # Declared before the first FROM so every stage can re-declare it. ARG scope
 # ends at FROM: without the re-declaration in gobgpd_builder the ldflag below
 # expands to empty and bgp_build_info ships with no commit label.
-ARG GOBGP_COMMIT=450e0688cf557bb231c1cbeeb59914a81b13b9f2
+ARG GOBGP_COMMIT=d4ad9479f0c430919c7f60d1203f1e618f254b1a
 
 # Fetch the purelb/gobgp-netlink fork once. This stage is arch-independent, so
 # it is shared by both target platforms rather than cloned per-arch.
