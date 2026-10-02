@@ -18,7 +18,7 @@ require (
 )
 
 // Use purelb/gobgp-netlink fork for netlink integration (netlink-grpc-complete branch)
-replace github.com/osrg/gobgp/v4 => github.com/purelb/gobgp-netlink/v4 v4.0.1-0.20260924223838-450e0688cf55
+replace github.com/osrg/gobgp/v4 => github.com/purelb/gobgp-netlink/v4 v4.900.6
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect
