@@ -1,6 +1,6 @@
 # k8gobgp metrics reference
 
-> **Status: current as of gobgp-netlink v1.3.6.** The metrics below are what the two endpoints
+> **Status: current as of gobgp-netlink v1.3.7.** The metrics below are what the two endpoints
 > emit today. Anything still marked **(new)** shipped with v1.3.1 and exists now; anything under
 > [Removed metrics](#removed-metrics) is gone.
 >
@@ -57,19 +57,6 @@ becomes visible.
 | `k8gobgp_gobgpd_connection_status` | Gauge | `endpoint` | 1 when a `GetBgp` RPC succeeded. **Driven by the `gobgpd` readiness check**, so it is as fresh as the probe cadence (10s) and reflects a real RPC, not a client handle |
 | `k8gobgp_gobgpd_connection_errors_total` | Counter | `endpoint` | Incremented by the reconciler when it cannot reach the daemon |
 
-### BGP RIB
-
-| Metric | Type | Labels | Notes |
-|---|---|---|---|
-| `k8gobgp_rib_routes` | Gauge | `family` | Route prefixes in the global RIB. **No gobgp-netlink equivalent** — every fork collector is per-peer and none calls `GetTable`. Label values use underscores (`ipv4_unicast`); the fork uses hyphens (`ipv4-unicast`) — see [Label traps](#label-traps) |
-
-### Collection health
-
-| Metric | Type | Labels | Notes |
-|---|---|---|---|
-| `k8gobgp_metrics_collection_duration_seconds` | Histogram | — | Time to collect RIB stats from gobgpd |
-| `k8gobgp_metrics_collection_errors_total` | Counter | — | Collection failures |
-
 ### Router ID resolution
 
 | Metric | Type | Labels | Notes |
@@ -97,20 +84,20 @@ busy because it is churning".
 
 ## BGP daemon metrics (port 7475)
 
-**36 metric families** are emitted by gobgp-netlink itself: 27 `bgp_*` and 9 `fsm_*`. Measured
-against v1.3.5 by scraping the endpoint directly:
+**37 metric families** are emitted by gobgp-netlink itself: 28 `bgp_*` and 9 `fsm_*`. Measured
+against v1.3.7, with global BGP started and no peers, by scraping the endpoint directly:
 
 ```
 curl -s http://127.0.0.1:7475/metrics | grep '^# HELP' | awk '{print $3}' | sed 's/_.*//' \
   | sort | uniq -c | sort -rn
 ```
 
-The endpoint serves 75 families in total; the other 39 are the standard Go runtime (29),
-`process_*` (9) and `promhttp_*` (1) collectors that come with any Go Prometheus client.
+The endpoint serves 80 families in total; the other 43 are the standard Go runtime (29),
+`process_*` (9), `grpc_*` (4) and `promhttp_*` (1) collectors.
 
 The total is **configuration-dependent** - per-peer families only appear once peers exist, so the
-same daemon served 75 with no peers and 79 with one peer and one peer group. Quote the 36 if you
-need a fixed number; do not assert a total.
+same version served 80 with no peers and 111 on a PureLB node with one established peer. Quote the
+37 if you need a fixed number; do not assert a total.
 
 ### Session state, per peer
 
@@ -142,6 +129,22 @@ survives each setting.
 state carried in the `session_state` label. **It does not emit a zero series for states the peer
 is not in**, so `count(bgp_peer_state{session_state="..."}) == 0` matches an empty vector and can
 never fire. Use `unless` — see [Common queries](#common-queries).
+
+### Global RIB, per family
+
+| Metric | Type | Labels |
+|---|---|---|
+| `bgp_rib_paths` | Gauge | `route_family` |
+
+Paths in the global RIB, one series per family in `global.families`. It is the only route count
+that includes locally originated paths: a PureLB service route is added with `AddPath`, so it is
+never received or accepted from a peer, and reaches `bgp_routes_advertised` only while a session
+is established and export policy lets it out. With `global.families` unset gobgpd enables every
+family, so all 26 are reported, mostly as 0. A family enabled only on a neighbor has no global RIB
+and no series. A family gobgpd cannot read is counted in `promhttp_metric_handler_errors_total`
+rather than dropped silently; the other families are still served.
+
+Replaces `k8gobgp_rib_routes`, which lost all of its series whenever `global.families` was set.
 
 ### Routes, per peer per family
 
@@ -261,6 +264,9 @@ These exist in k8gobgp today and are removed once gobgp-netlink emits them nativ
 | `k8gobgp_{neighbors,peer_groups,dynamic_neighbors,vrfs,policies,defined_sets}_configured` | `k8gobgp_configured_objects{kind="..."}` |
 | `k8gobgp_router_id_source{source}` | `count by (source) (k8gobgp_router_id_info)` |
 | `k8gobgp_metrics_collection_skipped_total` | none — unreachable in practice |
+| `k8gobgp_rib_routes{family}` | `bgp_rib_paths{route_family}` |
+| `k8gobgp_metrics_collection_duration_seconds` | none — the RIB poll loop is gone |
+| `k8gobgp_metrics_collection_errors_total` | `promhttp_metric_handler_errors_total` on 7475 counts a family gobgpd cannot read |
 | `k8gobgp_nodestatus_last_successful_write_timestamp` | renamed `..._timestamp_seconds` |
 
 ### The established-timestamp difference
@@ -296,8 +302,9 @@ return nothing.
 
 Three consequences worth stating outright:
 
-1. **`k8gobgp_rib_routes{family="ipv4_unicast"}` and `bgp_routes_*{route_family="ipv4-unicast"}`
-   cannot be joined** without a relabel. The label name differs *and* the separator differs.
+1. **`k8gobgp_rib_routes{family="ipv4_unicast"}` is not renamed to `bgp_rib_paths` by swapping
+   the metric name.** The label name differs *and* the separator differs:
+   `bgp_rib_paths{route_family="ipv4-unicast"}`.
 2. **Unnumbered peer identity is now per-node.** `iface:eth0` was identical on every node, so
    `by (neighbor)` aggregated across the fleet. `fe80::a1b2%eth0` is the resolved link-local
    address, which differs per node — fleet-wide aggregation by peer no longer means anything.
@@ -383,7 +390,8 @@ gobgp-netlink emits, per peer, where `F` is the number of enabled address famili
 | With BFD | **33 + 3F** |
 
 At `F=2` that is 35 and 39. Fixed per-node cost is roughly 23 series (netlink 15, BFD server 7,
-build info 1) plus 13 histogram families and the Go/process collectors.
+build info 1) plus 13 histogram families and the Go/process collectors, plus one `bgp_rib_paths`
+series per global family - 26 when `global.families` is unset.
 
 **There is no in-process limit on peer count.** If you run many peers per node — dynamic
 neighbours in particular — filter at scrape time. Apply the keep-list to the **7475 endpoint
@@ -394,7 +402,7 @@ diagnose the controller.
 metricRelabelConfigs:
   - sourceLabels: [__name__]
     action: keep
-    regex: '(bgp_peer_(state|type|asn|local_asn|established_timestamp_seconds|flop_count|out_queue_count|password_set|bfd_.*)|bgp_(received|sent)_notification_total|bgp_routes_.*|bgp_(bfd|netlink)_.*|bgp_build_info|bgp_message_handling_.*|fsm_loop_mgmt_op_lock_wait_seconds.*|go_(goroutines|threads|memstats_alloc_bytes)|process_(cpu_seconds_total|resident_memory_bytes|open_fds))'
+    regex: '(bgp_peer_(state|type|asn|local_asn|established_timestamp_seconds|flop_count|out_queue_count|password_set|bfd_.*)|bgp_(received|sent)_notification_total|bgp_routes_.*|bgp_rib_paths|bgp_(bfd|netlink)_.*|bgp_build_info|bgp_message_handling_.*|fsm_loop_mgmt_op_lock_wait_seconds.*|go_(goroutines|threads|memstats_alloc_bytes)|process_(cpu_seconds_total|resident_memory_bytes|open_fds))'
 ```
 
 That drops the 18 message counters except NOTIFICATION, and 11 of the 13 histogram families,

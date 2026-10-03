@@ -35,9 +35,9 @@ import (
 
 // This file exists because every comparison bug this package has had lived in
 // the same blind spot: we compare what we sent against what gobgpd returns,
-// having never written down what gobgpd returns. The interfaces to do it -
-// GoBGPStatsClient, GoBGPNodeStatusClient - were added with the comment
-// "allows mocking gRPC calls" and then never used by a test.
+// having never written down what gobgpd returns. The interface to do it -
+// GoBGPNodeStatusClient - was added with the comment "allows mocking gRPC
+// calls" and then never used by a test.
 //
 // gobgpdEcho below is the missing piece. It reproduces the shape of
 // oc.NewPeerFromConfigStruct: every sub-message populated whether or not the

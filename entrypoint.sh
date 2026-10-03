@@ -105,15 +105,9 @@ for i in $(seq 1 30); do
 done
 
 # Start the k8gobgp controller/manager
-#
-# --metrics-poll-interval 60s, not the 15s default: gobgpd's own collector is
-# cached at 15s, and this loop's GetTable runs as a mgmtOperation under the BGP
-# write lock. Two unsynchronised 15s consumers of that lock is the worst
-# arrangement, and RIB size is not a fast-moving signal.
 echo "Starting k8gobgp manager with endpoint: ${GOBGP_ENDPOINT}"
 /usr/local/bin/manager \
-    --gobgp-endpoint="${GOBGP_ENDPOINT}" \
-    --metrics-poll-interval="${METRICS_POLL_INTERVAL:-60s}" &
+    --gobgp-endpoint="${GOBGP_ENDPOINT}" &
 MANAGER_PID=$!
 
 # Wait for either process to exit. Whichever one it was, its status becomes the
