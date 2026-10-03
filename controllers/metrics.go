@@ -101,18 +101,7 @@ var (
 		[]string{"name", "namespace"},
 	)
 
-	// === BGP Stats Metrics (collected by BGPMetricsController) ===
-
-	// Global RIB route counts by address family
-	bgpRibRoutes = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "k8gobgp_rib_routes",
-			Help: "Number of route prefixes in the global RIB by address family",
-		},
-		[]string{"family"}, // family: ipv4_unicast, ipv6_unicast, l2vpn_evpn
-	)
-
-	// The per-neighbor and aggregate BGP stats that used to live here are gone:
+	// The BGP stats that used to live here are gone:
 	// gobgp-netlink emits all of them natively, from the daemon that owns the
 	// data, so re-exporting them over gRPC was duplication. See docs/metrics.md
 	// for the mapping - the labels are not a straight rename.
@@ -123,25 +112,14 @@ var (
 	//   k8gobgp_neighbor_session_established_...     -> bgp_peer_established_timestamp_seconds, gated on state
 	//   k8gobgp_neighbor_routes_{received,...}       -> bgp_routes_*{peer,route_family}
 	//   k8gobgp_routes_{received,accepted,advertised} -> sum(bgp_routes_*)
+	//   k8gobgp_rib_routes{family}                   -> bgp_rib_paths{route_family}
 	//
-	// k8gobgp_rib_routes above stays: every fork collector is per-peer and none
-	// calls GetTable, so global RIB size has no native equivalent.
-
-	// Metrics collection health metrics
-	metricsCollectionDuration = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "k8gobgp_metrics_collection_duration_seconds",
-			Help:    "Time taken to collect BGP metrics from gobgpd",
-			Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30},
-		},
-	)
-
-	metricsCollectionErrors = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "k8gobgp_metrics_collection_errors_total",
-			Help: "Total errors during BGP metrics collection",
-		},
-	)
+	// k8gobgp_rib_routes was the last of them, polled with GetBgp and GetTable.
+	// It decoded GetBgp's Global.Families as afi<<16|safi when they are ordinals,
+	// asked for families that do not exist and lost the metric silently. Since
+	// gobgp-netlink v1.3.7 gobgpd exports bgp_rib_paths, decoded next to the
+	// encoding, so the poll loop and its k8gobgp_metrics_collection_* health
+	// metrics went with it.
 
 	// k8gobgp_metrics_collection_skipped_total and
 	// k8gobgp_metrics_cardinality_limit_hit_total are removed. The first counted
@@ -263,10 +241,6 @@ func init() {
 		peerApplyErrors,
 		cleanupRetries,
 		cleanupDuration,
-		// Global RIB size, polled by BGPMetricsController. No native equivalent.
-		bgpRibRoutes,
-		metricsCollectionDuration,
-		metricsCollectionErrors,
 		// Router ID resolution metrics
 		routerIDResolutionTotal,
 		routerIDResolutionDuration,

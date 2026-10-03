@@ -61,11 +61,11 @@ const (
 	maxAdvertisedTo = 16
 )
 
-// GoBGPNodeStatusClient extends GoBGPStatsClient with additional methods needed by the reporter.
+// GoBGPNodeStatusClient is the RPC surface the reporter uses. It used to embed
+// GoBGPStatsClient, which went with the metrics poll loop: GetTable is the one
+// method of it the reporter calls.
 type GoBGPNodeStatusClient interface {
-	GoBGPStatsClient
-	// Declared here rather than inherited: the metrics poll loop no longer calls
-	// ListPeer, but the CR status still reports per-neighbor session state.
+	GetTable(ctx context.Context, req *gobgpapi.GetTableRequest, opts ...grpc.CallOption) (*gobgpapi.GetTableResponse, error)
 	ListPeer(ctx context.Context, in *gobgpapi.ListPeerRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPeerResponse], error)
 	ListPath(ctx context.Context, in *gobgpapi.ListPathRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[gobgpapi.ListPathResponse], error)
 	GetNetlink(ctx context.Context, in *gobgpapi.GetNetlinkRequest, opts ...grpc.CallOption) (*gobgpapi.GetNetlinkResponse, error)

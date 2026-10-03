@@ -193,13 +193,6 @@ func TestSanitizeFamilyString(t *testing.T) {
 	}
 }
 
-func TestMetricsConfig_Defaults(t *testing.T) {
-	config := MetricsConfig{}
-
-	// A zero PollInterval means "use the default"; Start applies it.
-	assert.Equal(t, 0, int(config.PollInterval.Seconds()))
-}
-
 func TestValidateCommunity(t *testing.T) {
 	tests := []struct {
 		name      string

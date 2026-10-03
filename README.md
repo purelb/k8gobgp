@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Go Report Card](https://goreportcard.com/badge/github.com/purelb/k8gobgp)](https://goreportcard.com/report/github.com/purelb/k8gobgp)
 
-A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.3.6) for enhanced Linux kernel integration.
+A Kubernetes controller for managing GoBGP configurations using Custom Resource Definitions (CRDs). This project implements comprehensive BGP configuration management through the Kubernetes API, leveraging the [gobgp-netlink](https://github.com/purelb/gobgp-netlink) fork (v1.3.7) for enhanced Linux kernel integration.
 
 ## Features
 
@@ -689,7 +689,6 @@ The manager supports the following command-line flags:
 | `--metrics-bind-address` | `:7473` | Address for the metrics endpoint |
 | `--health-probe-bind-address` | `:7474` | Address for health probes |
 | `--gobgp-endpoint` | (env: `GOBGP_ENDPOINT`) | GoBGP gRPC endpoint (e.g., `localhost:50051` or `unix:///var/run/gobgp/gobgp.sock`) |
-| `--metrics-poll-interval` | `15s` | Interval for polling RIB size from gobgpd (minimum 15s). The DaemonSet sets `60s`: gobgpd's own collector is cached at 15s and this loop takes the same BGP lock |
 | `--enable-per-neighbor-metrics` | — | **Deprecated, ignored.** gobgp-netlink emits per-peer metrics natively |
 | `--max-neighbors-metrics` | — | **Deprecated, ignored.** Bound per-peer cardinality at scrape time; see [docs/metrics.md](docs/metrics.md) |
 
@@ -723,9 +722,6 @@ The controller's own metrics on `:7473/metrics`:
 | `k8gobgp_gobgpd_connection_errors_total` | Counter | `endpoint` | Failed attempts to reach gobgpd |
 | `k8gobgp_cleanup_retries_total` | Counter | `name`, `namespace` | Retries during finalizer cleanup |
 | `k8gobgp_cleanup_duration_seconds` | Histogram | `name`, `namespace` | Cleanup duration |
-| `k8gobgp_rib_routes` | Gauge | `family` | Routes in the global RIB. **No gobgp-netlink equivalent** — its collectors are all per-peer and none calls `GetTable` |
-| `k8gobgp_metrics_collection_duration_seconds` | Histogram | — | Time to collect RIB stats |
-| `k8gobgp_metrics_collection_errors_total` | Counter | — | Collection failures |
 | `k8gobgp_router_id_resolution_total` | Counter | `result` | Router ID resolution attempts |
 | `k8gobgp_router_id_resolution_duration_seconds` | Histogram | — | Resolution duration. Buckets top out at 2.048s |
 | `k8gobgp_router_id_info` | Gauge | `router_id`, `source`, `node`, `asn`, `name`, `namespace` | Always 1; read the labels |
@@ -740,20 +736,26 @@ Also on `:7473`: controller-runtime's `controller_runtime_*`, `workqueue_*` and
 
 ### BGP daemon metrics (`:7475`)
 
-72 families covering session state, routes, BFD, kernel FIB programming and loop
-timing. See [docs/metrics.md](docs/metrics.md) for the full list, the label
+37 families of gobgpd's own (28 `bgp_*`, 9 `fsm_*`) covering session state, routes,
+BFD, kernel FIB programming and loop timing. See [docs/metrics.md](docs/metrics.md) for the full list, the label
 traps, ready-made queries and a scrape-time keep-list — per-peer cardinality is
 `29 + 3F` series without BFD and `33 + 3F` with, where `F` is the number of
 enabled address families, and gobgp-netlink applies no cap of its own.
 
 ### Migrating from the previous metric set
 
-Twelve `k8gobgp_*` metrics were removed because gobgp-netlink emits the same
+Thirteen `k8gobgp_*` metrics were removed because gobgp-netlink emits the same
 data natively, from the daemon that owns it. The replacements are **not** a
 straight rename — `neighbor=` becomes `peer=`, `state=established` becomes
 `session_state=SESSION_STATE_ESTABLISHED`, and `family=ipv4_unicast` becomes
-`route_family=ipv4-unicast` with the separator flipped, which means
-`k8gobgp_rib_routes` and `bgp_routes_*` cannot be joined without relabeling.
+`route_family=ipv4-unicast` with the separator flipped.
+
+The last of them, `k8gobgp_rib_routes`, was polled over gRPC and exported nothing
+at all whenever `global.families` was set. gobgpd exports `bgp_rib_paths` from
+gobgp-netlink v1.3.7, and the poll loop went with it, taking
+`k8gobgp_metrics_collection_duration_seconds`,
+`k8gobgp_metrics_collection_errors_total` and `--metrics-poll-interval` along.
+A manager started with `--metrics-poll-interval` now exits at flag parsing.
 
 [docs/metrics.md](docs/metrics.md) carries the full mapping. The short version:
 
@@ -767,6 +769,7 @@ straight rename — `neighbor=` becomes `peer=`, `state=established` becomes
 | `k8gobgp_routes_*` | `sum by (instance) (bgp_routes_*)` |
 | `k8gobgp_{neighbors,peer_groups,...}_configured` | `k8gobgp_configured_objects{kind="..."}` |
 | `k8gobgp_router_id_source` | `count by (source) (k8gobgp_router_id_info)` |
+| `k8gobgp_rib_routes{family}` | `bgp_rib_paths{route_family}` |
 
 `--enable-per-neighbor-metrics` and `--max-neighbors-metrics` are accepted and
 ignored; they warn on use and will be removed. Bound per-peer cardinality at
@@ -938,5 +941,5 @@ limitations under the License.
 ## Acknowledgments
 
 - [GoBGP](https://github.com/osrg/gobgp) - The BGP implementation
-- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.3.6 - Enhanced GoBGP fork with netlink integration
+- [gobgp-netlink](https://github.com/purelb/gobgp-netlink) v1.3.7 - Enhanced GoBGP fork with netlink integration
 - [PureLB](https://purelb.io) - Kubernetes load balancer project
