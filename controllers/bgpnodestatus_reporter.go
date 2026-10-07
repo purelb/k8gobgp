@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -533,8 +534,10 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 	}
 
 	// Also add addresses from interfaces that are NOT in the RIB (for display).
-	// Use the actual prefix length from the interface (e.g. /24), not /32.
-	// GoBGP imports routes with the prefix length as assigned on the interface.
+	// GoBGP imports the network an address is on, not the address: 10.0.0.5/24
+	// is in the RIB as 10.0.0.0/24. Matching the address string instead listed
+	// every address with host bits set as not in the RIB, and deriveHealth
+	// then reported the node degraded.
 	nlImportedPrefixes := make(map[string]bool)
 	for _, addr := range importedAddresses {
 		nlImportedPrefixes[addr.Address] = true
@@ -559,10 +562,9 @@ func (r *BGPNodeStatusReporter) collectNetlinkImportStatus(ctx context.Context, 
 			if addr.IPNet == nil {
 				continue
 			}
-			prefix := addr.IPNet.String()
-			if !nlImportedPrefixes[prefix] {
+			if !nlImportedPrefixes[addrToNetworkPrefix(addr)] {
 				importedAddresses = append(importedAddresses, bgpv1.ImportedAddress{
-					Address:   prefix,
+					Address:   addr.IPNet.String(),
 					Interface: ifStatus.Name,
 					InRIB:     false,
 				})
@@ -1146,6 +1148,12 @@ func addrToHostPrefix(addr netlink.Addr) string {
 		return fmt.Sprintf("%s/32", addr.IP.String())
 	}
 	return fmt.Sprintf("%s/128", addr.IP.String())
+}
+
+// addrToNetworkPrefix returns the network an interface address is on, which
+// is the prefix GoBGP's netlink import puts in the RIB for it.
+func addrToNetworkPrefix(addr netlink.Addr) string {
+	return (&net.IPNet{IP: addr.IP.Mask(addr.Mask), Mask: addr.Mask}).String()
 }
 
 func tableIDToName(id int32) string {

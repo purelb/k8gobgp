@@ -1,6 +1,6 @@
 # k8gobgp metrics reference
 
-> **Status: current as of gobgp-netlink v1.3.7.** The metrics below are what the two endpoints
+> **Status: current as of gobgp-netlink v1.3.8.** The metrics below are what the two endpoints
 > emit today. Anything still marked **(new)** shipped with v1.3.1 and exists now; anything under
 > [Removed metrics](#removed-metrics) is gone.
 >
