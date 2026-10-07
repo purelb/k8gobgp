@@ -99,6 +99,29 @@ func TestAddrToHostPrefix(t *testing.T) {
 	}
 }
 
+// The RIB holds the network, so an address with host bits set must map to it,
+// not to its own string - otherwise it is listed as not in the RIB.
+func TestAddrToNetworkPrefix(t *testing.T) {
+	tests := []struct {
+		name     string
+		ip       string
+		bits     int
+		size     int
+		expected string
+	}{
+		{"ipv4_host_bits", "10.255.1.100", 24, 32, "10.255.1.0/24"},
+		{"ipv4_host", "10.255.1.100", 32, 32, "10.255.1.100/32"},
+		{"ipv6_host_bits", "fc00:255:1::100", 64, 128, "fc00:255:1::/64"},
+		{"ipv6_host", "fc00:255:1::100", 128, 128, "fc00:255:1::100/128"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr := netlink.Addr{IPNet: &net.IPNet{IP: net.ParseIP(tt.ip), Mask: net.CIDRMask(tt.bits, tt.size)}}
+			assert.Equal(t, tt.expected, addrToNetworkPrefix(addr))
+		})
+	}
+}
+
 func TestFormatRouteDistinguisher(t *testing.T) {
 	tests := []struct {
 		name     string
