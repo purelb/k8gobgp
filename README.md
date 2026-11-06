@@ -474,10 +474,17 @@ is rarely a reason to change it.
 
 #### Before you enable it
 
-**A BFD transition is a hard BGP reset.** Not a graceful restart — the session
+**A BFD failure is a hard BGP reset.** Not a graceful restart — the session
 drops and every route through it is withdrawn. That is the point of BFD, but it
 means an over-aggressive profile converts a transient scheduling hiccup into a
-real outage.
+real outage. The reset fires when an `UP` session's detect timer expires, or the
+remote signals `DOWN` with any diagnostic other than 3.
+
+**Other BFD transitions leave BGP up.** A session that expires before reaching
+`UP`, a remote `AdminDown`, and a remote `DOWN` with diagnostic 3 all take BFD
+down without touching BGP, and while BFD is not `UP` only the BGP hold timer
+protects the peer. `bgp_peer_bfd_failure_transitions_total` still counts `UP` to
+`DOWN` transitions that leave BGP up, so it is not a count of BGP resets.
 
 **Changing any BFD field also resets the session.** gobgpd implements a BFD
 config change as delete-then-add, which stops our transmit long enough for the
