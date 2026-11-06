@@ -59,6 +59,14 @@ GOBGPD_ARGS="--metrics-host ${GOBGP_METRICS_HOST} --pprof-disable"
 echo "Starting gobgpd..."
 if [ "$USE_UNIX_SOCKET" = "true" ]; then
     # Use Unix socket for local communication (more secure)
+    #
+    # The socket lives in an emptyDir, which outlives this container and survives
+    # a node reboot while the pod object exists. A stop that skips gobgpd's own
+    # cleanup (power loss, SIGKILL, OOM kill) leaves the file behind, and binding
+    # then fails with EADDRINUSE on every restart even though nothing is
+    # listening. gobgpd logs that and keeps running without an API. Safe to
+    # remove: one gobgpd runs per container and the emptyDir is private to the pod.
+    rm -f "${GOBGP_SOCKET}"
     # shellcheck disable=SC2086
     /usr/local/bin/gobgpd --api-hosts "unix://${GOBGP_SOCKET}" ${GOBGPD_ARGS} &
     GOBGPD_PID=$!
@@ -87,8 +95,11 @@ fi
 echo "Waiting for gobgpd to be ready..."
 for i in $(seq 1 30); do
     if [ "$USE_UNIX_SOCKET" = "true" ]; then
-        if [ -S "${GOBGP_SOCKET}" ]; then
-            echo "gobgpd is ready (socket exists)"
+        # Ask the API rather than testing for the file: a socket file with no
+        # listener behind it is what a failed bind looks like. "neighbor" answers
+        # before the manager has called StartBgp. --target, not -u: -u is a host.
+        if /usr/local/bin/gobgp --target "unix://${GOBGP_SOCKET}" neighbor >/dev/null 2>&1; then
+            echo "gobgpd is ready"
             break
         fi
     else
@@ -96,6 +107,12 @@ for i in $(seq 1 30); do
             echo "gobgpd is ready"
             break
         fi
+    fi
+    if ! kill -0 "$GOBGPD_PID" 2>/dev/null; then
+        GOBGPD_STATUS=0
+        wait "$GOBGPD_PID" || GOBGPD_STATUS=$?
+        echo "gobgpd exited during startup (status ${GOBGPD_STATUS})"
+        exit 1
     fi
     if [ $i -eq 30 ]; then
         echo "Timeout waiting for gobgpd to start"

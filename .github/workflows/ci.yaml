@@ -184,8 +184,8 @@ jobs:
       # Two things a static pin check cannot see: that the daemon we shipped is
       # the commit we pinned, and that it accepts the flags entrypoint.sh passes.
       # The second one matters - gobgpd exits 1 on an unknown flag and
-      # entrypoint.sh backgrounds it, so the symptom is "Timeout waiting for
-      # gobgpd to start" on every node, naming neither the flag nor the version.
+      # entrypoint.sh backgrounds it, so the symptom is "gobgpd exited during
+      # startup" on every node, naming neither the flag nor the version.
       - name: Assert the built gobgpd matches the pin and accepts its flags
         run: |
           set -euo pipefail
@@ -198,6 +198,31 @@ jobs:
           docker run --rm --entrypoint gobgpd "$IMG" --version | grep -q "commit: ${sha:0:7}"
           docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --metrics-host
           docker run --rm --entrypoint gobgpd "$IMG" --help 2>&1 | grep -q -- --pprof-disable
+
+      # A socket left by an unclean stop must not block gobgpd, and readiness must
+      # mean the API answers: issue #98 was a crash loop in which both failed. The
+      # manager has no cluster to talk to here and exits, which ends the container.
+      - name: Assert entrypoint recovers from a stale socket and reports a dead gobgpd
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:ci-${{ github.sha }}"
+          SOCK=/var/run/gobgp/gobgp.sock
+          docker run -d --name stale-maker -v stale-sock:/var/run/gobgp --entrypoint gobgpd "$IMG" \
+            --api-hosts "unix://${SOCK}" --pprof-disable
+          for i in $(seq 1 30); do
+            docker exec stale-maker gobgp --target "unix://${SOCK}" neighbor >/dev/null 2>&1 && break || sleep 1
+          done
+          docker kill --signal KILL stale-maker
+          docker run --rm -v stale-sock:/var/run/gobgp --entrypoint sh "$IMG" -c "test -S ${SOCK}"
+          logs=$(timeout 60 docker run --rm -e NODE_IP=127.0.0.1 -v stale-sock:/var/run/gobgp "$IMG" 2>&1 || true)
+          echo "$logs"
+          grep -q 'gobgpd is ready' <<<"$logs"
+          if grep -q 'address already in use' <<<"$logs"; then exit 1; fi
+          # gobgpd exits on an unknown flag. Word-split into its arguments, this
+          # must be reported at once rather than waiting out the 30s loop.
+          logs=$(timeout 20 docker run --rm -e GOBGP_METRICS_HOST='127.0.0.1:7475 --no-such-flag' "$IMG" 2>&1 || true)
+          echo "$logs"
+          grep -q 'gobgpd exited during startup' <<<"$logs"
 
       # Round-trip the converters against the real daemon.
       #
