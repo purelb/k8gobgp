@@ -32,6 +32,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -82,8 +83,8 @@ func TestMain(m *testing.M) {
 	}
 
 	// Create controller-runtime client with our scheme
-	scheme, err := bgpv1.SchemeBuilder.Build()
-	if err != nil {
+	scheme := runtime.NewScheme()
+	if err := bgpv1.AddToScheme(scheme); err != nil {
 		fmt.Printf("Failed to build scheme: %v\n", err)
 		os.Exit(1)
 	}
