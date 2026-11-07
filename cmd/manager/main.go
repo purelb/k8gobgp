@@ -130,11 +130,14 @@ func main() {
 	}
 
 	if err = (&controllers.BGPConfigurationReconciler{
-		Client:             mgr.GetClient(),
-		Log:                ctrl.Log.WithName("controllers").WithName("BGPConfiguration"),
-		Scheme:             mgr.GetScheme(),
-		GoBGPEndpoint:      gobgpEndpoint,
-		Recorder:           mgr.GetEventRecorderFor("bgpconfiguration-controller"),
+		Client:        mgr.GetClient(),
+		Log:           ctrl.Log.WithName("controllers").WithName("BGPConfiguration"),
+		Scheme:        mgr.GetScheme(),
+		GoBGPEndpoint: gobgpEndpoint,
+		// GetEventRecorder writes events.k8s.io events, which PureLB's lbnodeagent
+		// ServiceAccount cannot create, so moving to it would silently lose events
+		// on that deployment until its RBAC grants them.
+		Recorder:           mgr.GetEventRecorderFor("bgpconfiguration-controller"), //nolint:staticcheck // see above
 		NodeName:           nodeName,
 		PodName:            podName,
 		PodNamespace:       podNamespace,

@@ -182,7 +182,7 @@ NOTIFICATION is how a session tells you why it dropped.
 |---|---|---|
 | `bgp_bfd_server_up` | Gauge | Socket bound (1) or not (0). Binds lazily on the first BFD peer, so 0 is normal when nobody uses BFD |
 | `bgp_bfd_received_packet_total` | Counter | Matched to a peer |
-| `bgp_bfd_received_drop_total` | Counter | Peer's receive queue was full — the queue is one packet deep, so any advance means an event loop stalled longer than a transmit interval |
+| `bgp_bfd_received_drop_total` | Counter | Peer's receive queue was full — the queue holds eight packets, so any advance means an event loop stalled for several transmit intervals |
 | `bgp_bfd_received_error_total` | Counter | Socket read errors |
 | `bgp_bfd_invalid_packet_total` | Counter | Undecodable datagrams |
 | `bgp_bfd_unknown_peer_total` | Counter | From an address with no configured peer. **Typically a link-local neighbour configured without its `%zone`** — transmit works, BGP looks healthy, BFD never leaves DOWN. Global counter with no peer label, so diagnosis needs daemon debug logs |
