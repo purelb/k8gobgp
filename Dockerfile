@@ -19,7 +19,7 @@ ARG GOBGP_COMMIT=fb5f01ac0ad49dfb80dea6fa163629eb9cbc9f02
 
 # Fetch the purelb/gobgp-netlink fork once. This stage is arch-independent, so
 # it is shared by both target platforms rather than cloned per-arch.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS gobgp_src
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS gobgp_src
 
 ARG GOBGP_COMMIT
 
@@ -56,7 +56,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
       -o gobgp ./cmd/gobgp
 
 # Build the k8gobgp reconciler/controller
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS reconciler_builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS reconciler_builder
 
 ARG TARGETARCH
 
